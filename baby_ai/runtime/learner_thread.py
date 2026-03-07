@@ -203,6 +203,10 @@ class LearnerThread:
         })
 
         action_logits = outputs["action_logits"]
+        # Ensure numerical stability for categorical distribution
+        action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        action_logits = torch.clamp(action_logits, min=-1e4, max=1e4)
+        
         value = outputs["value"]
 
         # Policy loss (if we have targets)

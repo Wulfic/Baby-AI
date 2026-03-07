@@ -16,7 +16,19 @@ import argparse
 import signal
 import sys
 import time
+import atexit
+import ctypes
 from pathlib import Path
+
+# --- Fallback to always release mouse cursor on crash ---
+def _emergency_release_cursor():
+    try:
+        ctypes.windll.user32.ClipCursor(None)
+    except Exception:
+        pass
+
+atexit.register(_emergency_release_cursor)
+# --------------------------------------------------------
 
 import torch
 
@@ -240,6 +252,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         player_name=mc.player_name,
         player_uuid=mc.player_uuid,
         max_memory_mb=mc.max_memory_mb,
+        window_width=mc.window_width,
+        window_height=mc.window_height,
         launch_timeout_sec=mc.launch_timeout_sec,
         block_user_input=mc.block_user_input,
     )
@@ -262,6 +276,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     icm = orchestrator.icm
     reward_composer = orchestrator.reward_composer
 
+    # ── UI Control Panel ─────────────────────────────────────────
+    from baby_ai.ui.control_panel import AIControlPanel
+    control_panel = AIControlPanel()
+    control_panel.start()
+
     # ── Training loop ──────────────────────────────────────────
     log.info("Minecraft training loop started — Ctrl+C to stop.")
     prev_fused: torch.Tensor | None = None
@@ -274,6 +293,15 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         obs = env.reset()
 
         while True:
+            # Check UI controls
+            if control_panel.is_stopped:
+                log.info("Stop requested from Control Panel.")
+                break
+                
+            if control_panel.is_paused:
+                time.sleep(0.5)
+                continue
+
             # ── Model inference ──────────────────────────────────
             result = orchestrator.step(obs)
             action_id = result["action"].item()

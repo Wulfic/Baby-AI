@@ -206,7 +206,7 @@ class MinecraftConfig:
     """Settings for the Minecraft game environment."""
     # ── Window / capture ───────────────────────────────────────
     window_title: str = "Minecraft"         # substring matched against window titles
-    input_mode: str = "background"          # "background" (safe, no cursor) or "active" (camera look, moves cursor)
+    input_mode: str = "active"              # "background" (safe, no cursor) or "active" (camera look, moves cursor)
     capture_resolution: Tuple[int, int] = (160, 160)  # (H, W) for screen captures
     step_delay_ms: float = 100.0            # minimum ms between consecutive actions
     look_pixels_small: int = 40             # small camera rotation (pixels per step)
@@ -223,6 +223,8 @@ class MinecraftConfig:
     player_uuid: str = field(default_factory=lambda: os.environ.get("MC_PLAYER_UUID", ""))
     max_memory_mb: int = field(default_factory=lambda: int(os.environ.get("MC_MAX_MEMORY_MB", "4096")))  # JVM -Xmx (4 GB default; 2 GB causes GC thrashing on 1.21+)
     launch_timeout_sec: float = 120.0       # max wait for MC window to appear
+    window_width: int = 1920                # Game window width matching standard 1080p maximize
+    window_height: int = 1080               # Game window height matching standard 1080p maximize
 
     # ── Input guard ────────────────────────────────────────────
     block_user_input: bool = True           # block user KB/mouse when MC focused

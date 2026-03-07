@@ -266,25 +266,31 @@ class InputGuard:
         """
         Low-level mouse hook callback.
 
-        Only block clicks and scroll — **never** block mouse movement.
-        Blocking WM_MOUSEMOVE traps the cursor system-wide because
-        low-level hooks intercept before the OS processes the delta,
-        making the user unable to move the mouse at all.
+        Blocks PHYSICAL mouse clicks and scroll so the user can't interfere
+        with the game. ALways lets INJECTED (AI) moves/clicks pass through!
+        We also allow physical WM_MOUSEMOVE to pass through so the user doesn't
+        get a frozen OS cursor and can still use Alt-Tab or move their mouse 
+        to click the AI Pause button.
         """
         if nCode >= 0 and self._should_block():
-            # wParam carries the mouse message type
-            # 0x0200 = WM_MOUSEMOVE  — ALWAYS let through
-            # 0x0201 = WM_LBUTTONDOWN, 0x0202 = WM_LBUTTONUP
-            # 0x0204 = WM_RBUTTONDOWN, 0x0205 = WM_RBUTTONUP
-            # 0x0207 = WM_MBUTTONDOWN, 0x0208 = WM_MBUTTONUP
-            # 0x020A = WM_MOUSEWHEEL,  0x020B = WM_XBUTTONDOWN
-            # 0x020E = WM_MOUSEHWHEEL
+            struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            
+            # Check if this input was injected by software (like SetCursorPos or PostMessage AI)
+            is_injected = (struct.flags & 1) != 0 or (struct.flags & 2) != 0
+            if is_injected:
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                
+            # If physical hardware:
+            # 0x0200 = WM_MOUSEMOVE
             if wParam == 0x0200:
-                # Mouse movement — never block this
+                # Let the user physically move their mouse (otherwise cursor is fully frozen system-wide)
+                # Note: this WILL rotate the camera slightly if the user wiggles their mouse while watching,
+                # but it allows them to move their mouse to click the AI UI.
                 self._stats["passed"] += 1
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Block clicks and scroll so user can't interfere with the game
+            # Block physical clicks and scroll
             self._stats["mouse_blocked"] += 1
             return _BLOCK
 

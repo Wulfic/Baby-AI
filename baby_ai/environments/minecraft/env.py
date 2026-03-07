@@ -33,7 +33,7 @@ from baby_ai.environments.minecraft.actions import (
     has_look,
 )
 from baby_ai.environments.minecraft.capture import ScreenCapture
-from baby_ai.environments.minecraft.focus_guard import FocusGuard
+from baby_ai.environments.minecraft.input_guard import InputGuard
 from baby_ai.environments.minecraft.input_controller import InputController
 from baby_ai.environments.minecraft.launcher import MinecraftLauncher
 from baby_ai.environments.minecraft.window import WindowManager
@@ -75,14 +75,16 @@ class MinecraftEnv(GameEnvironment):
         world_name: str = "",
         player_name: str = "",
         player_uuid: str = "",
-        max_memory_mb: int = 2048,
+        max_memory_mb: int = 4096,
+        window_width: int = 1920,
+        window_height: int = 1080,
         launch_timeout_sec: float = 120.0,
         # ── Input guard ─────────────────────────────────────────
         block_user_input: bool = False,
     ):
         # ── Auto-launch Minecraft if requested ──────────────────
         self._launcher: Optional[MinecraftLauncher] = None
-        self._guard: Optional[FocusGuard] = None
+        self._guard: Optional[InputGuard] = None
         hwnd: Optional[int] = None
 
         if auto_launch and mc_dir:
@@ -93,6 +95,8 @@ class MinecraftEnv(GameEnvironment):
                 player_name=player_name,
                 player_uuid=player_uuid,
                 max_memory_mb=max_memory_mb,
+                window_width=window_width,
+                window_height=window_height,
             )
 
             # Ensure MC will keep running when unfocused
@@ -118,11 +122,9 @@ class MinecraftEnv(GameEnvironment):
         self._input = InputController(self._window, mode=input_mode)
 
         # ── Input guard ─────────────────────────────────────────
-        # FocusGuard keeps MC unfocused so real user input never reaches it.
-        # The AI's PostMessage input works regardless of focus state.
-        # MC's pauseOnLostFocus:false keeps the game ticking in background.
+        # InputGuard intercepts physical keyboard/mouse if MC is focused.
         if block_user_input:
-            self._guard = FocusGuard(mc_hwnd=self._window.hwnd)
+            self._guard = InputGuard(mc_hwnd=self._window.hwnd)
             self._guard.start()
 
         self._resolution = resolution

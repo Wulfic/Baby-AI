@@ -240,37 +240,47 @@ class InputController:
     def mouse_look(self, dx: int, dy: int) -> bool:
         """
         Rotate the camera by (dx, dy) pixels.
-
-        In **background** mode this is a no-op and returns False.
+        
+        In **background** mode, this sends WM_MOUSEMOVE via PostMessage. 
+        Note: This only actually rotates the in-game camera if Minecraft's
+        'rawMouseInput' setting is set to 'false' in options.txt.
 
         In **active** mode this warps the OS cursor relative to the
-        window center.  Minecraft will read the delta on its next
-        event poll and warp the cursor back.
-
-        Safety: If the MC window is not focused, the look is skipped
-        entirely (we never force-focus the window).  The cursor is
-        clamped to the MC client area so it cannot escape the window
-        and click on other applications.
-
-        Returns:
-            True if the look was executed, False if skipped.
+        window center.
         """
-        if self._mode != "active":
-            return False
-
-        # SAFETY: Only move cursor when MC is the foreground window.
-        # Never call set_foreground() — that steals focus from the user.
-        if not self._window.is_focused:
-            return False
-
         if not self._window.is_valid:
+            return False
+
+        if self._mode == "background":
+            # Send the delta relative to the center of the window
+            _, _, cw, ch = self._window.get_client_rect()
+            
+            # Since Minecraft is windowed, local client coordinates start at 0,0
+            local_cx = cw // 2
+            local_cy = ch // 2
+            
+            target_x = local_cx + dx
+            target_y = local_cy + dy
+            
+            # 1. Send the offset to simulate the mouse moving
+            lp_move = _makelparam(target_x, target_y)
+            user32.PostMessageW(self._window.hwnd, WM_MOUSEMOVE, 0, lp_move)
+            
+            # 2. Immediately send a "reset to center" message.
+            # Because Minecraft is backgrounded, its native SetCursorPos(center) 
+            # won't trigger real mouse events to reset its internal last_x/last_y.
+            # We must trick it into thinking the cursor snapped back to center.
+            lp_reset = _makelparam(local_cx, local_cy)
+            user32.PostMessageW(self._window.hwnd, WM_MOUSEMOVE, 0, lp_reset)
+            return True
+
+        # ACTIVE MODE SAFETY:
+        if not self._window.is_focused:
             return False
 
         cx, cy = self._window.get_client_center()
         sx, sy, cw, ch = self._window.get_client_rect()
 
-        # Compute target position and CLAMP to the MC client area
-        # so the cursor can never escape the window bounds.
         target_x = max(sx + 1, min(cx + dx, sx + cw - 2))
         target_y = max(sy + 1, min(cy + dy, sy + ch - 2))
 

@@ -75,7 +75,8 @@ class ScreenCapture:
         # Refresh client-area position (window may have been moved)
         sx, sy, sw, sh = self._window.get_client_rect()
         if sw <= 0 or sh <= 0:
-            raise RuntimeError("Minecraft client area has zero size — is the window minimised?")
+            log.warning("Minecraft client area has zero size. Returning black frame.")
+            return np.zeros((self._resolution[0], self._resolution[1], 3), dtype=np.uint8)
 
         self._region = {"left": sx, "top": sy, "width": sw, "height": sh}
         shot = sct.grab(self._region)

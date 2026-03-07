@@ -392,7 +392,9 @@ class MinecraftLauncher:
 
         Sets ``pauseOnLostFocus:false`` which is required for the AI to
         control the game via PostMessage while the window is in the
-        background.  The original value is logged for transparency.
+        background.
+        Also sets ``rawMouseInput:false`` to allow simulating mouse movement
+        while in the background using WM_MOUSEMOVE instead of hardware inputs.
         """
         opts_path = self._mc_dir / "options.txt"
         if not opts_path.is_file():
@@ -401,7 +403,9 @@ class MinecraftLauncher:
 
         lines = opts_path.read_text(encoding="utf-8").splitlines()
         new_lines: list[str] = []
-        found = False
+        found_pause = False
+        found_mouse = False
+        found_respawn = False
 
         for line in lines:
             if line.startswith("pauseOnLostFocus:"):
@@ -409,13 +413,35 @@ class MinecraftLauncher:
                 if old_val != "false":
                     log.info("Patching options.txt: pauseOnLostFocus:%s → false", old_val)
                 new_lines.append("pauseOnLostFocus:false")
-                found = True
+                found_pause = True
+            elif line.startswith("rawMouseInput:"):
+                old_val = line.split(":", 1)[1].strip()
+                if old_val != "false":
+                    log.info("Patching options.txt: rawMouseInput:%s → false", old_val)
+                new_lines.append("rawMouseInput:false")
+                found_mouse = True
+            elif line.startswith("doImmediateRespawn:"):
+                old_val = line.split(":", 1)[1].strip()
+                if old_val != "true":
+                    log.info("Patching options.txt: doImmediateRespawn:%s → true", old_val)
+                new_lines.append("doImmediateRespawn:true")
+                found_respawn = True
+            elif line.startswith("hideServerAddress:"): # we inject our own setting loosely here
+                new_lines.append(line)
             else:
                 new_lines.append(line)
 
-        if not found:
+        if not found_pause:
             log.info("Adding pauseOnLostFocus:false to options.txt")
             new_lines.append("pauseOnLostFocus:false")
+            
+        if not found_mouse:
+            log.info("Adding rawMouseInput:false to options.txt")
+            new_lines.append("rawMouseInput:false")
+            
+        if not found_respawn:
+            log.info("Adding doImmediateRespawn:true to options.txt")
+            new_lines.append("doImmediateRespawn:true")
 
         opts_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
