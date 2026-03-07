@@ -89,7 +89,7 @@ _add("attack",        buttons=_b("left"))
 _add("use",           buttons=_b("right"))
 _add("pick_block",    buttons=_b("middle"))
 _add("drop",          keys=_k("Q"))
-_add("inventory",     keys=_k("E"))
+_add("inventory") # Disabled per user request (was keys=_k("E"))
 
 # 13-22: hotbar 1-0
 for i in range(1, 10):

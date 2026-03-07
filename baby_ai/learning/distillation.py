@@ -125,15 +125,18 @@ class DistillationEngine:
             dict with loss components and total loss.
         """
         self._staging_student.train()
-        self.teacher.eval()
+        # Ensure we don't accidentally set teacher to eval if it's shared with learner_thread
+        # self.teacher.eval()
 
         # Move batch to device
         inputs = {}
+        valid_keys = {"vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor", "hidden"}
         for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                inputs[k] = v.to(device)
-            else:
-                inputs[k] = v
+            if k in valid_keys:
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(device)
+                else:
+                    inputs[k] = v
 
         # Get Teacher targets (no grad)
         with torch.no_grad():

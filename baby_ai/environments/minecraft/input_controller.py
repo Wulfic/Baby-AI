@@ -199,7 +199,8 @@ class InputController:
 
         if x < 0 or y < 0:
             _, _, cw, ch = self._window.get_client_rect()
-            x, y = cw // 2, ch // 2
+            # Shift Y slightly up to hit 'Respawn' and avoid 'Title Screen' button
+            x, y = cw // 2, (ch // 2) - int(ch * 0.15)
 
         lp = _makelparam(x, y)
 
@@ -216,7 +217,8 @@ class InputController:
         """Send a mouse-button-up event."""
         if x < 0 or y < 0:
             _, _, cw, ch = self._window.get_client_rect()
-            x, y = cw // 2, ch // 2
+            # Shift Y slightly up to hit 'Respawn' and avoid 'Title Screen' button
+            x, y = cw // 2, (ch // 2) - int(ch * 0.15)
 
         lp = _makelparam(x, y)
 

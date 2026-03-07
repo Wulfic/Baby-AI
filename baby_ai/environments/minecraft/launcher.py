@@ -426,6 +426,10 @@ class MinecraftLauncher:
                     log.info("Patching options.txt: doImmediateRespawn:%s → true", old_val)
                 new_lines.append("doImmediateRespawn:true")
                 found_respawn = True
+            elif line.startswith("key_key.inventory:"):
+                new_lines.append("key_key.inventory:key.keyboard.unknown")
+            elif line.startswith("key_key.chat:"):
+                new_lines.append("key_key.chat:key.keyboard.unknown")
             elif line.startswith("hideServerAddress:"): # we inject our own setting loosely here
                 new_lines.append(line)
             else:
