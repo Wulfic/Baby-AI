@@ -53,6 +53,7 @@ class DistillationEngine:
         feature_weight: float = 0.5,
         temperature: float = 2.0,
         use_amp: bool = True,
+        teacher_lock: threading.Lock | None = None,
     ):
         self.student = student
         self.teacher = teacher
@@ -61,6 +62,7 @@ class DistillationEngine:
         self.feature_weight = feature_weight
         self.temperature = temperature
         self.use_amp = use_amp
+        self._teacher_lock = teacher_lock or threading.Lock()
 
         # Create a staging copy of Student for offline updates
         self._staging_student = copy.deepcopy(student)
@@ -124,9 +126,11 @@ class DistillationEngine:
         Returns:
             dict with loss components and total loss.
         """
+        # Ensure staging student is on the correct device (lazy move —
+        # the deepcopy at init time happens before .to(device) is called
+        # on the live student, so the copy starts on CPU).
+        self._staging_student.to(device)
         self._staging_student.train()
-        # Ensure we don't accidentally set teacher to eval if it's shared with learner_thread
-        # self.teacher.eval()
 
         # Move batch to device
         inputs = {}
@@ -139,8 +143,18 @@ class DistillationEngine:
                     inputs[k] = v
 
         # Get Teacher targets (no grad)
-        with torch.no_grad():
-            teacher_out = self.teacher(**inputs)
+        # Wrap in autocast so teacher outputs match the dtype that
+        # autocast will produce for the student forward pass.
+        # Acquire teacher lock to prevent concurrent forward on the
+        # same cuDNN GRU from the learner thread (reserve buffers
+        # are not thread-safe).
+        with self._teacher_lock:
+            with torch.no_grad():
+                if self.use_amp:
+                    with torch.amp.autocast("cuda"):
+                        teacher_out = self.teacher(**inputs)
+                else:
+                    teacher_out = self.teacher(**inputs)
 
         # Get Student outputs
         if self.use_amp:

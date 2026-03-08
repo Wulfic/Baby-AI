@@ -108,13 +108,46 @@ class ScreenCapture:
         return tensor.unsqueeze(0)  # (1, C, H, W)
 
     def grab_both(self) -> Tuple[np.ndarray, torch.Tensor]:
-        """Return (raw_bgr, model_tensor) in one capture to avoid double-grab."""
-        bgr = self.grab_raw()
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        """Return ``(native_bgr, model_tensor)`` from a single capture.
+
+        ``native_bgr`` is at the Minecraft window's native client-area
+        resolution (e.g. 854 x 480) so that screen-region analysers have
+        enough pixel detail to detect hotbar changes, block-crack
+        animations, etc.
+
+        ``model_tensor`` is resized to ``self._resolution`` (typically
+        160 x 160) for the neural-network forward pass.
+        """
+        sct = _get_mss()
+
+        sx, sy, sw, sh = self._window.get_client_rect()
+        if sw <= 0 or sh <= 0:
+            log.warning("Minecraft client area has zero size. Returning black frame.")
+            black = np.zeros(
+                (self._resolution[0], self._resolution[1], 3), dtype=np.uint8,
+            )
+            tensor = torch.zeros(
+                1, 3, self._resolution[0], self._resolution[1],
+            )
+            return black, tensor
+
+        self._region = {"left": sx, "top": sy, "width": sw, "height": sh}
+        shot = sct.grab(self._region)
+
+        # Native-resolution BGR (no resize) — used by screen analysers
+        native_bgr = np.array(shot, dtype=np.uint8)[..., :3]
+
+        # Downscale to model resolution for the vision encoder
+        model_bgr = cv2.resize(
+            native_bgr,
+            (self._resolution[1], self._resolution[0]),
+        )
+        rgb = cv2.cvtColor(model_bgr, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).float()
         if self._normalize:
             tensor = tensor / 255.0
-        return bgr, tensor.unsqueeze(0)
+
+        return native_bgr, tensor.unsqueeze(0)
 
     @property
     def resolution(self) -> Tuple[int, int]:

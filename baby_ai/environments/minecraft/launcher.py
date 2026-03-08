@@ -159,6 +159,25 @@ def _build_classpath(mc_dir: Path, version_data: Dict[str, Any]) -> str:
                     jars.append(str(jar))
                 else:
                     missing.append(path)
+        else:
+            # Maven-style library (used by Fabric Loader) — derive
+            # the JAR path from  group:artifact:version  notation.
+            name = lib.get("name", "")
+            if name:
+                parts = name.split(":")
+                if len(parts) >= 3:
+                    group, art_name, ver = parts[0], parts[1], parts[2]
+                    rel = (
+                        group.replace(".", os.sep)
+                        + os.sep + art_name
+                        + os.sep + ver
+                        + os.sep + f"{art_name}-{ver}.jar"
+                    )
+                    jar = libs_dir / rel
+                    if jar.is_file():
+                        jars.append(str(jar))
+                    else:
+                        missing.append(rel)
 
     # Append the version JAR
     version_id = version_data["id"]
@@ -478,6 +497,25 @@ class MinecraftLauncher:
         with open(version_json) as f:
             version_data = json.load(f)
 
+        # ── Auto-detect Fabric Loader ───────────────────────────
+        # If the user has installed Fabric Loader, a version folder
+        # like  fabric-loader-0.16.9-1.21.1  will exist alongside
+        # the vanilla one.  We prefer it so the Baby-AI Bridge mod
+        # (and any other Fabric mods) get loaded automatically.
+        fabric_version = self._find_fabric_version()
+        if fabric_version:
+            log.info("Fabric Loader detected: %s", fabric_version)
+            fabric_json_path = (
+                self._mc_dir / "versions" / fabric_version
+                / f"{fabric_version}.json"
+            )
+            with open(fabric_json_path) as f:
+                fabric_data = json.load(f)
+
+            # Fabric's JSON inherits from the vanilla version —
+            # merge so we get the full classpath + Fabric's main class.
+            version_data = self._merge_fabric_json(version_data, fabric_data)
+
         main_class = version_data["mainClass"]
         java_info = version_data.get("javaVersion", {})
         java_component = java_info.get("component", "java-runtime-delta")
@@ -728,3 +766,66 @@ class MinecraftLauncher:
             return entry.get("name", self._player_name), entry.get("uuid", self._player_uuid)
 
         return self._player_name, self._player_uuid
+
+    # ── Fabric Loader support ───────────────────────────────────
+
+    def _find_fabric_version(self) -> Optional[str]:
+        """
+        Find the latest installed Fabric Loader version matching our MC version.
+
+        Fabric Loader installs itself as a version folder named like
+        ``fabric-loader-0.16.9-1.21.1`` in ``.minecraft/versions/``.
+
+        Returns:
+            The version folder name, or ``None`` if Fabric is not installed.
+        """
+        versions_dir = self._mc_dir / "versions"
+        if not versions_dir.is_dir():
+            return None
+
+        prefix = "fabric-loader-"
+        suffix = f"-{self._version}"
+        best: Optional[str] = None
+
+        for entry in versions_dir.iterdir():
+            if (entry.is_dir()
+                    and entry.name.startswith(prefix)
+                    and entry.name.endswith(suffix)):
+                json_file = entry / f"{entry.name}.json"
+                if json_file.is_file():
+                    # Pick the lexicographically highest (= newest loader)
+                    if best is None or entry.name > best:
+                        best = entry.name
+
+        return best
+
+    @staticmethod
+    def _merge_fabric_json(
+        parent: Dict[str, Any],
+        child: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Merge a Fabric Loader version JSON with its parent (vanilla).
+
+        Fabric overrides ``mainClass`` and *prepends* its own libraries
+        and JVM arguments to the vanilla ones.
+        """
+        merged = dict(parent)
+
+        # Main class — Fabric's Knot launcher replaces the vanilla one
+        if "mainClass" in child:
+            merged["mainClass"] = child["mainClass"]
+
+        # Libraries — Fabric's must come before vanilla's on the classpath
+        if "libraries" in child:
+            merged["libraries"] = child["libraries"] + parent.get("libraries", [])
+
+        # JVM arguments — prepend Fabric-specific ones
+        parent_jvm = parent.get("arguments", {}).get("jvm", [])
+        child_jvm  = child.get("arguments", {}).get("jvm", [])
+        if child_jvm:
+            if "arguments" not in merged:
+                merged["arguments"] = {}
+            merged["arguments"]["jvm"] = child_jvm + parent_jvm
+
+        return merged

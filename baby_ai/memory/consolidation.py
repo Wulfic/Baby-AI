@@ -87,6 +87,10 @@ class EWC:
         for n in fisher:
             fisher[n] /= max(count, 1)
 
+        # Restore training mode — callers (e.g. the learner thread)
+        # expect the model to remain in .train() mode.
+        model.train()
+
         # Store snapshot
         self._fisher = fisher
         self._params_star = {

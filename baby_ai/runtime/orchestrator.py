@@ -11,7 +11,9 @@ This is the top-level controller that:
 from __future__ import annotations
 
 import os
+import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -89,6 +91,11 @@ class Orchestrator:
         )
 
         # --- Distillation ---
+        # Lock to prevent concurrent forward/backward on the Teacher
+        # from the learner and distillation threads (cuDNN GRU is not
+        # thread-safe — its internal reserve buffers get corrupted).
+        self._teacher_lock = threading.Lock()
+
         self.distill_engine = DistillationEngine(
             student=self.student,
             teacher=self.teacher,
@@ -96,6 +103,7 @@ class Orchestrator:
             kl_weight=self.config.training.distill_kl_weight,
             feature_weight=self.config.training.distill_feature_weight,
             use_amp=self.config.training.use_amp,
+            teacher_lock=self._teacher_lock,
         )
 
         # --- Runtime threads ---
@@ -112,6 +120,7 @@ class Orchestrator:
             consolidator=self.consolidator,
             config=self.config.training,
             device=device,
+            teacher_lock=self._teacher_lock,
         )
 
         self.distill_thread = DistillThread(
@@ -192,6 +201,7 @@ class Orchestrator:
         """Save model weights, optimizer state, and replay metadata."""
         ensure_dirs()
         path = CHECKPOINT_DIR / f"checkpoint_{tag}.pt"
+        tmp_path = path.with_suffix(".pt.tmp")
         torch.save({
             "student_state_dict": self.student.state_dict(),
             "teacher_state_dict": self.teacher.state_dict(),
@@ -200,17 +210,38 @@ class Orchestrator:
             "learner_step": self.learner_thread.step_count,
             "distill_count": self.distill_thread.stats["distill_count"],
             "replay_stats": self.replay.stats(),
-        }, path)
+        }, tmp_path)
+
+        # Atomic rename — prevents corrupted checkpoints if the process
+        # crashes mid-write (especially on network storage like Z:\).
+        tmp_path.replace(path)
         log.info("Checkpoint saved: %s", path)
         return path
 
     def load_checkpoint(self, path: Path | str) -> None:
-        """Load a checkpoint."""
+        """Load a checkpoint.  Tolerates corrupt / truncated files."""
         path = Path(path)
         if not path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
+            log.warning("Checkpoint not found: %s — starting fresh.", path)
+            return
 
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        except (RuntimeError, zipfile.BadZipFile, EOFError, Exception) as exc:
+            log.error(
+                "Checkpoint file is corrupt or unreadable: %s (%s). "
+                "Starting fresh and renaming bad file.",
+                path, exc,
+            )
+            # Keep the bad file for debugging but don't block startup
+            bad_path = path.with_suffix(".pt.bad")
+            try:
+                path.rename(bad_path)
+                log.info("Renamed corrupt checkpoint → %s", bad_path)
+            except OSError:
+                pass
+            return
+
         self.student.load_state_dict(ckpt["student_state_dict"])
         self.teacher.load_state_dict(ckpt["teacher_state_dict"])
         if "icm_state_dict" in ckpt:

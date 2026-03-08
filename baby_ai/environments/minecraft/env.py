@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import time
+from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -36,10 +37,48 @@ from baby_ai.environments.minecraft.capture import ScreenCapture
 from baby_ai.environments.minecraft.input_guard import InputGuard
 from baby_ai.environments.minecraft.input_controller import InputController
 from baby_ai.environments.minecraft.launcher import MinecraftLauncher
+from baby_ai.environments.minecraft.screen_analyzer import (
+    detect_death,
+    BlockBreakTracker,
+    HotbarTracker,
+    CraftingTracker,
+    PlacementTracker,
+    BuildingStreakTracker,
+    CreativeSequenceTracker,
+)
+from baby_ai.environments.minecraft.mod_bridge import ModBridge
 from baby_ai.environments.minecraft.window import WindowManager
 from baby_ai.utils.logging import get_logger
 
 log = get_logger("mc_env")
+
+# ── Action categories for reward shaping ────────────────────────
+# Which action indices involve actual interaction with the world
+_INTERACTION_ACTIONS = set()
+_MOVEMENT_ACTIONS = set()
+for _i, _a in enumerate(MINECRAFT_ACTIONS):
+    # Actions that involve left/right mouse (attack / use / place)
+    if _a.buttons:
+        _INTERACTION_ACTIONS.add(_i)
+    # Actions that involve movement keys (W, A, S, D, SPACE)
+    if _a.keys:
+        _INTERACTION_ACTIONS.add(_i)  # any non-noop is "doing something"
+    # Specifically movement (walking, jumping, strafing)
+    from baby_ai.environments.minecraft.input_controller import VK as _VK
+    _move_vks = {_VK.get(k) for k in ("W", "S", "A", "D", "SPACE") if k in _VK}
+    if _a.keys & _move_vks:
+        _MOVEMENT_ACTIONS.add(_i)
+# Actions that specifically attack or place/use blocks
+_BLOCK_INTERACTION_ACTIONS = set()
+_ATTACK_ACTIONS = set()
+_USE_ACTIONS = set()
+for _i, _a in enumerate(MINECRAFT_ACTIONS):
+    if "left" in _a.buttons or "right" in _a.buttons:
+        _BLOCK_INTERACTION_ACTIONS.add(_i)
+    if "left" in _a.buttons:
+        _ATTACK_ACTIONS.add(_i)
+    if "right" in _a.buttons:
+        _USE_ACTIONS.add(_i)
 
 
 class MinecraftEnv(GameEnvironment):
@@ -81,6 +120,8 @@ class MinecraftEnv(GameEnvironment):
         launch_timeout_sec: float = 120.0,
         # ── Input guard ─────────────────────────────────────────
         block_user_input: bool = False,
+        # ── Mod bridge ──────────────────────────────────────────
+        mod_bridge_port: int = 5556,
     ):
         # ── Auto-launch Minecraft if requested ──────────────────
         self._launcher: Optional[MinecraftLauncher] = None
@@ -137,6 +178,39 @@ class MinecraftEnv(GameEnvironment):
         self._last_frame: Optional[np.ndarray] = None
         self._prev_action_id: int = 0
 
+        # ── Reward-shaping state ────────────────────────────────
+        # Frame history for visual change detection
+        self._frame_history: deque[np.ndarray] = deque(maxlen=10)
+        # Action history for diversity tracking
+        self._action_history: deque[int] = deque(maxlen=50)
+        # Rolling noop/idle counter — penalise extended inactivity
+        self._idle_streak: int = 0
+        # Track sustained interaction (holding attack on a block)
+        self._interaction_streak: int = 0
+        # Baseline frame for longer-horizon exploration detection
+        self._baseline_frame: Optional[np.ndarray] = None
+        self._baseline_frame_step: int = 0
+
+        # ── Screen-based event detectors ────────────────────────
+        self._block_break_tracker = BlockBreakTracker()
+        self._hotbar_tracker = HotbarTracker()
+        self._crafting_tracker = CraftingTracker()
+        self._placement_tracker = PlacementTracker()
+        self._building_streak = BuildingStreakTracker()
+        self._creative_sequence = CreativeSequenceTracker()
+        self._is_dead: bool = False
+        self._raw_frame: Optional[np.ndarray] = None  # full-res BGR
+
+        # ── Stagnation penalty ──────────────────────────────────
+        # Penalise if no crafting, breaking, or building for ~30 s.
+        # Convert 30 real-time seconds into steps using step_delay.
+        self._stagnation_timeout = max(1, int(30.0 / max(self._step_delay, 0.01)))
+        self._last_productive_step: int = 0
+
+        # ── Mod bridge (authoritative game events via TCP) ──────
+        self._mod_bridge = ModBridge(port=mod_bridge_port)
+        self._mod_bridge.start()
+
         log.info(
             "MinecraftEnv ready: window='%s' mode=%s resolution=%s guard=%s launcher=%s",
             self._window.title, input_mode, resolution,
@@ -152,6 +226,28 @@ class MinecraftEnv(GameEnvironment):
         self._step_count = 0
         self._prev_action_id = 0
         self._last_step_time = time.perf_counter()
+
+        # Reset reward-shaping state
+        self._frame_history.clear()
+        self._action_history.clear()
+        self._idle_streak = 0
+        self._interaction_streak = 0
+        self._baseline_frame = None
+        self._baseline_frame_step = 0
+
+        # Reset screen-based detectors
+        self._block_break_tracker.reset()
+        self._hotbar_tracker.reset()
+        self._crafting_tracker.reset()
+        self._placement_tracker.reset()
+        self._building_streak.reset()
+        self._creative_sequence.reset()
+        self._is_dead = False
+        self._last_productive_step = 0
+
+        # Drain any stale mod events from the previous episode
+        if self._mod_bridge is not None:
+            self._mod_bridge.drain_events()
 
         # Brief pause to let key releases propagate
         time.sleep(0.05)
@@ -193,8 +289,12 @@ class MinecraftEnv(GameEnvironment):
         # ── Observe ─────────────────────────────────────────────
         obs = self._observe()
 
+        # ── Track action for reward shaping ─────────────────────
+        self._action_history.append(action_id)
+
         # ── Reward heuristics ───────────────────────────────────
-        reward = self._compute_reward(obs)
+        reward_info = self._compute_reward(obs, action_id)
+        reward = reward_info["total"]
 
         done = not self._window.is_valid
         info = {
@@ -202,6 +302,7 @@ class MinecraftEnv(GameEnvironment):
             "action_name": action.name,
             "has_look": action.look is not None,
             "window_focused": self._window.is_focused,
+            "reward_breakdown": reward_info,
         }
 
         self._step_count += 1
@@ -212,6 +313,10 @@ class MinecraftEnv(GameEnvironment):
     def close(self) -> None:
         """Release all held inputs, stop input guard, and stop Minecraft."""
         self._input.release_all()
+
+        if self._mod_bridge is not None:
+            self._mod_bridge.stop()
+            self._mod_bridge = None
 
         if self._guard is not None:
             self._guard.stop()
@@ -241,6 +346,7 @@ class MinecraftEnv(GameEnvironment):
         """Capture a frame and package it as a model-ready observation dict."""
         raw_bgr, vision_tensor = self._capture.grab_both()
         self._last_frame = raw_bgr
+        self._raw_frame = raw_bgr  # native window resolution for analysers
 
         # Audio placeholder — zero mel spectrogram with correct shape:
         # (B, n_mels, T) where n_mels=64, T≈100 for 1 sec at 16kHz/160 hop
@@ -256,21 +362,368 @@ class MinecraftEnv(GameEnvironment):
             "sensor": sensor_tensor,    # (1, S)
         }
 
-    def _compute_reward(self, obs: Dict[str, torch.Tensor]) -> float:
+    def _compute_reward(self, obs: Dict[str, torch.Tensor], action_id: int) -> Dict[str, float]:
         """
-        Compute a lightweight extrinsic reward from frame analysis.
+        Compute multi-channel extrinsic reward from frame analysis and action.
 
-        For V1 this returns 0.0 — the primary learning signal comes
-        from intrinsic curiosity (ICM) in the learning module.
+        Returns a dict with per-channel values AND a "total" key with
+        the combined extrinsic signal.  The intrinsic (ICM) reward is
+        computed externally — this only handles environment-side shaping.
 
-        Future enhancements:
-        - Health bar delta detection (template matching)
-        - Death screen detection ("You Died!" text)
-        - Time-alive bonus
-        - Inventory change detection
+        Channels (* = new creation-focused channels)
+        --------
+        survival        : tiny constant bonus for staying alive
+        visual_change   : reward for frames that look meaningfully different
+        action_diversity: reward for trying many different actions recently
+        interaction     : reward when attack/use is held while visual
+                          change is detected (= block broken / placed)
+        exploration     : reward when the scene looks very different from
+                          a baseline captured N steps ago
+        idle_penalty    : negative reward for noop / standing still
+        block_break     : crosshair crack detection (mining)
+        item_pickup     : hotbar change detection (collecting items)
+        death_penalty   : penalty for dying
+        movement        : reward for locomotion with visual confirmation
+        * block_place     : right-click that changes forward view (building)
+        * crafting         : crafting UI interaction + hotbar change
+        * building_streak  : bonus for consecutive placements (structures)
+        * creative_sequence: bonus for gather->craft->build pipeline
         """
-        # Small survival bonus to encourage continued play
-        return 0.01
+        rewards: Dict[str, float] = {}
+
+        # ────────────────────────────────────────────────────────
+        # 1. Survival bonus (very small, prevents total-zero signal)
+        # ────────────────────────────────────────────────────────
+        rewards["survival"] = 0.005
+
+        # ────────────────────────────────────────────────────────
+        # 2. Visual change — compare current frame to previous
+        # ────────────────────────────────────────────────────────
+        vision_tensor = obs["vision"]  # (1, 3, H, W)
+        frame_np = vision_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        frame_u8 = (frame_np * 255).astype(np.uint8) if frame_np.max() <= 1.0 else frame_np.astype(np.uint8)
+
+        visual_change = 0.0
+        if self._frame_history:
+            prev = self._frame_history[-1]
+            diff = np.abs(frame_u8.astype(np.float32) - prev.astype(np.float32)).mean() / 255.0
+            if diff > 0.02:
+                visual_change = min(diff * 5.0, 1.0)
+        rewards["visual_change"] = visual_change
+
+        self._frame_history.append(frame_u8)
+
+        # ────────────────────────────────────────────────────────
+        # 3. Action diversity — entropy-like bonus over recent actions
+        # ────────────────────────────────────────────────────────
+        action_div = 0.0
+        if len(self._action_history) >= 10:
+            recent = list(self._action_history)[-30:]
+            unique_ratio = len(set(recent)) / max(len(recent), 1)
+            action_div = unique_ratio * 0.3
+        rewards["action_diversity"] = action_div
+
+        # ────────────────────────────────────────────────────────
+        # 4. Interaction bonus — attack/use that causes visual change
+        #    Only rewards MEANINGFUL interaction: requires significant
+        #    visual change to prove the button press did something
+        #    real in the world (not just clicking in empty air).
+        # ────────────────────────────────────────────────────────
+        interaction_bonus = 0.0
+        if action_id in _BLOCK_INTERACTION_ACTIONS:
+            self._interaction_streak += 1
+            if visual_change > 0.06:
+                # Large visual change while interacting — real impact
+                interaction_bonus = 0.5 + min(visual_change * 2.0, 0.5)
+            elif self._interaction_streak >= 5 and visual_change > 0.03:
+                # Sustained interaction with moderate change (mining)
+                interaction_bonus = 0.2
+            # Single clicks with tiny/no visual change = no reward
+        else:
+            self._interaction_streak = 0
+        rewards["interaction"] = interaction_bonus
+
+        # ────────────────────────────────────────────────────────
+        # 5. Exploration — long-horizon scene difference
+        # ────────────────────────────────────────────────────────
+        exploration_bonus = 0.0
+        baseline_interval = 100
+        if self._baseline_frame is None:
+            self._baseline_frame = frame_u8.copy()
+            self._baseline_frame_step = self._step_count
+        elif self._step_count - self._baseline_frame_step >= baseline_interval:
+            base_diff = np.abs(
+                frame_u8.astype(np.float32) - self._baseline_frame.astype(np.float32)
+            ).mean() / 255.0
+            if base_diff > 0.08:
+                exploration_bonus = min(base_diff * 3.0, 1.0)
+            self._baseline_frame = frame_u8.copy()
+            self._baseline_frame_step = self._step_count
+        rewards["exploration"] = exploration_bonus
+
+        # ────────────────────────────────────────────────────────
+        # 6. Movement bonus — ONLY reward when visual change
+        #    confirms actual movement (not just pressing W).
+        # ────────────────────────────────────────────────────────
+        movement_bonus = 0.0
+        if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02:
+            # Visual change proves the agent actually moved somewhere
+            movement_bonus = visual_change * 0.3
+        rewards["movement"] = movement_bonus
+
+        # ────────────────────────────────────────────────────────
+        # 7. Idle penalty — discourage noop / repeated same action
+        # ────────────────────────────────────────────────────────
+        idle_penalty = 0.0
+        if action_id == 0:
+            self._idle_streak += 1
+            if self._idle_streak > 5:
+                idle_penalty = min(0.05 * (self._idle_streak - 5), 0.3)
+        else:
+            self._idle_streak = max(0, self._idle_streak - 2)
+
+        if len(self._action_history) >= 10:
+            last_10 = list(self._action_history)[-10:]
+            if len(set(last_10)) == 1:
+                idle_penalty += 0.1
+        rewards["idle_penalty"] = idle_penalty
+
+        # ────────────────────────────────────────────────────────
+        # Drain authoritative game events from the Fabric mod bridge.
+        # When connected, these override the pixel-based detectors
+        # for block break, item pickup, block place, crafting, and
+        # death — giving accurate, no-false-positive signals.
+        # ────────────────────────────────────────────────────────
+        mod_events = (
+            self._mod_bridge.drain_events()
+            if self._mod_bridge is not None and self._mod_bridge.connected
+            else []
+        )
+        mod_blocks_broken = [e for e in mod_events if e.get("event") == "block_broken"]
+        mod_blocks_placed = [e for e in mod_events if e.get("event") == "block_placed"]
+        mod_items_crafted = [e for e in mod_events if e.get("event") == "item_crafted"]
+        mod_items_picked  = [e for e in mod_events if e.get("event") == "item_picked_up"]
+        mod_deaths        = [e for e in mod_events if e.get("event") == "player_death"]
+
+        use_mod = bool(mod_events) or (
+            self._mod_bridge is not None and self._mod_bridge.connected
+        )
+
+        if mod_events and self._step_count % 50 == 0:
+            log.info("Mod events step %d: %s",
+                     self._step_count,
+                     [e["event"] for e in mod_events])
+
+        # ────────────────────────────────────────────────────────
+        # 8. Block-break detection
+        #    MOD: 1.0 per block break event (authoritative)
+        #    PIXEL FALLBACK: crosshair crack animation
+        # ────────────────────────────────────────────────────────
+        if use_mod:
+            block_break_reward = float(len(mod_blocks_broken))
+            # Still update pixel tracker state so it stays in sync
+            if self._raw_frame is not None:
+                is_attacking = action_id in _ATTACK_ACTIONS
+                self._block_break_tracker.update(
+                    self._raw_frame, is_attacking=is_attacking,
+                )
+            block_break_score = block_break_reward
+        else:
+            block_break_score = 0.0
+            if self._raw_frame is not None:
+                is_attacking = action_id in _ATTACK_ACTIONS
+                block_break_score = self._block_break_tracker.update(
+                    self._raw_frame, is_attacking=is_attacking,
+                )
+            block_break_reward = block_break_score if block_break_score > 0.3 else 0.0
+        rewards["block_break"] = block_break_reward
+
+        # ────────────────────────────────────────────────────────
+        # 9. Crafting detection
+        #    MOD: 1.0 per crafting event
+        #    PIXEL FALLBACK: inventory UI + hotbar change
+        # ────────────────────────────────────────────────────────
+        craft_info = {"ui_open": False, "craft_score": 0.0, "frames_in_ui": 0}
+        if self._raw_frame is not None:
+            craft_info = self._crafting_tracker.update(self._raw_frame)
+
+        if use_mod:
+            # Each crafted item is a full 1.0 reward
+            craft_score_mod = float(len(mod_items_crafted))
+            # Override pixel tracker score with mod score
+            craft_info = dict(craft_info)  # copy
+            craft_info["craft_score"] = craft_score_mod
+
+        # ────────────────────────────────────────────────────────
+        # 10. Item pickup
+        #    MOD: scaled by count, capped at 1.0
+        #    PIXEL FALLBACK: hotbar region change (suppressed during UI)
+        # ────────────────────────────────────────────────────────
+        if use_mod:
+            total_picked = sum(e.get("count", 1) for e in mod_items_picked)
+            item_pickup = min(total_picked / 5.0, 1.0) if total_picked > 0 else 0.0
+            # Keep pixel tracker in sync
+            if self._raw_frame is not None:
+                self._hotbar_tracker.update(self._raw_frame)
+        else:
+            item_pickup = 0.0
+            if self._raw_frame is not None and not craft_info["ui_open"]:
+                item_pickup = self._hotbar_tracker.update(self._raw_frame)
+            elif self._raw_frame is not None:
+                self._hotbar_tracker.update(self._raw_frame)
+        rewards["item_pickup"] = item_pickup
+
+        # ────────────────────────────────────────────────────────
+        # 11. Death penalty
+        #    MOD: 1.0 per death event
+        #    PIXEL FALLBACK: red "You Died!" overlay
+        # ────────────────────────────────────────────────────────
+        if use_mod:
+            death_penalty = float(len(mod_deaths))
+            if death_penalty > 0:
+                log.info("Death detected via mod at step %d", self._step_count)
+            # Keep pixel tracker in sync
+            if self._raw_frame is not None:
+                self._is_dead = detect_death(self._raw_frame)
+        else:
+            death_penalty = 0.0
+            if self._raw_frame is not None:
+                died_now = detect_death(self._raw_frame)
+                if died_now and not self._is_dead:
+                    death_penalty = 1.0
+                    log.info("Death detected at step %d", self._step_count)
+                self._is_dead = died_now
+        rewards["death_penalty"] = death_penalty
+
+        # ============================================
+        # * CREATION-FOCUSED REWARD CHANNELS
+        # ============================================
+
+        # ────────────────────────────────────────────────────────
+        # 12. Block placement detection
+        #    MOD: 1.0 per placement event
+        #    PIXEL FALLBACK: right-click + forward visual change
+        # ────────────────────────────────────────────────────────
+        if use_mod:
+            block_place_score = float(len(mod_blocks_placed))
+            # Keep pixel tracker in sync
+            if self._raw_frame is not None:
+                is_using = action_id in _USE_ACTIONS
+                self._placement_tracker.update(
+                    self._raw_frame, is_using=is_using,
+                )
+        else:
+            block_place_score = 0.0
+            if self._raw_frame is not None:
+                is_using = action_id in _USE_ACTIONS
+                block_place_score = self._placement_tracker.update(
+                    self._raw_frame, is_using=is_using,
+                )
+        rewards["block_place"] = block_place_score
+
+        # ────────────────────────────────────────────────────────
+        # 13. Crafting reward (craft_info from section 9)
+        # ────────────────────────────────────────────────────────
+        rewards["crafting"] = craft_info["craft_score"]
+
+        # Small bonus for engaging with the crafting UI long enough
+        # to actually craft — only when pixel fallback is in use
+        # and the tracker hasn't already fired a real craft_score.
+        if (not use_mod
+                and craft_info["ui_open"]
+                and craft_info["frames_in_ui"] > 15
+                and craft_info["craft_score"] == 0.0):
+            rewards["crafting"] += 0.02
+
+        # ────────────────────────────────────────────────────────
+        # 14. Building streak — consecutive placements build
+        #     structures; super-linear reward scaling.
+        # ────────────────────────────────────────────────────────
+        placed_this_step = block_place_score > 0.5
+        streak_info = self._building_streak.update(placed_this_step)
+        rewards["building_streak"] = streak_info["streak_bonus"]
+
+        # ────────────────────────────────────────────────────────
+        # 15. Creative sequence — gather → craft → build pipeline
+        #     Large bonus for completing creative workflow cycles.
+        # ────────────────────────────────────────────────────────
+        seq_info = self._creative_sequence.update(
+            block_break=block_break_reward,
+            item_pickup=item_pickup,
+            craft_score=craft_info["craft_score"],
+            block_place=block_place_score,
+        )
+        rewards["creative_sequence"] = seq_info["stage_reward"] + seq_info["cycle_bonus"]
+
+        # ────────────────────────────────────────────────────────
+        # 16. Stagnation penalty — no crafting, breaking, or
+        #     building for ~30 seconds triggers an escalating
+        #     penalty to push the agent out of idle wandering.
+        # ────────────────────────────────────────────────────────
+        productive = (
+            block_break_reward > 0
+            or craft_info["craft_score"] > 0
+            or block_place_score > 0.3
+            or item_pickup > 0
+        )
+        if productive:
+            self._last_productive_step = self._step_count
+
+        steps_since_productive = self._step_count - self._last_productive_step
+        stagnation_penalty = 0.0
+        if steps_since_productive > self._stagnation_timeout:
+            # How many multiples of the timeout we've exceeded
+            overshoot = (steps_since_productive - self._stagnation_timeout) / self._stagnation_timeout
+            # Escalates from 0.1 up to a cap of 0.5
+            stagnation_penalty = min(0.1 + 0.15 * overshoot, 0.5)
+        rewards["stagnation_penalty"] = stagnation_penalty
+
+        # ────────────────────────────────────────────────────────
+        # Diagnostic logging — raw detector scores every 50 steps
+        # so we can verify detectors are actually producing signal.
+        # ────────────────────────────────────────────────────────
+        if self._step_count % 50 == 0:
+            raw_h, raw_w = (self._raw_frame.shape[:2] if self._raw_frame is not None else (0, 0))
+            bridge_status = "connected" if (self._mod_bridge and self._mod_bridge.connected) else "disconnected"
+            log.info(
+                "Detector diagnostics step %d | mod_bridge=%s | raw_frame=%dx%d"
+                " | blk_brk=%.3f item=%.3f place=%.3f"
+                " | craft=%.3f death=%.1f"
+                " | vis_change=%.4f interact=%.3f",
+                self._step_count, bridge_status, raw_h, raw_w,
+                block_break_reward, item_pickup, block_place_score,
+                craft_info["craft_score"], death_penalty,
+                visual_change, interaction_bonus,
+            )
+
+        # ────────────────────────────────────────────────────────
+        # Combine -- weights emphasise CREATION over exploration
+        # ────────────────────────────────────────────────────────
+        total = (
+            # Baseline survival
+            rewards["survival"]
+            # Old channels (reduced weights on generic activity)
+            + rewards["visual_change"] * 0.2
+            + rewards["action_diversity"] * 0.5
+            + rewards["interaction"] * 0.8
+            + rewards["exploration"] * 0.8
+            + rewards["movement"] * 0.3
+            # Resource gathering (essential precursor to crafting)
+            + rewards["block_break"] * 4.0
+            + rewards["item_pickup"] * 6.0
+            # * Creation channels (highest weights)
+            + rewards["block_place"] * 4.0
+            + rewards["crafting"] * 25.0
+            + rewards["building_streak"] * 3.0
+            + rewards["creative_sequence"] * 6.0
+            # Penalties
+            - rewards["idle_penalty"]
+            - rewards["death_penalty"] * 10.0
+            - rewards["stagnation_penalty"]
+        )
+        rewards["total"] = total
+
+        return rewards
 
     # ── Diagnostics ─────────────────────────────────────────────
 

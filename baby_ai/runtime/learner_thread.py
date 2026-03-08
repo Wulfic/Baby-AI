@@ -52,6 +52,7 @@ class LearnerThread:
         consolidator: Consolidator,
         config: TrainingConfig | None = None,
         device: str = "cuda",
+        teacher_lock: threading.Lock | None = None,
     ):
         self.teacher = teacher
         self.replay = replay
@@ -59,6 +60,7 @@ class LearnerThread:
         self.consolidator = consolidator
         self.config = config or DEFAULT_CONFIG.training
         self.device = device
+        self._teacher_lock = teacher_lock or threading.Lock()
 
         # Optimizer with parameter-group-specific learning rates
         encoder_params = []
@@ -143,19 +145,23 @@ class LearnerThread:
         weights_t = torch.from_numpy(weights).float().to(self.device)
 
         # Forward pass with AMP
-        if self.config.use_amp:
-            with torch.amp.autocast("cuda"):
+        # Acquire the teacher lock to prevent the distillation thread
+        # from running a concurrent forward on the same cuDNN GRU
+        # (whose internal reserve buffers are not thread-safe).
+        with self._teacher_lock:
+            if self.config.use_amp:
+                with torch.amp.autocast("cuda"):
+                    loss_dict = self._compute_loss(batch, weights_t)
+            else:
                 loss_dict = self._compute_loss(batch, weights_t)
-        else:
-            loss_dict = self._compute_loss(batch, weights_t)
 
-        total_loss = loss_dict["total"]
+            total_loss = loss_dict["total"]
 
-        # Backward with gradient accumulation
-        if self.scaler is not None:
-            self.scaler.scale(total_loss / self.config.gradient_accumulation_steps).backward()
-        else:
-            (total_loss / self.config.gradient_accumulation_steps).backward()
+            # Backward with gradient accumulation
+            if self.scaler is not None:
+                self.scaler.scale(total_loss / self.config.gradient_accumulation_steps).backward()
+            else:
+                (total_loss / self.config.gradient_accumulation_steps).backward()
 
         self._accum_count += 1
 

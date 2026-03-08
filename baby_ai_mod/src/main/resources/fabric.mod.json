@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "baby-ai-bridge",
+  "version": "${version}",
+
+  "name": "Baby-AI Bridge",
+  "description": "Streams Minecraft game events (block break/place, crafting, item pickup, death) to the Baby-AI training system via a local TCP socket.",
+  "authors": ["Baby-AI"],
+  "license": "MIT",
+
+  "environment": "*",
+
+  "entrypoints": {
+    "main": ["com.babyai.mod.BabyAiMod"]
+  },
+
+  "mixins": ["babyai.mixins.json"],
+
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft":    "~1.21.1",
+    "java":         ">=21",
+    "fabric-api":   "*"
+  }
+}

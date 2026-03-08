@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "com.babyai.mod.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "BlockItemMixin",
+    "ItemPickupMixin",
+    "CraftingMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

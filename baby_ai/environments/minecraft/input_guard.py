@@ -121,11 +121,32 @@ _ALWAYS_PASS_VKS = {
     0x91,   # VK_SCROLL (Scroll Lock — emergency toggle)
 }
 
+# Virtual key codes for hotkey detection
+_VK_Q = 0x51
+_VK_M = 0x4D
+_VK_P = 0x50
+_VK_CONTROL = 0x11
+
+# GetAsyncKeyState — lets us check modifier state inside the hook
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+
 # KBDLLHOOKSTRUCT layout
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("vkCode", wt.DWORD),
         ("scanCode", wt.DWORD),
+        ("flags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+# MSLLHOOKSTRUCT layout (for WH_MOUSE_LL)
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wt.POINT),
+        ("mouseData", wt.DWORD),
         ("flags", wt.DWORD),
         ("time", wt.DWORD),
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
@@ -153,6 +174,10 @@ class InputGuard:
         self._mc_hwnd = mc_hwnd
         self._enabled = False
         self._emergency_off = False  # Scroll Lock toggle
+        self._mouse_blocked = True   # Ctrl+M toggle for mouse blocking
+        self._kb_blocked = True      # Ctrl+M toggle for keyboard blocking
+        self._quit_requested = False  # Ctrl+Q sets this flag
+        self._ai_paused = False      # Ctrl+P toggle for pausing AI
         self._thread: Optional[threading.Thread] = None
         self._thread_id: Optional[int] = None
         self._kb_hook: Optional[ctypes.c_void_p] = None
@@ -189,7 +214,7 @@ class InputGuard:
 
         log.info(
             "Input guard ACTIVE — blocking user input to MC window (hwnd=%s). "
-            "Press Scroll Lock to emergency-toggle.",
+            "Scroll Lock=emergency-toggle | Ctrl+Q=save&quit | Ctrl+M=toggle input block | Ctrl+P=pause AI",
             hex(self._mc_hwnd),
         )
 
@@ -222,6 +247,10 @@ class InputGuard:
             return False
         return int(fg) == self._mc_hwnd
 
+    def _is_ctrl_held(self) -> bool:
+        """Check if Ctrl is currently held (via GetAsyncKeyState)."""
+        return (user32.GetAsyncKeyState(_VK_CONTROL) & 0x8000) != 0
+
     def _keyboard_hook_proc(
         self, nCode: int, wParam: int, lParam: int,
     ) -> int:
@@ -230,6 +259,32 @@ class InputGuard:
             # Parse the key info
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = kb.vkCode
+
+            # Only react to key-down events (WM_KEYDOWN=0x0100, WM_SYSKEYDOWN=0x0104)
+            is_keydown = wParam in (0x0100, 0x0104)
+
+            # ── Hotkeys (checked on key-down only) ──────────────
+            if is_keydown and self._is_ctrl_held():
+                if vk == _VK_Q:
+                    # Ctrl+Q  →  request save & quit
+                    self._quit_requested = True
+                    log.info("Ctrl+Q pressed — save & quit requested.")
+                    return _BLOCK
+
+                if vk == _VK_M:
+                    # Ctrl+M  →  toggle keyboard + mouse blocking
+                    self._kb_blocked = not self._kb_blocked
+                    self._mouse_blocked = self._kb_blocked
+                    state = "ON" if self._kb_blocked else "OFF"
+                    log.info("Ctrl+M pressed — input blocking %s", state)
+                    return _BLOCK
+
+                if vk == _VK_P:
+                    # Ctrl+P  →  toggle AI pause
+                    self._ai_paused = not self._ai_paused
+                    state = "PAUSED" if self._ai_paused else "RUNNING"
+                    log.info("Ctrl+P pressed — AI %s", state)
+                    return _BLOCK
 
             # Scroll Lock toggles emergency off
             if vk == 0x91:  # VK_SCROLL
@@ -254,6 +309,11 @@ class InputGuard:
                 self._stats["passed"] += 1
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+            # If keyboard blocking is disabled via Ctrl+M, let keys through
+            if not self._kb_blocked:
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
             # Block this key event
             self._stats["kb_blocked"] += 1
             return _BLOCK
@@ -267,20 +327,28 @@ class InputGuard:
         Low-level mouse hook callback.
 
         Blocks PHYSICAL mouse clicks and scroll so the user can't interfere
-        with the game. ALways lets INJECTED (AI) moves/clicks pass through!
+        with the game. Always lets INJECTED (AI) moves/clicks pass through!
         We also allow physical WM_MOUSEMOVE to pass through so the user doesn't
-        get a frozen OS cursor and can still use Alt-Tab or move their mouse 
+        get a frozen OS cursor and can still use Alt-Tab or move their mouse
         to click the AI Pause button.
+
+        Ctrl+M toggles mouse blocking — when OFF, all physical mouse events
+        pass through so the user can interact with MC normally.
         """
         if nCode >= 0 and self._should_block():
+            # If mouse blocking is disabled via Ctrl+M, let everything through
+            if not self._mouse_blocked:
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
             struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            
+
             # Check if this input was injected by software (like SetCursorPos or PostMessage AI)
             is_injected = (struct.flags & 1) != 0 or (struct.flags & 2) != 0
             if is_injected:
                 self._stats["passed"] += 1
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
-                
+
             # If physical hardware:
             # 0x0200 = WM_MOUSEMOVE
             if wParam == 0x0200:
@@ -348,6 +416,26 @@ class InputGuard:
     @property
     def enabled(self) -> bool:
         return self._enabled and not self._emergency_off
+
+    @property
+    def quit_requested(self) -> bool:
+        """True after the user presses Ctrl+Q."""
+        return self._quit_requested
+
+    @property
+    def mouse_blocked(self) -> bool:
+        """True when physical mouse clicks are being blocked."""
+        return self._mouse_blocked
+
+    @property
+    def kb_blocked(self) -> bool:
+        """True when physical keyboard input is being blocked."""
+        return self._kb_blocked
+
+    @property
+    def ai_paused(self) -> bool:
+        """True when the user has paused the AI via Ctrl+P."""
+        return self._ai_paused
 
     @property
     def stats(self) -> dict:

@@ -229,6 +229,9 @@ class MinecraftConfig:
     # ── Input guard ────────────────────────────────────────────
     block_user_input: bool = True           # block user KB/mouse when MC focused
 
+    # ── Mod bridge (Fabric mod TCP event stream) ───────────────
+    mod_bridge_port: int = 5556             # TCP port the Baby-AI Bridge mod listens on
+
 
 # ---------------------------------------------------------------------------
 # Top-level config bundle

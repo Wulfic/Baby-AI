@@ -256,6 +256,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         window_height=mc.window_height,
         launch_timeout_sec=mc.launch_timeout_sec,
         block_user_input=mc.block_user_input,
+        mod_bridge_port=mc.mod_bridge_port,
     )
 
     # ── Orchestrator (Student + Teacher + Learner + Distill) ────
@@ -297,8 +298,18 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if control_panel.is_stopped:
                 log.info("Stop requested from Control Panel.")
                 break
-                
+
+            # Ctrl+Q via InputGuard — save & quit
+            if env._guard is not None and env._guard.quit_requested:
+                log.info("Ctrl+Q — save & quit requested.")
+                break
+
             if control_panel.is_paused:
+                time.sleep(0.5)
+                continue
+
+            # Ctrl+P via InputGuard — pause AI
+            if env._guard is not None and env._guard.ai_paused:
                 time.sleep(0.5)
                 continue
 
@@ -316,9 +327,39 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         prev_action.to(config.device),
                     )
                 intrinsic_r = icm_out["curiosity_reward"].mean().item()
-                extrinsic_r = 0.01  # survival bonus
+
+                # Extract per-channel extrinsic rewards from env info
+                rb = info.get("reward_breakdown", {})
+                extrinsic_r = rb.get("survival", 0.005)
+                exploration_r = rb.get("exploration", 0.0)
+                interaction_r = rb.get("interaction", 0.0)
+                action_div_r = rb.get("action_diversity", 0.0)
+                movement_r = rb.get("movement", 0.0)
+                block_break_r = rb.get("block_break", 0.0)
+                item_pickup_r = rb.get("item_pickup", 0.0)
+                death_pen_r = rb.get("death_penalty", 0.0)
+                idle_pen = rb.get("idle_penalty", 0.0)
+                # ★ Creation-focused channels
+                block_place_r = rb.get("block_place", 0.0)
+                crafting_r = rb.get("crafting", 0.0)
+                building_streak_r = rb.get("building_streak", 0.0)
+                creative_seq_r = rb.get("creative_sequence", 0.0)
+
                 total_r = reward_composer.compose(
-                    extrinsic=extrinsic_r, intrinsic=intrinsic_r,
+                    extrinsic=extrinsic_r,
+                    intrinsic=intrinsic_r,
+                    exploration=exploration_r,
+                    interaction=interaction_r,
+                    action_diversity=action_div_r,
+                    movement=movement_r,
+                    block_break=block_break_r,
+                    item_pickup=item_pickup_r,
+                    block_place=block_place_r,
+                    crafting=crafting_r,
+                    building_streak=building_streak_r,
+                    creative_sequence=creative_seq_r,
+                    death_penalty=death_pen_r,
+                    safety_penalty=idle_pen,
                 )
 
                 transition = {
@@ -340,11 +381,21 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:
                 ir_str = f"{intrinsic_r:.4f}" if prev_fused is not None else "N/A"
+                rb = info.get("reward_breakdown", {})
                 log.info(
-                    "Step %5d | action=%-28s | curiosity=%s | ep_reward=%.2f | latency=%.0f ms",
+                    "Step %5d | action=%-28s | curiosity=%s | interact=%.3f | explore=%.3f | blk_break=%.3f | item=%.3f | place=%.3f | craft=%.3f | bld_streak=%.3f | creative=%.3f | death=%.1f | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
                     action_name(action_id),
                     ir_str,
+                    rb.get("interaction", 0.0),
+                    rb.get("exploration", 0.0),
+                    rb.get("block_break", 0.0),
+                    rb.get("item_pickup", 0.0),
+                    rb.get("block_place", 0.0),
+                    rb.get("crafting", 0.0),
+                    rb.get("building_streak", 0.0),
+                    rb.get("creative_sequence", 0.0),
+                    rb.get("death_penalty", 0.0),
                     episode_reward,
                     result.get("latency_ms", 0),
                 )
