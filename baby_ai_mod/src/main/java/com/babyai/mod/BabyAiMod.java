@@ -10,6 +10,10 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
 /**
  * Baby-AI Bridge — Fabric mod entry point.
  *
@@ -23,6 +27,11 @@ public class BabyAiMod implements ModInitializer {
     public static final String MOD_ID = "baby-ai-bridge";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
+    // Per-player stat snapshots for delta tracking each tick
+    private final Map<UUID, Float> lastHealth = new HashMap<>();
+    private final Map<UUID, Integer> lastFood = new HashMap<>();
+    private final Map<UUID, Integer> lastXpTotal = new HashMap<>();
+
     @Override
     public void onInitialize() {
         LOGGER.info("[Baby-AI] Bridge mod initializing...");
@@ -33,10 +42,52 @@ public class BabyAiMod implements ModInitializer {
         // ── Heartbeat tick (every 100 ticks = 5 seconds) ─────
         // Lets the Python client verify the event pipeline works
         // even when no game events are happening.
+        //
+        // Also tracks per-tick health, food, and XP deltas for all
+        // online players so we can emit fine-grained reward signals.
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             long tick = server.getTicks();
             if (tick % 100 == 0) {
                 EventBridge.INSTANCE.onHeartbeat(tick);
+            }
+
+            // ── Per-player stat delta tracking (every tick) ────
+            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                UUID uid = player.getUuid();
+
+                // Health
+                float curHealth = player.getHealth();
+                Float prevHealth = lastHealth.get(uid);
+                if (prevHealth != null && Math.abs(curHealth - prevHealth) > 0.01f) {
+                    EventBridge.INSTANCE.onHealthChanged(prevHealth, curHealth, tick);
+                    if (curHealth < prevHealth) {
+                        LOGGER.debug("[Baby-AI] Damage: {:.1f} -> {:.1f}",
+                                     prevHealth, curHealth);
+                    } else {
+                        LOGGER.debug("[Baby-AI] Heal: {:.1f} -> {:.1f}",
+                                     prevHealth, curHealth);
+                    }
+                }
+                lastHealth.put(uid, curHealth);
+
+                // Food level
+                int curFood = player.getHungerManager().getFoodLevel();
+                Integer prevFood = lastFood.get(uid);
+                if (prevFood != null && curFood != prevFood) {
+                    EventBridge.INSTANCE.onFoodChanged(prevFood, curFood, tick);
+                }
+                lastFood.put(uid, curFood);
+
+                // XP (use total experience points for precise delta)
+                int curXp = player.totalExperience;
+                Integer prevXp = lastXpTotal.get(uid);
+                if (prevXp != null && curXp > prevXp) {
+                    int gained = curXp - prevXp;
+                    EventBridge.INSTANCE.onXpGained(
+                        gained, player.experienceLevel, tick
+                    );
+                }
+                lastXpTotal.put(uid, curXp);
             }
         });
 

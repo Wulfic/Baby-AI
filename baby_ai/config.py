@@ -153,18 +153,18 @@ class TrainingConfig:
     encoder_lr: float = 1e-4
     core_lr: float = 1e-4
     policy_lr: float = 3e-4
-    distill_lr: float = 1e-5
+    distill_lr: float = 5e-5
 
     # Batching
-    micro_batch_size: int = 8
-    gradient_accumulation_steps: int = 4
+    micro_batch_size: int = 16
+    gradient_accumulation_steps: int = 2
 
     # Replay
     replay_capacity: int = 50_000
     replay_disk_cap_gb: float = 4.0  # compressed on-disk cap
 
     # Distillation
-    distill_every_n_steps: int = 1000
+    distill_every_n_steps: int = 250
     distill_kl_weight: float = 1.0
     distill_feature_weight: float = 0.5
 

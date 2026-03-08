@@ -290,6 +290,17 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     episode_reward = 0.0
     episode_steps = 0
 
+    # Accumulators for reward channels between log intervals.
+    # Without these, events that happen between logged steps are invisible.
+    _acc_keys = (
+        "block_break", "item_pickup", "block_place",
+        "crafting", "building_streak", "creative_sequence",
+        "interaction", "exploration", "death_penalty",
+        "item_drop_penalty", "damage_taken", "healing",
+        "food_reward", "xp_reward",
+    )
+    _acc = {k: 0.0 for k in _acc_keys}
+
     try:
         obs = env.reset()
 
@@ -345,6 +356,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 building_streak_r = rb.get("building_streak", 0.0)
                 creative_seq_r = rb.get("creative_sequence", 0.0)
 
+                # Accumulate rewards between log intervals
+                for _k in _acc_keys:
+                    _acc[_k] += rb.get(_k, 0.0)
+
                 total_r = reward_composer.compose(
                     extrinsic=extrinsic_r,
                     intrinsic=intrinsic_r,
@@ -381,24 +396,38 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:
                 ir_str = f"{intrinsic_r:.4f}" if prev_fused is not None else "N/A"
-                rb = info.get("reward_breakdown", {})
+                # Show accumulated rewards since the last log interval
+                # (so events between log steps are visible).
                 log.info(
-                    "Step %5d | action=%-28s | curiosity=%s | interact=%.3f | explore=%.3f | blk_break=%.3f | item=%.3f | place=%.3f | craft=%.3f | bld_streak=%.3f | creative=%.3f | death=%.1f | ep_reward=%.2f | latency=%.0f ms",
+                    "Step %5d | action=%-28s | curiosity=%s"
+                    " | interact=%.3f | explore=%.3f"
+                    " | blk_break=%.3f | item=%.3f | place=%.3f"
+                    " | craft=%.3f | bld_streak=%.3f | creative=%.3f"
+                    " | death=%.1f | drop=%.2f"
+                    " | dmg=%.2f | heal=%.2f | food=%.2f | xp=%.2f"
+                    " | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
                     action_name(action_id),
                     ir_str,
-                    rb.get("interaction", 0.0),
-                    rb.get("exploration", 0.0),
-                    rb.get("block_break", 0.0),
-                    rb.get("item_pickup", 0.0),
-                    rb.get("block_place", 0.0),
-                    rb.get("crafting", 0.0),
-                    rb.get("building_streak", 0.0),
-                    rb.get("creative_sequence", 0.0),
-                    rb.get("death_penalty", 0.0),
+                    _acc["interaction"],
+                    _acc["exploration"],
+                    _acc["block_break"],
+                    _acc["item_pickup"],
+                    _acc["block_place"],
+                    _acc["crafting"],
+                    _acc["building_streak"],
+                    _acc["creative_sequence"],
+                    _acc["death_penalty"],
+                    _acc["item_drop_penalty"],
+                    _acc["damage_taken"],
+                    _acc["healing"],
+                    _acc["food_reward"],
+                    _acc["xp_reward"],
                     episode_reward,
                     result.get("latency_ms", 0),
                 )
+                # Reset accumulators after logging
+                _acc = {k: 0.0 for k in _acc_keys}
 
             # ── Episode boundary ────────────────────────────────
             max_steps = mc.max_episode_steps
@@ -412,6 +441,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 prev_fused, prev_action, prev_obs = None, None, None
                 episode_reward = 0.0
                 episode_steps = 0
+                _acc = {k: 0.0 for k in _acc_keys}
                 continue
 
             # ── Periodic checkpoint (every 2000 steps) ──────────

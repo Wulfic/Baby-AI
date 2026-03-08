@@ -85,6 +85,27 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
     if _VK.get("Q") in _a.keys:
         _DROP_ACTIONS.add(_i)
 
+# ── Movement quality categories ─────────────────────────────────
+# Actions that involve forward movement (W key) — preferred locomotion
+_FORWARD_ACTIONS = set()
+# Actions that involve camera look — preferred for situational awareness
+_LOOK_ACTIONS = set()
+# Pure strafe actions (A/D without W) — less desirable wandering
+_PURE_STRAFE_ACTIONS = set()
+_w_vk = _VK.get("W")
+_a_vk = _VK.get("A")
+_d_vk = _VK.get("D")
+for _i, _a in enumerate(MINECRAFT_ACTIONS):
+    if _w_vk and _w_vk in _a.keys:
+        _FORWARD_ACTIONS.add(_i)
+    if _a.look is not None:
+        _LOOK_ACTIONS.add(_i)
+    # Pure strafe = has A or D but NOT W
+    has_strafe = (_a_vk and _a_vk in _a.keys) or (_d_vk and _d_vk in _a.keys)
+    has_forward = _w_vk and _w_vk in _a.keys
+    if has_strafe and not has_forward:
+        _PURE_STRAFE_ACTIONS.add(_i)
+
 
 class MinecraftEnv(GameEnvironment):
     """
@@ -597,13 +618,24 @@ class MinecraftEnv(GameEnvironment):
         rewards["exploration"] = exploration_bonus
 
         # ────────────────────────────────────────────────────────
-        # 6. Movement bonus — ONLY reward when visual change
-        #    confirms actual movement (not just pressing W).
+        # 6. Movement bonus — reward confirmed movement with a
+        #    bias towards forward locomotion and camera rotation
+        #    over aimless strafing.
         # ────────────────────────────────────────────────────────
         movement_bonus = 0.0
         if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02:
-            # Visual change proves the agent actually moved somewhere
-            movement_bonus = visual_change * 0.3
+            base_move = visual_change * 0.3
+            if action_id in _FORWARD_ACTIONS:
+                # Forward movement gets a 50% bonus
+                base_move *= 1.5
+            elif action_id in _PURE_STRAFE_ACTIONS:
+                # Pure strafing (no forward) is penalised to 40%
+                base_move *= 0.4
+            movement_bonus = base_move
+        # Camera look (even while standing still) gets a small bonus
+        # to encourage situational awareness / scanning the environment.
+        if action_id in _LOOK_ACTIONS and action_id not in _PURE_STRAFE_ACTIONS:
+            movement_bonus += 0.02
         rewards["movement"] = movement_bonus
 
         # ────────────────────────────────────────────────────────
@@ -612,15 +644,16 @@ class MinecraftEnv(GameEnvironment):
         idle_penalty = 0.0
         if action_id == 0:
             self._idle_streak += 1
-            if self._idle_streak > 5:
-                idle_penalty = min(0.05 * (self._idle_streak - 5), 0.3)
+            if self._idle_streak > 3:
+                # Escalates faster: 0.08/step, caps at 0.8
+                idle_penalty = min(0.08 * (self._idle_streak - 3), 0.8)
         else:
             self._idle_streak = max(0, self._idle_streak - 2)
 
         if len(self._action_history) >= 10:
             last_10 = list(self._action_history)[-10:]
             if len(set(last_10)) == 1:
-                idle_penalty += 0.1
+                idle_penalty += 0.15
         rewards["idle_penalty"] = idle_penalty
 
         # ────────────────────────────────────────────────────────
@@ -639,6 +672,9 @@ class MinecraftEnv(GameEnvironment):
         mod_items_crafted = [e for e in mod_events if e.get("event") == "item_crafted"]
         mod_items_picked  = [e for e in mod_events if e.get("event") == "item_picked_up"]
         mod_deaths        = [e for e in mod_events if e.get("event") == "player_death"]
+        mod_health        = [e for e in mod_events if e.get("event") == "health_changed"]
+        mod_food          = [e for e in mod_events if e.get("event") == "food_changed"]
+        mod_xp            = [e for e in mod_events if e.get("event") == "xp_gained"]
 
         # Reset attack streak when a block actually breaks —
         # prevents unnecessary long-break triggers.
@@ -661,7 +697,9 @@ class MinecraftEnv(GameEnvironment):
         #    PIXEL FALLBACK: crosshair crack animation (flat 1.0)
         # ────────────────────────────────────────────────────────
         if use_mod:
-            # Sum per-block rewards based on rarity / difficulty
+            # Sum per-block rewards based on rarity / difficulty.
+            # Mod only fires block_broken on COMPLETE breaks —
+            # no partial-damage reward is possible here.
             block_break_reward = sum(
                 get_item_reward(e.get("block", ""), "block_broken")
                 for e in mod_blocks_broken
@@ -680,7 +718,10 @@ class MinecraftEnv(GameEnvironment):
                 block_break_score = self._block_break_tracker.update(
                     self._raw_frame, is_attacking=is_attacking,
                 )
-            block_break_reward = block_break_score if block_break_score > 0.3 else 0.0
+            # Only reward near-complete breaks (score ≥ 0.85).
+            # This prevents partial damage from generating reward —
+            # the agent must fully break the block to get credit.
+            block_break_reward = block_break_score if block_break_score > 0.85 else 0.0
         rewards["block_break"] = block_break_reward
 
         # ────────────────────────────────────────────────────────
@@ -735,6 +776,17 @@ class MinecraftEnv(GameEnvironment):
 
         rewards["item_pickup"] = item_pickup
 
+        # ── Item drop penalty ───────────────────────────────────
+        # Dropping items (Q key) is almost never beneficial early
+        # on.  Apply a penalty proportional to the item's value
+        # to discourage carelessly discarding inventory.
+        item_drop_penalty = 0.0
+        if action_id in _DROP_ACTIONS:
+            # Flat penalty per drop action — the agent shouldn't
+            # be pressing Q unless there's a very good reason.
+            item_drop_penalty = 0.3
+        rewards["item_drop_penalty"] = item_drop_penalty
+
         # ────────────────────────────────────────────────────────
         # 11. Death penalty
         #    MOD: 1.0 per death event
@@ -756,6 +808,47 @@ class MinecraftEnv(GameEnvironment):
                     log.info("Death detected at step %d", self._step_count)
                 self._is_dead = died_now
         rewards["death_penalty"] = death_penalty
+
+        # ────────────────────────────────────────────────────────
+        # 11b. Damage / Healing (from health_changed events)
+        #    Damage taken → penalty proportional to hearts lost
+        #    Healing      → small reward proportional to hearts gained
+        # ────────────────────────────────────────────────────────
+        damage_taken = 0.0
+        healing = 0.0
+        if use_mod:
+            for evt in mod_health:
+                delta = evt.get("delta", 0.0)
+                if delta < 0:
+                    # delta is negative when damaged; store as positive penalty
+                    damage_taken += abs(delta)
+                elif delta > 0:
+                    healing += delta
+        rewards["damage_taken"] = damage_taken
+        rewards["healing"] = healing
+
+        # ────────────────────────────────────────────────────────
+        # 11c. Food / Hunger reward
+        #    Positive food delta = filling hunger bar → reward
+        #    Losing hunger is not penalised (natural drain)
+        # ────────────────────────────────────────────────────────
+        food_reward = 0.0
+        if use_mod:
+            for evt in mod_food:
+                delta = evt.get("delta", 0)
+                if delta > 0:
+                    food_reward += float(delta)
+        rewards["food_reward"] = food_reward
+
+        # ────────────────────────────────────────────────────────
+        # 11d. Experience points reward
+        #    Small reward for each XP point gained
+        # ────────────────────────────────────────────────────────
+        xp_reward = 0.0
+        if use_mod:
+            for evt in mod_xp:
+                xp_reward += float(evt.get("amount", 0))
+        rewards["xp_reward"] = xp_reward
 
         # ============================================
         # * CREATION-FOCUSED REWARD CHANNELS
@@ -841,8 +934,9 @@ class MinecraftEnv(GameEnvironment):
         if steps_since_productive > self._stagnation_timeout:
             # How many multiples of the timeout we've exceeded
             overshoot = (steps_since_productive - self._stagnation_timeout) / self._stagnation_timeout
-            # Escalates from 0.1 up to a cap of 0.5
-            stagnation_penalty = min(0.1 + 0.15 * overshoot, 0.5)
+            # Escalates from 0.15 up to a cap of 1.5 — the agent
+            # should feel *real* pressure to do something useful.
+            stagnation_penalty = min(0.15 + 0.25 * overshoot, 1.5)
         rewards["stagnation_penalty"] = stagnation_penalty
 
         # ────────────────────────────────────────────────────────
@@ -890,9 +984,15 @@ class MinecraftEnv(GameEnvironment):
             + rewards["building_streak"] * 3.0
             + rewards["creative_sequence"] * 6.0
             # Penalties
-            - rewards["idle_penalty"]
+            - rewards["idle_penalty"] * 2.0
             - rewards["death_penalty"] * 10.0
-            - rewards["stagnation_penalty"]
+            - rewards["stagnation_penalty"] * 3.0
+            - rewards["item_drop_penalty"] * 3.0
+            - rewards["damage_taken"] * 1.5
+            # Survival / sustain rewards
+            + rewards["healing"] * 1.0
+            + rewards["food_reward"] * 0.8
+            + rewards["xp_reward"] * 0.1
         )
         rewards["total"] = total
 

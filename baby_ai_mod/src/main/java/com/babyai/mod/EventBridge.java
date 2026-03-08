@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>{@code item_crafted}  — item, count, tick</li>
  *   <li>{@code item_picked_up} — item, count, tick</li>
  *   <li>{@code player_death}  — source, tick</li>
+ *   <li>{@code health_changed} — old_health, new_health, delta, tick</li>
+ *   <li>{@code food_changed}   — old_food, new_food, delta, tick</li>
+ *   <li>{@code xp_gained}      — amount, total_level, tick</li>
  * </ul>
  */
 public class EventBridge {
@@ -161,6 +164,56 @@ public class EventBridge {
         j.addProperty("event", "heartbeat");
         j.addProperty("tick", tick);
         j.addProperty("clients", clients.size());
+        broadcast(j);
+    }
+
+    /**
+     * Fired when the player's health changes (damage taken or healing).
+     *
+     * @param oldHealth HP before the change (0–20 in half-hearts).
+     * @param newHealth HP after the change.
+     * @param tick      Current server tick.
+     */
+    public void onHealthChanged(float oldHealth, float newHealth, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "health_changed");
+        j.addProperty("old_health", oldHealth);
+        j.addProperty("new_health", newHealth);
+        j.addProperty("delta", newHealth - oldHealth);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Fired when the player's food/hunger level changes.
+     *
+     * @param oldFood Food level before the change (0–20).
+     * @param newFood Food level after the change.
+     * @param tick    Current server tick.
+     */
+    public void onFoodChanged(int oldFood, int newFood, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "food_changed");
+        j.addProperty("old_food", oldFood);
+        j.addProperty("new_food", newFood);
+        j.addProperty("delta", newFood - oldFood);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Fired when the player gains experience points.
+     *
+     * @param amount     Number of XP points gained this tick.
+     * @param totalLevel Current player level after the gain.
+     * @param tick       Current server tick.
+     */
+    public void onXpGained(int amount, int totalLevel, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "xp_gained");
+        j.addProperty("amount", amount);
+        j.addProperty("total_level", totalLevel);
+        j.addProperty("tick", tick);
         broadcast(j);
     }
 }

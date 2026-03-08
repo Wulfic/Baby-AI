@@ -233,7 +233,7 @@ class LearnerThread:
 
             policy_loss = -(log_prob * advantage.detach() * weights).mean()
             value_loss = F.mse_loss(value.squeeze(-1), rewards)
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy.mean()
+            loss = policy_loss + 0.5 * value_loss - 0.03 * entropy.mean()
 
         # ICM loss (if we have next-state info)
         if "next_fused" in batch and "action" in batch:

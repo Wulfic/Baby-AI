@@ -87,7 +87,7 @@ class DistillThread:
 
             time.sleep(1.0)  # check every second
 
-    def _distill_round(self, num_steps: int = 10) -> None:
+    def _distill_round(self, num_steps: int = 20) -> None:
         """
         Run a round of distillation steps, then swap.
 

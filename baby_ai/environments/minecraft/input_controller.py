@@ -85,6 +85,19 @@ VK = {
 # These are only usable by the launcher/wrapper code directly.
 BLOCKED_KEYS: Set[int] = {VK["ESCAPE"], VK["TAB"], VK["F3"], VK["F5"]}
 
+# Toggle / momentary keys — these are tapped (down+up in one step)
+# rather than held.  Minecraft treats E, Q, and number keys as
+# instant-action triggers; holding them via continuous KEYDOWN
+# confuses the keybind system and can cause keys to "unbind".
+_TAP_KEYS: Set[int] = {
+    VK["E"],   # inventory toggle
+    VK["Q"],   # drop item
+    VK["F"],   # swap hands
+    # Hotbar keys — only need a single tap to switch slots
+    VK["1"], VK["2"], VK["3"], VK["4"], VK["5"],
+    VK["6"], VK["7"], VK["8"], VK["9"], VK["0"],
+}
+
 # Extended keys that need the bit-24 flag
 _EXTENDED_KEYS: Set[int] = set()  # add VK codes here if needed
 
@@ -145,6 +158,13 @@ class InputController:
         # Cache scan codes (VK → SC mapping doesn't change)
         self._scan_cache: Dict[int, int] = {}
 
+        # Background-mode tracked cursor position (client coords).
+        # Look deltas accumulate here so the AI can reach any part
+        # of the screen (inventory slots, crafting grid, etc.).
+        # Lazily initialised to window center on first use.
+        self._bg_cursor_x: int = -1
+        self._bg_cursor_y: int = -1
+
     # ── Keyboard ────────────────────────────────────────────────
 
     def _scan(self, vk: int) -> int:
@@ -184,12 +204,38 @@ class InputController:
 
     # ── Mouse buttons ──────────────────────────────────────────
 
+    def _get_cursor_client_pos(self) -> tuple[int, int]:
+        """
+        Return the current cursor position in client coordinates.
+
+        Active mode: reads the real OS cursor via ``GetCursorPos``
+        and converts to client-relative coords.
+        Background mode: returns the tracked ``_bg_cursor`` position
+        (initialised to center on first use).
+        """
+        _, _, cw, ch = self._window.get_client_rect()
+        if self._mode == "active":
+            pt = wt.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            sx, sy, _, _ = self._window.get_client_rect()
+            cx = max(0, min(pt.x - sx, cw - 1))
+            cy = max(0, min(pt.y - sy, ch - 1))
+            return cx, cy
+        # Background — use tracked cursor
+        if self._bg_cursor_x < 0:
+            self._bg_cursor_x = cw // 2
+            self._bg_cursor_y = ch // 2
+        return self._bg_cursor_x, self._bg_cursor_y
+
     def mouse_down(self, button: str = "left", x: int = -1, y: int = -1) -> None:
         """
         Send a mouse-button-down event at (x, y) in client coords.
 
-        If x/y are -1, the click is sent at the client-area center
-        (the crosshair location in-game).
+        If x/y are -1, the click is sent at the **current cursor
+        position** — the real OS cursor in active mode, or the
+        tracked virtual cursor in background mode.  This allows
+        the AI to click on inventory slots, crafting grids, etc.
+        after positioning the cursor with look actions.
 
         This uses PostMessage which targets the MC window by handle,
         so clicks NEVER affect other windows.
@@ -198,9 +244,7 @@ class InputController:
             return
 
         if x < 0 or y < 0:
-            _, _, cw, ch = self._window.get_client_rect()
-            # Shift Y slightly up to hit 'Respawn' and avoid 'Title Screen' button
-            x, y = cw // 2, (ch // 2) - int(ch * 0.15)
+            x, y = self._get_cursor_client_pos()
 
         lp = _makelparam(x, y)
 
@@ -214,11 +258,9 @@ class InputController:
         self._held_buttons.add(button)
 
     def mouse_up(self, button: str = "left", x: int = -1, y: int = -1) -> None:
-        """Send a mouse-button-up event."""
+        """Send a mouse-button-up event at the current cursor position."""
         if x < 0 or y < 0:
-            _, _, cw, ch = self._window.get_client_rect()
-            # Shift Y slightly up to hit 'Respawn' and avoid 'Title Screen' button
-            x, y = cw // 2, (ch // 2) - int(ch * 0.15)
+            x, y = self._get_cursor_client_pos()
 
         lp = _makelparam(x, y)
 
@@ -254,37 +296,43 @@ class InputController:
             return False
 
         if self._mode == "background":
-            # Send the delta relative to the center of the window
+            # ── Background mode: accumulate cursor position ──────
+            # Camera rotation via PostMessage doesn't work (LWJGL
+            # raw-input), but cursor positioning DOES work for GUI
+            # screens (inventory, crafting table, etc.).
             _, _, cw, ch = self._window.get_client_rect()
-            
-            # Since Minecraft is windowed, local client coordinates start at 0,0
-            local_cx = cw // 2
-            local_cy = ch // 2
-            
-            target_x = local_cx + dx
-            target_y = local_cy + dy
-            
-            # 1. Send the offset to simulate the mouse moving
-            lp_move = _makelparam(target_x, target_y)
-            user32.PostMessageW(self._window.hwnd, WM_MOUSEMOVE, 0, lp_move)
-            
-            # 2. Immediately send a "reset to center" message.
-            # Because Minecraft is backgrounded, its native SetCursorPos(center) 
-            # won't trigger real mouse events to reset its internal last_x/last_y.
-            # We must trick it into thinking the cursor snapped back to center.
-            lp_reset = _makelparam(local_cx, local_cy)
-            user32.PostMessageW(self._window.hwnd, WM_MOUSEMOVE, 0, lp_reset)
+
+            # Lazy init to window center
+            if self._bg_cursor_x < 0:
+                self._bg_cursor_x = cw // 2
+                self._bg_cursor_y = ch // 2
+
+            # Accumulate delta (clamped to window bounds)
+            self._bg_cursor_x = max(1, min(self._bg_cursor_x + dx, cw - 2))
+            self._bg_cursor_y = max(1, min(self._bg_cursor_y + dy, ch - 2))
+
+            # Send cursor to accumulated position so GUI screens
+            # see the cursor move to the intended slot / button.
+            lp = _makelparam(self._bg_cursor_x, self._bg_cursor_y)
+            user32.PostMessageW(self._window.hwnd, WM_MOUSEMOVE, 0, lp)
             return True
 
-        # ACTIVE MODE SAFETY:
+        # ── Active mode: accumulate from real cursor position ───
+        # Read where the OS cursor actually is right now.  In-game
+        # Minecraft re-centres each frame, so GetCursorPos ≈ center.
+        # But in GUI screens the cursor stays where we placed it,
+        # allowing deltas to accumulate across steps and reach the
+        # entire screen — inventory slots, crafting grid, etc.
         if not self._window.is_focused:
             return False
 
-        cx, cy = self._window.get_client_center()
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+
         sx, sy, cw, ch = self._window.get_client_rect()
 
-        target_x = max(sx + 1, min(cx + dx, sx + cw - 2))
-        target_y = max(sy + 1, min(cy + dy, sy + ch - 2))
+        target_x = max(sx + 1, min(pt.x + dx, sx + cw - 2))
+        target_y = max(sy + 1, min(pt.y + dy, sy + ch - 2))
 
         user32.SetCursorPos(target_x, target_y)
         return True
@@ -304,13 +352,30 @@ class InputController:
 
         Keys not in the desired set are released; keys not currently
         held are pressed.  This minimises message count.
+
+        **Toggle keys** (E, Q, F, hotbar numbers) are excluded from
+        hold tracking.  They receive a single down+up tap so that
+        Minecraft sees one clean press event without a lingering
+        KEYDOWN that conflicts with the game's own keybind toggle
+        logic.
         """
-        to_release = self._held_keys - desired_keys
-        to_press = desired_keys - self._held_keys
+        # Separate tap-only keys from holdable keys
+        hold_desired = desired_keys - _TAP_KEYS
+        tap_desired = desired_keys & _TAP_KEYS
+
+        # Release / press holdable keys
+        to_release = self._held_keys - hold_desired
+        to_press = hold_desired - self._held_keys
         for vk in to_release:
             self.release_key(vk)
         for vk in to_press:
             self.press_key(vk)
+
+        # Tap toggle keys (press then immediate release)
+        for vk in tap_desired:
+            self.press_key(vk)
+            time.sleep(0.035)          # 35 ms hold — long enough for MC to register
+            self.release_key(vk)
 
     def set_buttons(self, desired_buttons: Set[str]) -> None:
         """Transition to exactly the set of *desired_buttons* being held."""
