@@ -446,7 +446,7 @@ class MinecraftLauncher:
                 new_lines.append("doImmediateRespawn:true")
                 found_respawn = True
             elif line.startswith("key_key.inventory:"):
-                new_lines.append("key_key.inventory:key.keyboard.unknown")
+                new_lines.append("key_key.inventory:key.keyboard.e")
             elif line.startswith("key_key.chat:"):
                 new_lines.append("key_key.chat:key.keyboard.unknown")
             elif line.startswith("hideServerAddress:"): # we inject our own setting loosely here

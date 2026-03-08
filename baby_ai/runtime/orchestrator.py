@@ -210,6 +210,7 @@ class Orchestrator:
             "learner_step": self.learner_thread.step_count,
             "distill_count": self.distill_thread.stats["distill_count"],
             "replay_stats": self.replay.stats(),
+            "reward_composer_step": self.reward_composer._step,
         }, tmp_path)
 
         # Atomic rename — prevents corrupted checkpoints if the process
@@ -246,6 +247,10 @@ class Orchestrator:
         self.teacher.load_state_dict(ckpt["teacher_state_dict"])
         if "icm_state_dict" in ckpt:
             self.icm.load_state_dict(ckpt["icm_state_dict"])
+        # Restore reward composer step counter so intrinsic weight
+        # decay continues across sessions instead of resetting.
+        if "reward_composer_step" in ckpt:
+            self.reward_composer._step = ckpt["reward_composer_step"]
         log.info("Checkpoint loaded from: %s", path)
 
     def system_stats(self) -> dict:

@@ -79,6 +79,12 @@ class LearnerThread:
             {"params": core_params, "lr": self.config.core_lr},
             {"params": policy_params, "lr": self.config.policy_lr},
         ])
+        
+        # Add learning rate warmup to prevent wild training swings early on
+        warmup_steps = getattr(self.config, "warmup_steps", 1000)
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=0.01, total_iters=warmup_steps
+        )
 
         # AMP scaler
         self.scaler = torch.amp.GradScaler("cuda") if self.config.use_amp else None
@@ -166,11 +172,28 @@ class LearnerThread:
         self._accum_count += 1
 
         if self._accum_count >= self.config.gradient_accumulation_steps:
+            # Gradient clipping — essential for RL stability.
+            # Without this, rare reward spikes create enormous
+            # gradients that destabilise all model weights.
             if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.teacher.parameters(), max_norm=1.0
+            )
+            if self.scaler is not None:
+                scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                # If scale decreases, it hit an inf/nan and skipped the step
+                skip_scheduler = (self.scaler.get_scale() < scale_before)
             else:
                 self.optimizer.step()
+                skip_scheduler = False
+            
+            # Step the scheduler safely
+            if hasattr(self, "scheduler") and not skip_scheduler:
+                self.scheduler.step()
+                
             self.optimizer.zero_grad()
             self._accum_count = 0
 
@@ -209,11 +232,17 @@ class LearnerThread:
         })
 
         action_logits = outputs["action_logits"]
-        # Ensure numerical stability for categorical distribution
-        action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-        action_logits = torch.clamp(action_logits, min=-1e4, max=1e4)
+        # Use moderately clamped bounds to prevent overflow without causing a massive dead
+        # gradient zone, allowing gradients to recover if logits briefly spike.
+        action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+        action_logits = torch.clamp(action_logits, min=-100.0, max=100.0)
         
         value = outputs["value"]
+
+        # *CRITICAL FIX*: We intentionally DO NOT clamp the `value` tensor here. 
+        # Clamping earlier caused a "dead gradient" bug where predictions > 20 never 
+        # received backprop signals to shrink! We instead rely on `F.smooth_l1_loss` 
+        # to safely cap gradient magnitudes without severing the backward pass.
 
         # Policy loss (if we have targets)
         loss = torch.tensor(0.0, device=self.device)
@@ -226,23 +255,34 @@ class LearnerThread:
 
             advantage = rewards - old_values.squeeze(-1)
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            # Clamp advantage to prevent catastrophic policy updates
+            # from single high-reward transitions.
+            advantage = torch.clamp(advantage, -5.0, 5.0)
 
             dist = torch.distributions.Categorical(logits=action_logits)
             log_prob = dist.log_prob(actions)
             entropy = dist.entropy()
 
             policy_loss = -(log_prob * advantage.detach() * weights).mean()
-            value_loss = F.mse_loss(value.squeeze(-1), rewards)
-            loss = policy_loss + 0.5 * value_loss - 0.03 * entropy.mean()
+            # Use Huber loss (SmoothL1) instead of MSE to reduce
+            # sensitivity to outlier value predictions.
+            # Weight value loss by replay priorities
+            value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
+            
+            loss = policy_loss + 0.5 * value_loss - 0.03 * (entropy * weights).mean()
 
         # ICM loss (if we have next-state info)
         if "next_fused" in batch and "action" in batch:
             icm_out = self.icm(batch["fused"], batch["next_fused"], batch["action"])
-            icm_loss = icm_out["forward_loss"] + icm_out["inverse_loss"]
+            # Clamp the ICM losses to avoid wild gradient swings from unpredictable states
+            fwd_loss_clamped = torch.clamp(icm_out["forward_loss"], max=10.0)
+            inv_loss_clamped = torch.clamp(icm_out["inverse_loss"], max=10.0)
+            icm_loss = fwd_loss_clamped + inv_loss_clamped
             loss = loss + 0.1 * icm_loss
 
         # EWC penalty
         ewc_penalty = self.consolidator.consolidation_loss(self.teacher)
+        ewc_penalty = torch.clamp(ewc_penalty, max=5.0)
         loss = loss + ewc_penalty
 
         return {"total": loss}

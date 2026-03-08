@@ -171,7 +171,7 @@ class TrainingConfig:
     # Intrinsic reward
     intrinsic_weight_start: float = 1.0
     intrinsic_weight_end: float = 0.1
-    intrinsic_decay_steps: int = 500_000
+    intrinsic_decay_steps: int = 10_000
 
     # Consolidation (EWC + rehearsal)
     consolidation_every_n_steps: int = 2000
@@ -179,6 +179,9 @@ class TrainingConfig:
 
     # Mixed precision
     use_amp: bool = True
+
+    # Learning Rate Warmup
+    warmup_steps: int = 1000
 
     # Checkpointing
     checkpoint_every_n_steps: int = 5000

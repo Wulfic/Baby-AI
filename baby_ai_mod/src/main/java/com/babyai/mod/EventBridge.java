@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>{@code health_changed} — old_health, new_health, delta, tick</li>
  *   <li>{@code food_changed}   — old_food, new_food, delta, tick</li>
  *   <li>{@code xp_gained}      — amount, total_level, tick</li>
+ *   <li>{@code position_update} — x, y, z, pitch, yaw, on_ground, light, tick</li>
  * </ul>
  */
 public class EventBridge {
@@ -213,6 +214,35 @@ public class EventBridge {
         j.addProperty("event", "xp_gained");
         j.addProperty("amount", amount);
         j.addProperty("total_level", totalLevel);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Periodic position update so the Python agent can track height,
+     * detect falls, and avoid caves.
+     *
+     * @param x       Player X coordinate.
+     * @param y       Player Y coordinate (height — sea level ≈ 63).
+     * @param z       Player Z coordinate.
+     * @param pitch   Camera pitch in degrees (−90 = straight up, +90 = down).
+     * @param yaw     Camera yaw in degrees.
+     * @param onGround True if the player is standing on a solid surface.
+     * @param light   Block light level at the player's eye position (0–15).
+     * @param tick    Current server tick.
+     */
+    public void onPositionUpdate(double x, double y, double z,
+                                  float pitch, float yaw,
+                                  boolean onGround, int light, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "position_update");
+        j.addProperty("x", Math.round(x * 100.0) / 100.0);
+        j.addProperty("y", Math.round(y * 100.0) / 100.0);
+        j.addProperty("z", Math.round(z * 100.0) / 100.0);
+        j.addProperty("pitch", pitch);
+        j.addProperty("yaw", yaw);
+        j.addProperty("on_ground", onGround);
+        j.addProperty("light", light);
         j.addProperty("tick", tick);
         broadcast(j);
     }

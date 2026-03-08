@@ -298,6 +298,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         "interaction", "exploration", "death_penalty",
         "item_drop_penalty", "damage_taken", "healing",
         "food_reward", "xp_reward",
+        "hotbar_spam_penalty", "height_penalty",
+        "home_proximity",
     )
     _acc = {k: 0.0 for k in _acc_keys}
 
@@ -405,6 +407,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     " | craft=%.3f | bld_streak=%.3f | creative=%.3f"
                     " | death=%.1f | drop=%.2f"
                     " | dmg=%.2f | heal=%.2f | food=%.2f | xp=%.2f"
+                    " | hbar=%.2f | height=%.2f | home=%.2f"
                     " | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
                     action_name(action_id),
@@ -423,6 +426,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     _acc["healing"],
                     _acc["food_reward"],
                     _acc["xp_reward"],
+                    _acc["hotbar_spam_penalty"],
+                    _acc["height_penalty"],
+                    _acc["home_proximity"],
                     episode_reward,
                     result.get("latency_ms", 0),
                 )

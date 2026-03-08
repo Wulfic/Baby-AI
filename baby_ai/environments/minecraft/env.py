@@ -92,6 +92,8 @@ _FORWARD_ACTIONS = set()
 _LOOK_ACTIONS = set()
 # Pure strafe actions (A/D without W) — less desirable wandering
 _PURE_STRAFE_ACTIONS = set()
+# Hotbar selection actions — spamming these produces no useful behaviour
+_HOTBAR_ACTIONS = set()
 _w_vk = _VK.get("W")
 _a_vk = _VK.get("A")
 _d_vk = _VK.get("D")
@@ -105,6 +107,14 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
     has_forward = _w_vk and _w_vk in _a.keys
     if has_strafe and not has_forward:
         _PURE_STRAFE_ACTIONS.add(_i)
+
+# Hotbar actions: indices that ONLY press a number key (no movement/mouse)
+for _i, _a in enumerate(MINECRAFT_ACTIONS):
+    _name = _a.name
+    if _name.startswith("hotbar_") and not _a.buttons and not _a.look:
+        _HOTBAR_ACTIONS.add(_i)
+# Also include inventory and drop-only as "non-productive" tap actions
+# Note: drop is already penalised via item_drop_penalty, so only hotbar here.
 
 
 class MinecraftEnv(GameEnvironment):
@@ -257,6 +267,31 @@ class MinecraftEnv(GameEnvironment):
         self._last_drop_time: float = 0.0
         self._drop_pickup_cooldown: float = 5.0
 
+        # ── Position / height tracking (from mod position_update) ──
+        # Surface Y in Minecraft 1.21 is ~63 (sea level).  Below ~58
+        # the player is likely in a cave or ravine.
+        self._player_y: Optional[float] = None      # last known Y
+        self._prev_player_y: Optional[float] = None  # Y from previous update
+        self._player_on_ground: bool = True
+        self._sky_light: int = 15                    # 0=total darkness, 15=full sky
+        self._underground_steps: int = 0             # consecutive steps below threshold
+        _SURFACE_Y = 58  # below this = underground penalty
+        self._surface_y = _SURFACE_Y
+
+        # ── Hotbar spam tracking ────────────────────────────────
+        self._hotbar_streak: int = 0  # consecutive hotbar-only actions
+
+        # ── Home location (set from first position_update) ──────
+        # The spawn point is treated as "home base" where the agent
+        # stores items and builds.  Actions within 100 blocks of
+        # home get a small proximity bonus; actions far away get a
+        # gentle distance penalty that grows with distance.
+        self._home_x: Optional[float] = None
+        self._home_z: Optional[float] = None
+        self._player_x: Optional[float] = None
+        self._player_z: Optional[float] = None
+        self._home_radius: float = 100.0  # blocks — full bonus zone
+
         # ── Mod bridge (authoritative game events via TCP) ──────
         self._mod_bridge = ModBridge(port=mod_bridge_port)
         self._mod_bridge.start()
@@ -301,6 +336,15 @@ class MinecraftEnv(GameEnvironment):
         self._last_long_break_time = 0.0
         self._long_break_count = 0
         self._last_drop_time = 0.0
+
+        # Reset position/underground tracking but KEEP home location
+        # (home persists across episode resets — it's the world spawn).
+        self._player_y = None
+        self._prev_player_y = None
+        self._player_on_ground = True
+        self._sky_light = 15
+        self._underground_steps = 0
+        self._hotbar_streak = 0
 
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:
@@ -657,6 +701,30 @@ class MinecraftEnv(GameEnvironment):
         rewards["idle_penalty"] = idle_penalty
 
         # ────────────────────────────────────────────────────────
+        # 7b. Hotbar spam penalty — pressing number keys repeatedly
+        #     without interacting with items is pointless.
+        # ────────────────────────────────────────────────────────
+        hotbar_spam_penalty = 0.0
+        if action_id in _HOTBAR_ACTIONS:
+            self._hotbar_streak += 1
+            # Escalating penalty: first hotbar press in a while is
+            # fine (switching tools), but repeated presses trigger.
+            if self._hotbar_streak >= 2:
+                hotbar_spam_penalty = min(0.1 * self._hotbar_streak, 0.6)
+        else:
+            # Decay streak when doing something else
+            self._hotbar_streak = max(0, self._hotbar_streak - 1)
+
+        # Also check the recent history — more than 3 hotbar
+        # actions out of the last 10 is excessive switching.
+        if len(self._action_history) >= 10:
+            last_10 = list(self._action_history)[-10:]
+            hotbar_count = sum(1 for a in last_10 if a in _HOTBAR_ACTIONS)
+            if hotbar_count > 3:
+                hotbar_spam_penalty += 0.05 * (hotbar_count - 3)
+        rewards["hotbar_spam_penalty"] = hotbar_spam_penalty
+
+        # ────────────────────────────────────────────────────────
         # Drain authoritative game events from the Fabric mod bridge.
         # When connected, these override the pixel-based detectors
         # for block break, item pickup, block place, crafting, and
@@ -675,6 +743,24 @@ class MinecraftEnv(GameEnvironment):
         mod_health        = [e for e in mod_events if e.get("event") == "health_changed"]
         mod_food          = [e for e in mod_events if e.get("event") == "food_changed"]
         mod_xp            = [e for e in mod_events if e.get("event") == "xp_gained"]
+        mod_position      = [e for e in mod_events if e.get("event") == "position_update"]
+
+        # ── Update player position from latest position_update ──
+        if mod_position:
+            latest_pos = mod_position[-1]  # use most recent
+            self._prev_player_y = self._player_y
+            self._player_y = latest_pos.get("y", self._player_y)
+            self._player_x = latest_pos.get("x", self._player_x)
+            self._player_z = latest_pos.get("z", self._player_z)
+            self._player_on_ground = latest_pos.get("on_ground", True)
+            self._sky_light = latest_pos.get("light", 15)
+
+            # First position_update ever → set as home location
+            if self._home_x is None and self._player_x is not None:
+                self._home_x = self._player_x
+                self._home_z = self._player_z
+                log.info("Home location set: (%.1f, %.1f)",
+                         self._home_x, self._home_z)
 
         # Reset attack streak when a block actually breaks —
         # prevents unnecessary long-break triggers.
@@ -850,6 +936,74 @@ class MinecraftEnv(GameEnvironment):
                 xp_reward += float(evt.get("amount", 0))
         rewards["xp_reward"] = xp_reward
 
+        # ────────────────────────────────────────────────────────
+        # 11e. Height / cave / fall penalties
+        #    Uses position_update events from the mod to detect:
+        #    - Being underground (Y below ~58, sea level is ~63)
+        #    - Falling (rapid Y decrease between updates)
+        #    - Darkness (low sky light = cave/underground)
+        #    Combined into a single "height_penalty" channel.
+        # ────────────────────────────────────────────────────────
+        height_penalty = 0.0
+        if self._player_y is not None:
+            # Underground penalty — escalates the longer the AI
+            # stays below the surface threshold.
+            if self._player_y < self._surface_y:
+                self._underground_steps += 1
+                # Depth-proportional: deeper = bigger penalty
+                depth = max(0.0, self._surface_y - self._player_y)
+                # Base 0.03 per step underground, scaled by depth
+                height_penalty += min(0.03 + 0.005 * depth, 0.3)
+                # Extra escalation for prolonged underground time
+                # (kicks in after ~50 steps = ~5 seconds)
+                if self._underground_steps > 50:
+                    overshoot = (self._underground_steps - 50) / 100.0
+                    height_penalty += min(0.1 * overshoot, 0.4)
+            else:
+                self._underground_steps = max(0, self._underground_steps - 5)
+
+            # Fall penalty — rapid Y decrease means falling into a
+            # hole/cave.  Only triggers for drops > 3 blocks.
+            if self._prev_player_y is not None:
+                y_drop = self._prev_player_y - self._player_y
+                if y_drop > 3.0:
+                    # Proportional to fall distance
+                    height_penalty += min(0.15 * y_drop, 1.0)
+                    log.debug("Fall detected: %.1f blocks (Y %.1f → %.1f)",
+                              y_drop, self._prev_player_y, self._player_y)
+
+            # Darkness penalty — low sky light means the AI is in
+            # a covered/underground area (cave, ravine, dense canopy).
+            if self._sky_light <= 4:
+                height_penalty += 0.05
+
+        rewards["height_penalty"] = height_penalty
+
+        # ────────────────────────────────────────────────────────
+        # 11f. Home proximity bonus / distance penalty
+        #    Spawn point = home base.  Staying within 100 blocks
+        #    gives a small bonus (all productive actions there are
+        #    implicitly more valuable).  Beyond 100 blocks, a
+        #    gentle penalty grows to discourage aimless wandering
+        #    far from where the AI keeps its items/buildings.
+        # ────────────────────────────────────────────────────────
+        home_bonus = 0.0
+        if (self._home_x is not None
+                and self._player_x is not None):
+            dx = self._player_x - self._home_x
+            dz = self._player_z - self._home_z
+            dist = (dx * dx + dz * dz) ** 0.5
+
+            if dist <= self._home_radius:
+                # Inside home zone — small flat bonus that makes
+                # every other reward channel slightly more valuable
+                home_bonus = 0.02
+            else:
+                # Outside home zone — gentle escalating penalty
+                overshoot = (dist - self._home_radius) / self._home_radius
+                home_bonus = -min(0.03 * overshoot, 0.5)
+        rewards["home_proximity"] = home_bonus
+
         # ============================================
         # * CREATION-FOCUSED REWARD CHANNELS
         # ============================================
@@ -955,12 +1109,20 @@ class MinecraftEnv(GameEnvironment):
                 " | blk_brk=%.3f item=%.3f place=%.3f"
                 " | craft=%.3f death=%.1f"
                 " | vis_change=%.4f interact=%.3f"
-                " | long_brk=%d atk_streak=%d",
+                " | long_brk=%d atk_streak=%d"
+                " | Y=%.1f sky_light=%d underground=%d"
+                " | home_dist=%.1f",
                 self._step_count, bridge_status, raw_h, raw_w,
                 block_break_reward, item_pickup, block_place_score,
                 craft_info["craft_score"], death_penalty,
                 visual_change, interaction_bonus,
                 self._long_break_count, self._attack_streak,
+                self._player_y if self._player_y is not None else -1.0,
+                self._sky_light,
+                self._underground_steps,
+                ((((self._player_x or 0) - (self._home_x or 0)) ** 2
+                  + ((self._player_z or 0) - (self._home_z or 0)) ** 2) ** 0.5)
+                if self._home_x is not None else -1.0,
             )
 
         # ────────────────────────────────────────────────────────
@@ -989,10 +1151,14 @@ class MinecraftEnv(GameEnvironment):
             - rewards["stagnation_penalty"] * 3.0
             - rewards["item_drop_penalty"] * 3.0
             - rewards["damage_taken"] * 1.5
+            - rewards["hotbar_spam_penalty"] * 2.0
+            - rewards["height_penalty"] * 2.5
             # Survival / sustain rewards
             + rewards["healing"] * 1.0
             + rewards["food_reward"] * 0.8
             + rewards["xp_reward"] * 0.1
+            # Home proximity (can be positive or negative)
+            + rewards["home_proximity"] * 1.5
         )
         rewards["total"] = total
 

@@ -7,6 +7,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.LightType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +51,24 @@ public class BabyAiMod implements ModInitializer {
             long tick = server.getTicks();
             if (tick % 100 == 0) {
                 EventBridge.INSTANCE.onHeartbeat(tick);
+            }
+
+            // ── Position update (every 20 ticks = 1 second) ────
+            // Sends player coordinates, camera angles, on_ground,
+            // and light level so the Python agent can detect caves,
+            // falls, and underground navigation.
+            if (tick % 20 == 0) {
+                for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                    BlockPos eyePos = BlockPos.ofFloored(
+                        player.getX(), player.getEyeY(), player.getZ()
+                    );
+                    int light = player.getWorld().getLightLevel(LightType.SKY, eyePos);
+                    EventBridge.INSTANCE.onPositionUpdate(
+                        player.getX(), player.getY(), player.getZ(),
+                        player.getPitch(), player.getYaw(),
+                        player.isOnGround(), light, tick
+                    );
+                }
             }
 
             // ── Per-player stat delta tracking (every tick) ────

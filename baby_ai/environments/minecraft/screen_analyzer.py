@@ -678,12 +678,14 @@ class CreativeSequenceTracker:
         self._state: int = self.IDLE
         self._steps_in_state: int = 0
         self._gather_accum: float = 0.0
+        self._gather_milestone_hit: bool = False
         self._cycles_completed: int = 0
 
     def reset(self) -> None:
         self._state = self.IDLE
         self._steps_in_state = 0
         self._gather_accum = 0.0
+        self._gather_milestone_hit = False
         self._cycles_completed = 0
 
     def update(
@@ -728,25 +730,32 @@ class CreativeSequenceTracker:
                 self._state = self.GATHERING
                 self._steps_in_state = 0
                 self._gather_accum = gather_signal
-                stage_reward = 0.05  # small reward for starting
+                stage_reward = 0.05  # one-time reward for starting
 
         elif self._state == self.GATHERING:
-            # Accumulate gathering progress
+            # Only reward ACTIVE gathering — not just being in state
             gather_signal = block_break + item_pickup
             self._gather_accum += gather_signal
 
-            if self._gather_accum > self._gather_thresh:
-                stage_reward = 0.1  # reward for sustained gathering
+            # Reward proportional to actual gathering this step
+            if gather_signal > 0:
+                stage_reward = min(gather_signal * 0.15, 0.1)
+
+            # Milestone: accumulated enough to advance
+            if (self._gather_accum > self._gather_thresh
+                    and not getattr(self, '_gather_milestone_hit', False)):
+                stage_reward += 0.1  # one-time milestone bonus
+                self._gather_milestone_hit = True
 
             # Transition to CRAFTING on UI open or crafting event
             if craft_score > self._craft_thresh:
                 self._state = self.CRAFTING
                 self._steps_in_state = 0
+                self._gather_milestone_hit = False
                 stage_reward = 0.3  # big reward for reaching crafting
 
         elif self._state == self.CRAFTING:
-            # Reward for being in crafting state
-            stage_reward = 0.02
+            # Only reward ACTUAL crafting, not sitting in crafting state
             if craft_score > 0:
                 stage_reward = 0.4  # reward for actually crafting
 

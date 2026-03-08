@@ -125,7 +125,13 @@ class RewardComposer:
         return self.intrinsic_start + frac * (self.intrinsic_end - self.intrinsic_start)
 
     def _normalize_channel(self, channel: str, value: float) -> float:
-        """Normalize a reward channel by running mean/std."""
+        """Normalize a reward channel by running mean/std.
+
+        Values are z-scored against a rolling window, then **clamped**
+        to [-5, 5] to prevent catastrophic reward spikes from sparse
+        channels (e.g. block_break fires once per hundred steps, so
+        its z-score would otherwise shoot to >10).
+        """
         if not self.normalize:
             return value
 
@@ -139,7 +145,9 @@ class RewardComposer:
 
         arr = np.array(self._stats[channel]["values"])
         mean, std = arr.mean(), arr.std() + 1e-8
-        return (value - mean) / std
+        z = (value - mean) / std
+        # Clamp to prevent reward explosions from rare events
+        return float(np.clip(z, -5.0, 5.0))
 
     def compose(
         self,
@@ -219,6 +227,11 @@ class RewardComposer:
             - self.death_penalty_weight * death_n
             - self.safety_weight * safety_n
         )
+
+        # Clamp total reward to a sane range to prevent enormous
+        # gradients in the learner — even with z-score clamping,
+        # many channels firing simultaneously can stack up.
+        reward = float(np.clip(reward, -15.0, 15.0))
 
         # Monitor all channels
         self._monitor.record("total", reward)

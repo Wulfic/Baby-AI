@@ -69,6 +69,12 @@ class DistillationEngine:
         self._optimizer = torch.optim.Adam(
             self._staging_student.parameters(), lr=lr
         )
+        # Learning Rate Warmup for distillation
+        # Prevent wild target-driven jumps early on
+        self._scheduler = torch.optim.lr_scheduler.LinearLR(
+            self._optimizer, start_factor=0.01, total_iters=1000
+        )
+        
         self._scaler = torch.amp.GradScaler("cuda") if use_amp else None
         self._swap_lock = threading.Lock()
         self._step = 0
@@ -167,13 +173,24 @@ class DistillationEngine:
 
         # Backward
         self._optimizer.zero_grad()
+        
         if self._scaler is not None:
             self._scaler.scale(loss["total"]).backward()
+            self._scaler.unscale_(self._optimizer)
+            torch.nn.utils.clip_grad_norm_(self._staging_student.parameters(), max_norm=1.0)
+            
+            scale_before = self._scaler.get_scale()
             self._scaler.step(self._optimizer)
             self._scaler.update()
+            skip_scheduler = (self._scaler.get_scale() < scale_before)
         else:
             loss["total"].backward()
+            torch.nn.utils.clip_grad_norm_(self._staging_student.parameters(), max_norm=1.0)
             self._optimizer.step()
+            skip_scheduler = False
+
+        if hasattr(self, "_scheduler") and not skip_scheduler:
+            self._scheduler.step()
 
         self._step += 1
 
