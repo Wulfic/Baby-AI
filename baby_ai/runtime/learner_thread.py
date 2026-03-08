@@ -217,10 +217,13 @@ class LearnerThread:
 
         # Log periodically
         if self._step % 100 == 0:
+            # Gather learning rates for diagnostics
+            current_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+            lr_str = '/'.join(f'{lr:.2e}' for lr in current_lrs)
             log.info(
-                "Step %d | loss=%.4f | replay=%d | buffer_priority=%.2f",
+                "Step %d | loss=%.4f | replay=%d | priority=%.2f | lr=%s",
                 self._step, total_loss.item(), self.replay.size,
-                self.replay.tree.total,
+                self.replay.tree.total, lr_str,
             )
 
     def _compute_loss(self, batch: dict, weights: torch.Tensor) -> dict:
@@ -239,10 +242,13 @@ class LearnerThread:
         
         value = outputs["value"]
 
-        # *CRITICAL FIX*: We intentionally DO NOT clamp the `value` tensor here. 
-        # Clamping earlier caused a "dead gradient" bug where predictions > 20 never 
-        # received backprop signals to shrink! We instead rely on `F.smooth_l1_loss` 
-        # to safely cap gradient magnitudes without severing the backward pass.
+        # Soft-clamp value predictions via tanh squashing to [-7, 7].
+        # Rewards are now clamped to [-5, 5], so values should stay in
+        # a similar range.  tanh preserves gradients everywhere (no dead
+        # zones), but smoothly compresses extreme predictions back toward
+        # the valid range.  The 7.0 scale gives headroom above the reward
+        # clamp so the value head can slightly overshoot without penalty.
+        value = 7.0 * torch.tanh(value / 7.0)
 
         # Policy loss (if we have targets)
         loss = torch.tensor(0.0, device=self.device)
@@ -255,9 +261,10 @@ class LearnerThread:
 
             advantage = rewards - old_values.squeeze(-1)
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-            # Clamp advantage to prevent catastrophic policy updates
-            # from single high-reward transitions.
-            advantage = torch.clamp(advantage, -5.0, 5.0)
+            # Clamp advantage to prevent catastrophic policy updates.
+            # Tighter [-3, 3] range aligns with the reduced reward scale
+            # and prevents any single sample from dominating the batch.
+            advantage = torch.clamp(advantage, -3.0, 3.0)
 
             dist = torch.distributions.Categorical(logits=action_logits)
             log_prob = dist.log_prob(actions)
@@ -266,10 +273,15 @@ class LearnerThread:
             policy_loss = -(log_prob * advantage.detach() * weights).mean()
             # Use Huber loss (SmoothL1) instead of MSE to reduce
             # sensitivity to outlier value predictions.
-            # Weight value loss by replay priorities
+            # Weight value loss by replay priorities.
             value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
-            
-            loss = policy_loss + 0.5 * value_loss - 0.03 * (entropy * weights).mean()
+
+            # Entropy bonus — encourages exploration but must NOT be
+            # weighted by replay priorities (which would make high-
+            # priority samples produce disproportionate entropy signal).
+            entropy_bonus = 0.01 * entropy.mean()
+
+            loss = policy_loss + 0.5 * value_loss - entropy_bonus
 
         # ICM loss (if we have next-state info)
         if "next_fused" in batch and "action" in batch:

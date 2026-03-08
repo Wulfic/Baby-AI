@@ -69,25 +69,25 @@ class RewardComposer:
 
     def __init__(
         self,
-        intrinsic_weight_start: float = 1.0,
-        intrinsic_weight_end: float = 0.1,
+        intrinsic_weight_start: float = 0.5,
+        intrinsic_weight_end: float = 0.05,
         intrinsic_decay_steps: int = 500_000,
-        comm_weight: float = 0.3,
-        extrinsic_weight: float = 1.0,
-        exploration_weight: float = 1.0,
-        interaction_weight: float = 1.5,
-        action_diversity_weight: float = 0.5,
-        movement_weight: float = 0.3,
-        block_break_weight: float = 3.0,
-        item_pickup_weight: float = 4.0,
-        # * Creation-focused weights (intentionally the highest)
-        block_place_weight: float = 5.0,
-        crafting_weight: float = 8.0,
-        building_streak_weight: float = 4.0,
-        creative_sequence_weight: float = 10.0,
+        comm_weight: float = 0.1,
+        extrinsic_weight: float = 0.3,
+        exploration_weight: float = 0.3,
+        interaction_weight: float = 0.4,
+        action_diversity_weight: float = 0.15,
+        movement_weight: float = 0.1,
+        block_break_weight: float = 0.8,
+        item_pickup_weight: float = 1.0,
+        # * Creation-focused weights (highest, but bounded for z-scored channels)
+        block_place_weight: float = 1.2,
+        crafting_weight: float = 2.0,
+        building_streak_weight: float = 1.0,
+        creative_sequence_weight: float = 2.5,
         # Penalties
-        death_penalty_weight: float = 5.0,
-        safety_weight: float = 2.0,
+        death_penalty_weight: float = 2.0,
+        safety_weight: float = 1.0,
         normalize: bool = True,
         normalize_window: int = 1000,
     ):
@@ -128,9 +128,16 @@ class RewardComposer:
         """Normalize a reward channel by running mean/std.
 
         Values are z-scored against a rolling window, then **clamped**
-        to [-5, 5] to prevent catastrophic reward spikes from sparse
-        channels (e.g. block_break fires once per hundred steps, so
-        its z-score would otherwise shoot to >10).
+        to [-3, 3] to prevent catastrophic reward spikes from sparse
+        channels (e.g. block_break fires once per hundred steps).
+
+        Key safeguards:
+        - Minimum std floor of 0.1 prevents divide-by-near-zero on
+          sparse binary channels (block_break, crafting, etc.)
+        - Warmup period returns scaled raw values until we have
+          enough data for meaningful statistics.
+        - Tighter [-3, 3] clamp keeps per-channel contributions
+          bounded even after multiplication by channel weights.
         """
         if not self.normalize:
             return value
@@ -140,14 +147,22 @@ class RewardComposer:
 
         self._stats[channel]["values"].append(value)
 
-        if len(self._stats[channel]["values"]) < 10:
-            return value  # not enough data yet
+        # Warmup: not enough data for reliable statistics.
+        # Return value scaled down to prevent spikes from raw magnitudes.
+        if len(self._stats[channel]["values"]) < 30:
+            return float(np.clip(value, -3.0, 3.0))
 
         arr = np.array(self._stats[channel]["values"])
-        mean, std = arr.mean(), arr.std() + 1e-8
+        mean = arr.mean()
+        # Minimum std floor of 0.1 — critical for sparse channels where
+        # std is near-zero (e.g., block_break: 99% zeros, 1% non-zero).
+        # Without this, a single event gets z-scored to z=10+ even though
+        # it's a perfectly normal game event.
+        std = max(arr.std(), 0.1)
         z = (value - mean) / std
-        # Clamp to prevent reward explosions from rare events
-        return float(np.clip(z, -5.0, 5.0))
+        # Tight clamp: even with weights up to 2.5, max single-channel
+        # contribution is 2.5 * 3.0 = 7.5 (vs old 10.0 * 5.0 = 50.0)
+        return float(np.clip(z, -3.0, 3.0))
 
     def compose(
         self,
@@ -228,10 +243,11 @@ class RewardComposer:
             - self.safety_weight * safety_n
         )
 
-        # Clamp total reward to a sane range to prevent enormous
-        # gradients in the learner — even with z-score clamping,
-        # many channels firing simultaneously can stack up.
-        reward = float(np.clip(reward, -15.0, 15.0))
+        # Clamp total reward to [-5, 5].  With reduced weights and
+        # tighter z-score clamps, the theoretical max is ~15 from all
+        # channels firing at once — but the value head and advantage
+        # computation work best with a compact reward range.
+        reward = float(np.clip(reward, -5.0, 5.0))
 
         # Monitor all channels
         self._monitor.record("total", reward)
