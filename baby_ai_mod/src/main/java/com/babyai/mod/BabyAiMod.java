@@ -3,6 +3,7 @@ package com.babyai.mod;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -29,11 +30,22 @@ public class BabyAiMod implements ModInitializer {
         // Start the TCP event bridge (accepts Python connections)
         EventBridge.INSTANCE.start();
 
+        // ── Heartbeat tick (every 100 ticks = 5 seconds) ─────
+        // Lets the Python client verify the event pipeline works
+        // even when no game events are happening.
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            long tick = server.getTicks();
+            if (tick % 100 == 0) {
+                EventBridge.INSTANCE.onHeartbeat(tick);
+            }
+        });
+
         // ── Block break (Fabric API) ─────────────────────────
         PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
             if (!world.isClient()) {
                 String blockId = Registries.BLOCK.getId(state.getBlock()).toString();
                 long tick = world.getServer() != null ? world.getServer().getTicks() : 0;
+                LOGGER.info("[Baby-AI] Block broken: {} at ({},{},{})", blockId, pos.getX(), pos.getY(), pos.getZ());
                 EventBridge.INSTANCE.onBlockBroken(blockId, pos, tick);
             }
         });

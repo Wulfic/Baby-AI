@@ -73,12 +73,33 @@ class ModBridge:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
+        # Heartbeat tracking — lets us tell "pipeline broken"
+        # from "no game events happened".
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_tick: int = 0
+        self._total_events: int = 0
+
     # ── Properties ──────────────────────────────────────────────
 
     @property
     def connected(self) -> bool:
         """True when the TCP connection to the mod is alive."""
         return self._connected
+
+    @property
+    def pipeline_alive(self) -> bool:
+        """True if we received a heartbeat within the last 15 s."""
+        return (time.monotonic() - self._last_heartbeat) < 15.0
+
+    @property
+    def last_heartbeat_tick(self) -> int:
+        """Game tick from the most recent heartbeat."""
+        return self._heartbeat_tick
+
+    @property
+    def total_events_received(self) -> int:
+        """Total non-heartbeat events received since start."""
+        return self._total_events
 
     # ── Lifecycle ───────────────────────────────────────────────
 
@@ -170,7 +191,21 @@ class ModBridge:
                         continue
                     try:
                         event = json.loads(line)
-                        self._events.append(event)
+                        evt_type = event.get("event", "unknown")
+                        if evt_type == "heartbeat":
+                            # Track heartbeat but don't queue it as a
+                            # game event — it's purely for diagnostics.
+                            self._last_heartbeat = time.monotonic()
+                            self._heartbeat_tick = event.get("tick", 0)
+                            log.debug("Heartbeat tick=%d clients=%d",
+                                      self._heartbeat_tick,
+                                      event.get("clients", 0))
+                        else:
+                            self._events.append(event)
+                            self._total_events += 1
+                            log.info("Mod event: %s %s", evt_type,
+                                     {k: v for k, v in event.items()
+                                      if k != "event"})
                     except json.JSONDecodeError:
                         log.debug("Bad JSON from mod: %.100s", line)
 

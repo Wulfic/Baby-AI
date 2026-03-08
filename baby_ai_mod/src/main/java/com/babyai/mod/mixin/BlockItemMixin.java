@@ -5,6 +5,8 @@ import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.ActionResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -26,6 +28,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(BlockItem.class)
 public class BlockItemMixin {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("Baby-AI");
+
     @Inject(method = "place", at = @At("RETURN"))
     private void babyai$onBlockPlaced(
             ItemPlacementContext context,
@@ -40,6 +44,7 @@ public class BlockItemMixin {
         long tick = context.getWorld().getServer() != null
                 ? context.getWorld().getServer().getTicks() : 0;
 
+        LOGGER.info("[Baby-AI] Block placed: {} at {}", blockId, context.getBlockPos());
         EventBridge.INSTANCE.onBlockPlaced(
                 blockId, context.getBlockPos(), tick
         );

@@ -48,6 +48,7 @@ from baby_ai.environments.minecraft.screen_analyzer import (
 )
 from baby_ai.environments.minecraft.mod_bridge import ModBridge
 from baby_ai.environments.minecraft.window import WindowManager
+from baby_ai.learning.item_rewards import get_item_reward
 from baby_ai.utils.logging import get_logger
 
 log = get_logger("mc_env")
@@ -72,6 +73,7 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
 _BLOCK_INTERACTION_ACTIONS = set()
 _ATTACK_ACTIONS = set()
 _USE_ACTIONS = set()
+_DROP_ACTIONS = set()
 for _i, _a in enumerate(MINECRAFT_ACTIONS):
     if "left" in _a.buttons or "right" in _a.buttons:
         _BLOCK_INTERACTION_ACTIONS.add(_i)
@@ -79,6 +81,9 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
         _ATTACK_ACTIONS.add(_i)
     if "right" in _a.buttons:
         _USE_ACTIONS.add(_i)
+    # Q key = drop item — used to suppress pickup reward after drops
+    if _VK.get("Q") in _a.keys:
+        _DROP_ACTIONS.add(_i)
 
 
 class MinecraftEnv(GameEnvironment):
@@ -207,6 +212,30 @@ class MinecraftEnv(GameEnvironment):
         self._stagnation_timeout = max(1, int(30.0 / max(self._step_delay, 0.01)))
         self._last_productive_step: int = 0
 
+        # ── Long-break system ───────────────────────────────────
+        # Some blocks (dirt w/o shovel, stone w/o pick) take up to
+        # 12 s of sustained left-click.  If the agent repeatedly
+        # issues attack actions without a block_broken event, we
+        # override with a single sustained hold.
+        self._attack_streak: int = 0       # consecutive attack steps
+        self._blocks_broken_total: int = 0 # lifetime counter (mod)
+        # Trigger long break after this many consecutive attack steps
+        # with no block break.  15 steps × 100 ms ≈ 1.5 s of trying.
+        self._long_break_threshold: int = 15
+        # How long (seconds) to hold attack during a long break.
+        self._long_break_duration: float = 8.0
+        # Minimum seconds between long breaks to avoid stalling.
+        self._long_break_cooldown: float = 15.0
+        self._last_long_break_time: float = 0.0
+        self._long_break_count: int = 0    # total long breaks done
+
+        # ── Drop-pickup suppression ─────────────────────────────
+        # Suppress item_pickup rewards for 5 s after a drop action
+        # to prevent the agent gaming rewards by dropping + picking
+        # up the same item repeatedly.
+        self._last_drop_time: float = 0.0
+        self._drop_pickup_cooldown: float = 5.0
+
         # ── Mod bridge (authoritative game events via TCP) ──────
         self._mod_bridge = ModBridge(port=mod_bridge_port)
         self._mod_bridge.start()
@@ -245,6 +274,13 @@ class MinecraftEnv(GameEnvironment):
         self._is_dead = False
         self._last_productive_step = 0
 
+        # Reset long-break state
+        self._attack_streak = 0
+        self._blocks_broken_total = 0
+        self._last_long_break_time = 0.0
+        self._long_break_count = 0
+        self._last_drop_time = 0.0
+
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:
             self._mod_bridge.drain_events()
@@ -269,25 +305,60 @@ class MinecraftEnv(GameEnvironment):
         action_id = int(action_id) % NUM_ACTIONS
         action = MINECRAFT_ACTIONS[action_id]
 
-        # ── Execute action ──────────────────────────────────────
-        # Only send input if the MC window is still alive
-        if self._window.is_valid:
-            self._input.set_keys(action.keys)
-            self._input.set_buttons(action.buttons)
+        # ── Long-break check ────────────────────────────────────
+        # If the agent has been issuing attack actions repeatedly
+        # without any block breaking, override with a sustained
+        # hold so blocks that take many seconds actually break.
+        is_attack = action_id in _ATTACK_ACTIONS
+        long_break_triggered = False
 
-            if action.look is not None:
-                # mouse_look already guards against unfocused window
-                self._input.mouse_look(action.look[0], action.look[1])
+        # Track item drops for pickup-reward suppression
+        if action_id in _DROP_ACTIONS:
+            self._last_drop_time = time.monotonic()
 
-        # ── Pacing ──────────────────────────────────────────────
-        elapsed = time.perf_counter() - self._last_step_time
-        remaining = self._step_delay - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        self._last_step_time = time.perf_counter()
+        if is_attack:
+            self._attack_streak += 1
+        else:
+            self._attack_streak = 0
 
-        # ── Observe ─────────────────────────────────────────────
-        obs = self._observe()
+        now_mono = time.monotonic()
+        cooldown_ok = (now_mono - self._last_long_break_time) >= self._long_break_cooldown
+        mod_alive = (self._mod_bridge is not None and self._mod_bridge.connected)
+
+        if (is_attack
+                and self._attack_streak >= self._long_break_threshold
+                and cooldown_ok
+                and mod_alive
+                and self._window.is_valid):
+            long_break_triggered = True
+            self._long_break_count += 1
+            self._last_long_break_time = now_mono
+            log.info(
+                "Long-break #%d triggered at step %d "
+                "(streak=%d, duration=%.1fs)",
+                self._long_break_count, self._step_count,
+                self._attack_streak, self._long_break_duration,
+            )
+            obs = self._execute_long_break(action)
+            self._attack_streak = 0  # reset after long break
+        else:
+            # ── Normal action execution ─────────────────────────
+            if self._window.is_valid:
+                self._input.set_keys(action.keys)
+                self._input.set_buttons(action.buttons)
+
+                if action.look is not None:
+                    self._input.mouse_look(action.look[0], action.look[1])
+
+            # ── Pacing ──────────────────────────────────────────
+            elapsed = time.perf_counter() - self._last_step_time
+            remaining = self._step_delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_step_time = time.perf_counter()
+
+            # ── Observe ─────────────────────────────────────────
+            obs = self._observe()
 
         # ── Track action for reward shaping ─────────────────────
         self._action_history.append(action_id)
@@ -303,12 +374,76 @@ class MinecraftEnv(GameEnvironment):
             "has_look": action.look is not None,
             "window_focused": self._window.is_focused,
             "reward_breakdown": reward_info,
+            "long_break": long_break_triggered,
+            "attack_streak": self._attack_streak,
+            "long_break_count": self._long_break_count,
         }
 
         self._step_count += 1
         self._prev_action_id = action_id
 
         return obs, reward, done, info
+
+    # ── Long-break helper ───────────────────────────────────────
+
+    def _execute_long_break(self, action) -> Dict[str, torch.Tensor]:
+        """
+        Hold left-click (attack) for an extended duration to break
+        tough blocks that need sustained mining.
+
+        Instead of the normal 100 ms tap, holds the attack button for
+        ``_long_break_duration`` seconds (default 8 s).  Polls for
+        ``block_broken`` mod events every 0.25 s and aborts early if
+        the target block breaks, avoiding wasted time.
+
+        During the hold we also keep any movement/modifier keys the
+        original action specified, but suppress look deltas to avoid
+        drifting the camera mid-break.
+
+        Returns the latest observation tensor dict.
+        """
+        # Hold the same keys/buttons as the triggering action
+        if self._window.is_valid:
+            self._input.set_keys(action.keys)
+            self._input.set_buttons(action.buttons | frozenset({"left"}))
+
+        poll_interval = 0.25   # check for break every 250 ms
+        start = time.perf_counter()
+        end = start + self._long_break_duration
+        broke_during_hold = False
+
+        while time.perf_counter() < end:
+            time.sleep(poll_interval)
+            if not self._window.is_valid:
+                break
+
+            # Check mod bridge for block_broken events
+            if self._mod_bridge is not None and self._mod_bridge.connected:
+                events = self._mod_bridge.drain_events()
+                breaks = [e for e in events if e.get("event") == "block_broken"]
+                if breaks:
+                    broke_during_hold = True
+                    elapsed_s = time.perf_counter() - start
+                    log.info(
+                        "Long-break: block broke after %.1fs (%d events)",
+                        elapsed_s, len(breaks),
+                    )
+                    # Put any non-break events back (pickups, etc.)
+                    for e in events:
+                        if e.get("event") != "block_broken":
+                            self._mod_bridge._events.append(e)
+                    break
+
+        # Release the sustained hold and capture final observation
+        self._input.release_all()
+        self._last_step_time = time.perf_counter()
+        obs = self._observe()
+
+        hold_time = time.perf_counter() - start
+        if not broke_during_hold:
+            log.info("Long-break: no block broke after %.1fs hold", hold_time)
+
+        return obs
 
     def close(self) -> None:
         """Release all held inputs, stop input guard, and stop Minecraft."""
@@ -505,6 +640,12 @@ class MinecraftEnv(GameEnvironment):
         mod_items_picked  = [e for e in mod_events if e.get("event") == "item_picked_up"]
         mod_deaths        = [e for e in mod_events if e.get("event") == "player_death"]
 
+        # Reset attack streak when a block actually breaks —
+        # prevents unnecessary long-break triggers.
+        if mod_blocks_broken:
+            self._attack_streak = 0
+            self._blocks_broken_total += len(mod_blocks_broken)
+
         use_mod = bool(mod_events) or (
             self._mod_bridge is not None and self._mod_bridge.connected
         )
@@ -516,11 +657,15 @@ class MinecraftEnv(GameEnvironment):
 
         # ────────────────────────────────────────────────────────
         # 8. Block-break detection
-        #    MOD: 1.0 per block break event (authoritative)
-        #    PIXEL FALLBACK: crosshair crack animation
+        #    MOD: per-item reward via item_rewards table
+        #    PIXEL FALLBACK: crosshair crack animation (flat 1.0)
         # ────────────────────────────────────────────────────────
         if use_mod:
-            block_break_reward = float(len(mod_blocks_broken))
+            # Sum per-block rewards based on rarity / difficulty
+            block_break_reward = sum(
+                get_item_reward(e.get("block", ""), "block_broken")
+                for e in mod_blocks_broken
+            )
             # Still update pixel tracker state so it stays in sync
             if self._raw_frame is not None:
                 is_attacking = action_id in _ATTACK_ACTIONS
@@ -540,7 +685,7 @@ class MinecraftEnv(GameEnvironment):
 
         # ────────────────────────────────────────────────────────
         # 9. Crafting detection
-        #    MOD: 1.0 per crafting event
+        #    MOD: per-item reward via item_rewards table (2× base)
         #    PIXEL FALLBACK: inventory UI + hotbar change
         # ────────────────────────────────────────────────────────
         craft_info = {"ui_open": False, "craft_score": 0.0, "frames_in_ui": 0}
@@ -548,20 +693,28 @@ class MinecraftEnv(GameEnvironment):
             craft_info = self._crafting_tracker.update(self._raw_frame)
 
         if use_mod:
-            # Each crafted item is a full 1.0 reward
-            craft_score_mod = float(len(mod_items_crafted))
+            # Per-item crafting reward scaled by rarity (2× multiplier)
+            craft_score_mod = sum(
+                get_item_reward(e.get("item", ""), "item_crafted")
+                * e.get("count", 1)
+                for e in mod_items_crafted
+            )
             # Override pixel tracker score with mod score
             craft_info = dict(craft_info)  # copy
             craft_info["craft_score"] = craft_score_mod
 
         # ────────────────────────────────────────────────────────
         # 10. Item pickup
-        #    MOD: scaled by count, capped at 1.0
+        #    MOD: per-item reward via item_rewards table
         #    PIXEL FALLBACK: hotbar region change (suppressed during UI)
         # ────────────────────────────────────────────────────────
         if use_mod:
-            total_picked = sum(e.get("count", 1) for e in mod_items_picked)
-            item_pickup = min(total_picked / 5.0, 1.0) if total_picked > 0 else 0.0
+            # Per-item pickup reward scaled by rarity
+            item_pickup = sum(
+                get_item_reward(e.get("item", ""), "item_picked_up")
+                * min(e.get("count", 1), 10)  # cap count to curb inflation
+                for e in mod_items_picked
+            )
             # Keep pixel tracker in sync
             if self._raw_frame is not None:
                 self._hotbar_tracker.update(self._raw_frame)
@@ -571,6 +724,15 @@ class MinecraftEnv(GameEnvironment):
                 item_pickup = self._hotbar_tracker.update(self._raw_frame)
             elif self._raw_frame is not None:
                 self._hotbar_tracker.update(self._raw_frame)
+
+        # Suppress pickup reward shortly after a drop action —
+        # prevents the agent from gaming rewards by dropping items
+        # and immediately picking them back up.
+        if item_pickup > 0 and (time.monotonic() - self._last_drop_time) < self._drop_pickup_cooldown:
+            log.debug("Suppressed item_pickup reward (%.3f) — within %.0fs of drop",
+                      item_pickup, self._drop_pickup_cooldown)
+            item_pickup = 0.0
+
         rewards["item_pickup"] = item_pickup
 
         # ────────────────────────────────────────────────────────
@@ -601,11 +763,16 @@ class MinecraftEnv(GameEnvironment):
 
         # ────────────────────────────────────────────────────────
         # 12. Block placement detection
-        #    MOD: 1.0 per placement event
+        #    MOD: per-block reward via item_rewards table (1.2× base)
         #    PIXEL FALLBACK: right-click + forward visual change
         # ────────────────────────────────────────────────────────
         if use_mod:
-            block_place_score = float(len(mod_blocks_placed))
+            # Per-block placement reward — incentivises building with
+            # rarer materials (1.2× multiplier for intentional building)
+            block_place_score = sum(
+                get_item_reward(e.get("block", ""), "block_placed")
+                for e in mod_blocks_placed
+            )
             # Keep pixel tracker in sync
             if self._raw_frame is not None:
                 is_using = action_id in _USE_ACTIONS
@@ -684,16 +851,22 @@ class MinecraftEnv(GameEnvironment):
         # ────────────────────────────────────────────────────────
         if self._step_count % 50 == 0:
             raw_h, raw_w = (self._raw_frame.shape[:2] if self._raw_frame is not None else (0, 0))
-            bridge_status = "connected" if (self._mod_bridge and self._mod_bridge.connected) else "disconnected"
+            if self._mod_bridge and self._mod_bridge.connected:
+                hb = "alive" if self._mod_bridge.pipeline_alive else "NO-HB"
+                bridge_status = f"connected({hb},tick={self._mod_bridge.last_heartbeat_tick},evt={self._mod_bridge.total_events_received})"
+            else:
+                bridge_status = "disconnected"
             log.info(
                 "Detector diagnostics step %d | mod_bridge=%s | raw_frame=%dx%d"
                 " | blk_brk=%.3f item=%.3f place=%.3f"
                 " | craft=%.3f death=%.1f"
-                " | vis_change=%.4f interact=%.3f",
+                " | vis_change=%.4f interact=%.3f"
+                " | long_brk=%d atk_streak=%d",
                 self._step_count, bridge_status, raw_h, raw_w,
                 block_break_reward, item_pickup, block_place_score,
                 craft_info["craft_score"], death_penalty,
                 visual_change, interaction_bonus,
+                self._long_break_count, self._attack_streak,
             )
 
         # ────────────────────────────────────────────────────────

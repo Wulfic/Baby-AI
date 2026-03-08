@@ -155,4 +155,12 @@ public class EventBridge {
         j.addProperty("tick", tick);
         broadcast(j);
     }
+
+    public void onHeartbeat(long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "heartbeat");
+        j.addProperty("tick", tick);
+        j.addProperty("clients", clients.size());
+        broadcast(j);
+    }
 }
