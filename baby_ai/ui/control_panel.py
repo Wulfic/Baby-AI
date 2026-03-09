@@ -6,11 +6,14 @@ Provides:
 - Set New Home button to update the agent's home location
 - Per-channel reward toggle checkboxes in a multi-column grid
 - AI Controls tab to enable/disable individual keys/buttons/look
+- Reward Weights tab with sliders for each weight multiplier
 - Live reward / step readout
+- Persistent settings across runs via SettingsStore
 
 Runs on a daemon thread so it doesn't block the training loop.
-All shared state is mediated through :class:`RewardToggleState`
-and :class:`AIControlsState` which are thread-safe.
+All shared state is mediated through :class:`RewardToggleState`,
+:class:`AIControlsState`, and :class:`RewardWeightsState` which
+are thread-safe.
 """
 
 from __future__ import annotations
@@ -31,6 +34,12 @@ from baby_ai.ui.controls_state import (
     CONTROL_GROUPS,
     AIControlsState,
 )
+from baby_ai.ui.reward_weights import (
+    REWARD_WEIGHTS,
+    WEIGHT_GROUPS,
+    RewardWeightsState,
+)
+from baby_ai.ui.settings_store import SettingsStore
 
 
 def _get_dpi_scale() -> float:
@@ -84,12 +93,17 @@ class AIControlPanel:
     controls_state : AIControlsState, optional
         Shared AI input-control state.  If ``None`` a private instance
         is created.
+    reward_weights : RewardWeightsState, optional
+        Shared reward weight multipliers.  If ``None`` a private
+        instance is created.
     on_set_home : callable, optional
         Invoked when the user clicks *Set New Home*.  Should grab the
         current player coordinates and update the env's home location.
     input_guard : object, optional
         Reference to the :class:`InputGuard` so the Pause button can
         toggle keyboard/mouse blocking in sync.
+    settings_store : SettingsStore, optional
+        Persistent settings.  If ``None`` a private instance is created.
     """
 
     def __init__(
@@ -97,14 +111,21 @@ class AIControlPanel:
         on_stop: Optional[Callable[[], None]] = None,
         toggle_state: Optional[RewardToggleState] = None,
         controls_state: Optional[AIControlsState] = None,
+        reward_weights: Optional[RewardWeightsState] = None,
         on_set_home: Optional[Callable[[], None]] = None,
         input_guard: Optional[object] = None,
+        settings_store: Optional[SettingsStore] = None,
     ):
         self.is_paused: bool = False
         self.is_stopped: bool = False
         self.on_stop = on_stop
         self.on_set_home = on_set_home
         self._input_guard = input_guard
+
+        # Settings persistence
+        self._store: SettingsStore = (
+            settings_store if settings_store is not None else SettingsStore()
+        )
 
         # Shared state for reward toggles.
         self.toggle_state: RewardToggleState = (
@@ -116,9 +137,19 @@ class AIControlPanel:
             controls_state if controls_state is not None else AIControlsState()
         )
 
+        # Shared state for reward weight multipliers.
+        self.reward_weights: RewardWeightsState = (
+            reward_weights if reward_weights is not None else RewardWeightsState()
+        )
+
+        # ── Restore persisted settings ─────────────────────────
+        self._load_persisted_settings()
+
         self.root: Optional[tk.Tk] = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
         self._ctrl_check_vars: dict[str, tk.BooleanVar] = {}
+        self._weight_vars: dict[str, tk.DoubleVar] = {}
+        self._weight_labels: dict[str, tk.Label] = {}
         self._reward_label: Optional[tk.Label] = None
         self._step_label: Optional[tk.Label] = None
 
@@ -235,6 +266,11 @@ class AIControlPanel:
         controls_frame = tk.Frame(self._notebook, bg=_BG)
         self._notebook.add(controls_frame, text="  AI Controls  ")
         self._build_controls_tab(controls_frame)
+
+        # ── Tab 3: Reward Weights ──────────────────────────────
+        weights_frame = tk.Frame(self._notebook, bg=_BG)
+        self._notebook.add(weights_frame, text="  Reward Weights  ")
+        self._build_weights_tab(weights_frame)
 
         # ── Live stats bar (bottom) ────────────────────────────
         self._sep(self.root)
@@ -461,16 +497,31 @@ class AIControlPanel:
     # ────────────────────────────────────────────────────────────
 
     def _on_toggle(self, key: str) -> None:
-        """Reward checkbox was toggled — push to shared state."""
+        """Reward checkbox was toggled — push to shared state + persist."""
         var = self._check_vars.get(key)
         if var is not None:
             self.toggle_state.set_enabled(key, var.get())
+            self._persist_reward_toggles()
 
     def _on_ctrl_toggle(self, key: str) -> None:
-        """AI-control checkbox was toggled — push to shared state."""
+        """AI-control checkbox was toggled — push to shared state + persist."""
         var = self._ctrl_check_vars.get(key)
         if var is not None:
             self.controls_state.set_enabled(key, var.get())
+            self._persist_ai_controls()
+
+    def _on_weight_change(self, key: str, value: str) -> None:
+        """Reward weight slider was moved — push to shared state + persist."""
+        try:
+            fval = round(float(value), 2)
+        except (ValueError, TypeError):
+            return
+        self.reward_weights.set_weight(key, fval)
+        # Update the value label next to the slider.
+        lbl = self._weight_labels.get(key)
+        if lbl is not None:
+            lbl.config(text=f"{fval:.1f}")
+        self._persist_reward_weights()
 
     def _on_set_home(self) -> None:
         """Set New Home button clicked — invoke the callback."""
@@ -482,6 +533,18 @@ class AIControlPanel:
         self.controls_state.set_all(enabled)
         for key, var in self._ctrl_check_vars.items():
             var.set(enabled)
+        self._persist_ai_controls()
+
+    def _reset_weights_to_defaults(self) -> None:
+        """Reset all reward weights to their default values."""
+        self.reward_weights.reset_defaults()
+        snap = self.reward_weights.snapshot()
+        for key, var in self._weight_vars.items():
+            var.set(snap.get(key, 0.0))
+            lbl = self._weight_labels.get(key)
+            if lbl is not None:
+                lbl.config(text=f"{snap.get(key, 0.0):.1f}")
+        self._persist_reward_weights()
 
     def toggle_pause(self) -> None:
         self.is_paused = not self.is_paused
@@ -504,6 +567,10 @@ class AIControlPanel:
     def trigger_stop(self) -> None:
         self.is_stopped = True
         self._release_cursor()
+        # Persist all settings before closing.
+        self._persist_reward_toggles()
+        self._persist_ai_controls()
+        self._persist_reward_weights()
         if self.on_stop:
             self.on_stop()
         self._destroy()
@@ -526,14 +593,192 @@ class AIControlPanel:
             pass
 
     def _destroy(self) -> None:
-        """Destroy the root window (must run on the tk thread)."""
+        """Destroy the root window (must run on the tk thread).
+
+        Clears all tk variable references first so their __del__
+        methods don't fire from the wrong thread during GC.
+        """
         try:
+            # Drop all tk variable refs before destroying root —
+            # prevents "main thread is not in main loop" RuntimeError
+            # when Python's GC collects them on the main thread.
+            self._check_vars.clear()
+            self._ctrl_check_vars.clear()
+            self._weight_vars.clear()
+            self._weight_labels.clear()
+            self._reward_label = None
+            self._step_label = None
             if self.root is not None:
                 self.root.quit()
                 self.root.destroy()
                 self.root = None
         except Exception:
             pass
+
+    # ────────────────────────────────────────────────────────────
+    # Persistence helpers
+    # ────────────────────────────────────────────────────────────
+
+    def _load_persisted_settings(self) -> None:
+        """Restore all shared state objects from the settings store."""
+        # Reward toggles
+        saved_toggles = self._store.get("reward_toggles")
+        if saved_toggles and isinstance(saved_toggles, dict):
+            for key, enabled in saved_toggles.items():
+                self.toggle_state.set_enabled(key, bool(enabled))
+
+        # AI controls
+        saved_controls = self._store.get("ai_controls")
+        if saved_controls and isinstance(saved_controls, dict):
+            for key, enabled in saved_controls.items():
+                self.controls_state.set_enabled(key, bool(enabled))
+
+        # Reward weights
+        saved_weights = self._store.get("reward_weights")
+        if saved_weights and isinstance(saved_weights, dict):
+            self.reward_weights.set_all(saved_weights)
+
+    def _persist_reward_toggles(self) -> None:
+        """Save current reward toggle state to disk."""
+        self._store.set("reward_toggles", self.toggle_state.snapshot())
+
+    def _persist_ai_controls(self) -> None:
+        """Save current AI controls state to disk."""
+        self._store.set("ai_controls", self.controls_state.snapshot())
+
+    def _persist_reward_weights(self) -> None:
+        """Save current reward weights to disk."""
+        self._store.set("reward_weights", self.reward_weights.snapshot())
+
+    # ────────────────────────────────────────────────────────────
+    # Tab builder: Reward Weights
+    # ────────────────────────────────────────────────────────────
+
+    def _build_weights_tab(self, parent: tk.Frame) -> None:
+        """Build the reward weight sliders inside *parent*."""
+        s = self._scale
+
+        # ── Header with Reset Defaults button ──────────────────
+        header = tk.Frame(parent, bg=_BG)
+        header.pack(fill=tk.X, pady=(int(4 * s), int(3 * s)))
+
+        tk.Label(
+            header, text="REWARD WEIGHT MULTIPLIERS",
+            font=("Segoe UI", int(9 * s), "bold"),
+            bg=_BG, fg=_FG_DIM, anchor="w",
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            header, text="Reset Defaults",
+            command=self._reset_weights_to_defaults,
+            bg=_STOP_BG, fg="#1e1e2e", activebackground="#eba0ac",
+            font=("Segoe UI", int(8 * s), "bold"),
+            relief="flat", bd=0, padx=int(6 * s), pady=int(2 * s),
+        ).pack(side=tk.RIGHT, padx=(int(4 * s), 0))
+
+        # ── Scrollable area ────────────────────────────────────
+        canvas_frame = tk.Frame(parent, bg=_BG)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, pady=(0, int(4 * s)))
+
+        canvas = tk.Canvas(canvas_frame, bg=_BG, highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(
+            canvas_frame, orient="vertical", command=canvas.yview,
+        )
+        inner = tk.Frame(canvas, bg=_BG)
+
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Mouse-wheel scrolling.
+        def _on_mousewheel_weights(event: tk.Event) -> None:
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel_weights)
+
+        # ── Build groups with sliders ──────────────────────────
+        snapshot = self.reward_weights.snapshot()
+
+        from collections import OrderedDict
+        grouped: OrderedDict[str, list] = OrderedDict()
+        for w in REWARD_WEIGHTS:
+            grouped.setdefault(w.group, []).append(w)
+
+        for group_name, weights in grouped.items():
+            grp_frame = tk.Frame(
+                inner, bg=_BG_GROUP,
+                padx=int(6 * s), pady=int(4 * s),
+            )
+            grp_frame.pack(fill=tk.X, padx=int(3 * s), pady=int(3 * s))
+
+            # Group header
+            tk.Label(
+                grp_frame, text=group_name.upper(),
+                font=("Segoe UI", int(8 * s), "bold"),
+                bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
+            ).pack(fill=tk.X)
+
+            for w in weights:
+                row = tk.Frame(grp_frame, bg=_BG_GROUP)
+                row.pack(fill=tk.X, padx=(int(4 * s), 0), pady=(int(1 * s), 0))
+
+                # Use grid so the label gets a fixed width and the
+                # slider expands to fill all remaining space.
+                row.columnconfigure(1, weight=1)  # slider column stretches
+
+                # Label (penalty indicator) — fixed width column
+                prefix = "\u2212 " if w.is_penalty else "+ "
+                tk.Label(
+                    row, text=prefix + w.label,
+                    font=("Segoe UI", int(8 * s)),
+                    bg=_BG_GROUP, fg=_FG, anchor="w",
+                ).grid(row=0, column=0, sticky="w",
+                       padx=(0, int(4 * s)),
+                       ipadx=int(2 * s))
+
+                # Current value label — right-aligned, fixed width
+                cur_val = snapshot.get(w.key, w.default)
+                val_label = tk.Label(
+                    row, text=f"{cur_val:.1f}",
+                    font=("Consolas", int(9 * s)),
+                    bg=_BG_GROUP, fg=_ACCENT, anchor="e",
+                    width=5,
+                )
+                val_label.grid(row=0, column=2, sticky="e",
+                               padx=(int(4 * s), 0))
+                self._weight_labels[w.key] = val_label
+
+                # Scale (slider) — fills remaining width
+                var = tk.DoubleVar(value=cur_val)
+                self._weight_vars[w.key] = var
+
+                slider = tk.Scale(
+                    row,
+                    from_=w.min_val,
+                    to=w.max_val,
+                    resolution=w.step,
+                    orient=tk.HORIZONTAL,
+                    variable=var,
+                    showvalue=False,
+                    command=lambda val, k=w.key: self._on_weight_change(k, val),
+                    bg=_ACCENT,               # thumb color
+                    fg=_FG,
+                    troughcolor=_ACCENT_DARK,  # visible groove
+                    activebackground="#b4d0fb", # thumb hover
+                    highlightthickness=0,
+                    bd=0,
+                    width=int(12 * s),         # thumb height
+                    sliderlength=int(16 * s),  # thumb width
+                    sliderrelief="raised",
+                )
+                slider.grid(row=0, column=1, sticky="ew",
+                            padx=(int(2 * s), int(2 * s)))
 
     # ────────────────────────────────────────────────────────────
     # Helpers

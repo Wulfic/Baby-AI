@@ -36,6 +36,7 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("intrinsic",          "Intrinsic (curiosity)", "Intrinsic",    True),
 
     # ── Exploration ─────────────────────────────────────────────
+    ChannelInfo("visual_change",      "Visual Change",       "Exploration",   True),
     ChannelInfo("exploration",        "Exploration",          "Exploration",   True),
     ChannelInfo("action_diversity",   "Action Diversity",     "Exploration",   True),
     ChannelInfo("movement",           "Movement",             "Exploration",   True),
@@ -64,6 +65,7 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("stagnation_penalty", "Stagnation Penalty",   "Penalties",     False, is_penalty=True),
     ChannelInfo("hotbar_spam_penalty","Hotbar Spam Penalty",  "Penalties",     True,  is_penalty=True),
     ChannelInfo("height_penalty",     "Height Penalty",       "Penalties",     False, is_penalty=True),
+    ChannelInfo("pitch_penalty",      "Pitch Penalty",        "Penalties",     True,  is_penalty=True),
     ChannelInfo("home_proximity",     "Home Proximity",       "Penalties",     False),
 ]
 

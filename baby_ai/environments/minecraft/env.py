@@ -53,6 +53,18 @@ from baby_ai.utils.logging import get_logger
 
 log = get_logger("mc_env")
 
+# Forward-declare; set at runtime via set_reward_weights().
+_reward_weights = None
+
+def set_reward_weights(state) -> None:
+    """Inject the shared RewardWeightsState so the env reads dynamic weights.
+
+    Called once from main.py after creating the env and reward weights state.
+    Must be called before the training loop starts.
+    """
+    global _reward_weights
+    _reward_weights = state
+
 # ── Action categories for reward shaping ────────────────────────
 # Which action indices involve actual interaction with the world
 _INTERACTION_ACTIONS = set()
@@ -727,8 +739,8 @@ class MinecraftEnv(GameEnvironment):
         if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02:
             base_move = visual_change * 0.3
             if action_id in _FORWARD_ACTIONS:
-                # Forward movement gets a 50% bonus
-                base_move *= 1.5
+                # Forward movement gets a 3× bonus
+                base_move *= 3.0
             elif action_id in _PURE_STRAFE_ACTIONS:
                 # Pure strafing (no forward) is penalised to 40%
                 base_move *= 0.4
@@ -1215,40 +1227,60 @@ class MinecraftEnv(GameEnvironment):
             )
 
         # ────────────────────────────────────────────────────────
-        # Combine -- weights emphasise CREATION over exploration
+        # Combine — weights are read from the UI-editable
+        # RewardWeightsState when available; otherwise use defaults.
         # ────────────────────────────────────────────────────────
+        if _reward_weights is not None:
+            w = _reward_weights.snapshot()
+        else:
+            # Hardcoded fallback (matches RewardWeightsState defaults)
+            w = {
+                "survival": 1.0, "visual_change": 0.2,
+                "action_diversity": 0.5, "interaction": 0.8,
+                "exploration": 0.8, "movement": 0.3,
+                "block_break": 4.0, "item_pickup": 6.0,
+                "block_place": 4.0, "crafting": 25.0,
+                "building_streak": 3.0, "creative_sequence": 6.0,
+                "idle_penalty": 2.0, "death_penalty": 10.0,
+                "stagnation_penalty": 3.0, "item_drop_penalty": 3.0,
+                "damage_taken": 1.5, "hotbar_spam_penalty": 2.0,
+                "height_penalty": 2.5, "pitch_penalty": 3.0,
+                "healing": 1.0, "food_reward": 0.8,
+                "xp_reward": 0.1, "home_proximity": 1.5,
+            }
+
         total = (
-            # Baseline survival
-            rewards["survival"]
-            # Old channels (reduced weights on generic activity)
-            + rewards["visual_change"] * 0.2
-            + rewards["action_diversity"] * 0.5
-            + rewards["interaction"] * 0.8
-            + rewards["exploration"] * 0.8
-            + rewards["movement"] * 0.3
-            # Resource gathering (essential precursor to crafting)
-            + rewards["block_break"] * 4.0
-            + rewards["item_pickup"] * 6.0
-            # * Creation channels (highest weights)
-            + rewards["block_place"] * 4.0
-            + rewards["crafting"] * 25.0
-            + rewards["building_streak"] * 3.0
-            + rewards["creative_sequence"] * 6.0
-            # Penalties
-            - rewards["idle_penalty"] * 2.0
-            - rewards["death_penalty"] * 10.0
-            - rewards["stagnation_penalty"] * 3.0
-            - rewards["item_drop_penalty"] * 3.0
-            - rewards["damage_taken"] * 1.5
-            - rewards["hotbar_spam_penalty"] * 2.0
-            - rewards["height_penalty"] * 2.5
-            - rewards["pitch_penalty"] * 3.0
-            # Survival / sustain rewards
-            + rewards["healing"] * 1.0
-            + rewards["food_reward"] * 0.8
-            + rewards["xp_reward"] * 0.1
+            # Baseline
+            rewards["survival"]          * w.get("survival", 1.0)
+            + rewards["visual_change"]   * w.get("visual_change", 0.2)
+            # Exploration
+            + rewards["action_diversity"]* w.get("action_diversity", 0.5)
+            + rewards["interaction"]     * w.get("interaction", 0.8)
+            + rewards["exploration"]     * w.get("exploration", 0.8)
+            + rewards["movement"]        * w.get("movement", 0.3)
+            # Resource gathering
+            + rewards["block_break"]     * w.get("block_break", 4.0)
+            + rewards["item_pickup"]     * w.get("item_pickup", 6.0)
+            # Creation
+            + rewards["block_place"]     * w.get("block_place", 4.0)
+            + rewards["crafting"]        * w.get("crafting", 25.0)
+            + rewards["building_streak"] * w.get("building_streak", 3.0)
+            + rewards["creative_sequence"]* w.get("creative_sequence", 6.0)
+            # Penalties (subtracted)
+            - rewards["idle_penalty"]    * w.get("idle_penalty", 2.0)
+            - rewards["death_penalty"]   * w.get("death_penalty", 10.0)
+            - rewards["stagnation_penalty"]* w.get("stagnation_penalty", 3.0)
+            - rewards["item_drop_penalty"]* w.get("item_drop_penalty", 3.0)
+            - rewards["damage_taken"]    * w.get("damage_taken", 1.5)
+            - rewards["hotbar_spam_penalty"]* w.get("hotbar_spam_penalty", 2.0)
+            - rewards["height_penalty"]  * w.get("height_penalty", 2.5)
+            - rewards["pitch_penalty"]   * w.get("pitch_penalty", 3.0)
+            # Sustain
+            + rewards["healing"]         * w.get("healing", 1.0)
+            + rewards["food_reward"]     * w.get("food_reward", 0.8)
+            + rewards["xp_reward"]       * w.get("xp_reward", 0.1)
             # Home proximity (can be positive or negative)
-            + rewards["home_proximity"] * 1.5
+            + rewards["home_proximity"]  * w.get("home_proximity", 1.5)
         )
         rewards["total"] = total
 

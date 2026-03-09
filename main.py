@@ -281,14 +281,22 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     from baby_ai.ui.control_panel import AIControlPanel
     from baby_ai.ui.reward_toggles import RewardToggleState
     from baby_ai.ui.controls_state import AIControlsState
+    from baby_ai.ui.reward_weights import RewardWeightsState
+    from baby_ai.ui.settings_store import SettingsStore
     from baby_ai.environments.minecraft.input_controller import set_controls_state
+    from baby_ai.environments.minecraft.env import set_reward_weights
 
+    settings_store = SettingsStore()
     toggle_state = RewardToggleState()
     controls_state = AIControlsState()
+    reward_weights = RewardWeightsState()
 
     # Wire AI Controls state into the input controller so it can
     # filter disabled keys/buttons/look before sending them.
     set_controls_state(controls_state)
+
+    # Wire reward weights into the env so it reads dynamic weights.
+    set_reward_weights(reward_weights)
 
     # Set-home callback: grabs current coords and updates env.
     def _on_set_home() -> None:
@@ -297,8 +305,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     control_panel = AIControlPanel(
         toggle_state=toggle_state,
         controls_state=controls_state,
+        reward_weights=reward_weights,
         on_set_home=_on_set_home,
         input_guard=env._guard,
+        settings_store=settings_store,
     )
     control_panel.start()
 
