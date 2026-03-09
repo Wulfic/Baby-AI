@@ -44,14 +44,14 @@ class ScreenCapture:
     Args:
         window: WindowManager pointing at the Minecraft window.
         resolution: (H, W) to resize captured frames to.  Defaults
-                    to the model's expected input size (160×160).
+                    to the model's expected input size (640×360).
         normalize: Scale pixel values to [0, 1] when returning tensors.
     """
 
     def __init__(
         self,
         window: WindowManager,
-        resolution: Tuple[int, int] = (160, 160),
+        resolution: Tuple[int, int] = (360, 640),
         normalize: bool = True,
     ):
         self._window = window
@@ -122,7 +122,7 @@ class ScreenCapture:
         animations, etc.
 
         ``model_tensor`` is resized to ``self._resolution`` (typically
-        160 x 160) for the neural-network forward pass.
+        640 x 360) for the neural-network forward pass.
         """
         sct = _get_mss()
 

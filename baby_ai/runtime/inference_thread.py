@@ -84,7 +84,7 @@ class InferenceThread:
     @torch.no_grad()
     def _warmup(self) -> None:
         """Run a dummy forward pass to warm up CUDA kernels."""
-        dummy = torch.randn(1, 3, 160, 160, device=self.device)
+        dummy = torch.randn(1, 3, 360, 640, device=self.device)
         try:
             self.student.act(vision=dummy)
         except Exception:

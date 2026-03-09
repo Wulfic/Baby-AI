@@ -337,6 +337,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     prev_obs: dict | None = None
     episode_reward = 0.0
     episode_steps = 0
+    last_distill_count = 0  # track distillation rounds for reward reset
 
     # Accumulators for reward channels between log intervals.
     # Without these, events that happen between logged steps are invisible.
@@ -453,6 +454,17 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             control_panel.update_live_stats(
                 reward=episode_reward, step=episode_steps,
             )
+
+            # ── Reset reward counter after distillation ─────────
+            cur_distill = orchestrator.distill_thread._distill_count
+            if cur_distill > last_distill_count:
+                log.info(
+                    "Distillation round %d complete — resetting "
+                    "episode_reward (was %.2f) to 0.",
+                    cur_distill, episode_reward,
+                )
+                episode_reward = 0.0
+                last_distill_count = cur_distill
 
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:

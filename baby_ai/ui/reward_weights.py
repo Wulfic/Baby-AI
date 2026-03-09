@@ -22,18 +22,26 @@ from typing import Dict, List
 
 @dataclass(frozen=True)
 class WeightInfo:
-    """Description of a single reward weight slider."""
-    key: str            # matches the key in reward_breakdown dict
+    """Description of a single reward weight slider.
+
+    When ``parent`` is set the entry is a *sub-weight* — an internal
+    multiplier that lives underneath a top-level channel weight.
+    Sub-weights are displayed indented in the UI and can be
+    expanded / collapsed.
+    """
+    key: str            # unique key; sub-weights use "parent.child" style
     label: str          # human-readable label for the UI
     group: str          # group header in the weights tab
     default: float      # default weight multiplier
     min_val: float      # slider minimum
     max_val: float      # slider maximum
     step: float         # slider step size
-    is_penalty: bool = False  # True = subtracted from total
+    is_penalty: bool = False   # True = subtracted from total
+    parent: str | None = None  # key of parent weight (None = top-level)
 
 
 # Ordered list — UI renders in this order.
+# Sub-weights MUST appear immediately after their parent.
 REWARD_WEIGHTS: List[WeightInfo] = [
     # ── Baseline ────────────────────────────────────────────────
     WeightInfo("survival",          "Survival",           "Baseline",     1.0,    0.0,  5.0,   0.1),
@@ -41,9 +49,22 @@ REWARD_WEIGHTS: List[WeightInfo] = [
 
     # ── Exploration ─────────────────────────────────────────────
     WeightInfo("action_diversity",  "Action Diversity",   "Exploration",  0.5,    0.0, 10.0,   0.1),
+
     WeightInfo("interaction",       "Interaction",        "Exploration",  0.8,    0.0, 10.0,   0.1),
+    # Sub-weights: internal multipliers within the interaction channel
+    WeightInfo("int_impact",        "Impact Bonus",       "Exploration",  0.5,    0.0,  3.0,   0.05, parent="interaction"),
+    WeightInfo("int_sustained",     "Sustained Mining",   "Exploration",  0.2,    0.0,  2.0,   0.05, parent="interaction"),
+
     WeightInfo("exploration",       "Exploration",        "Exploration",  0.8,    0.0, 10.0,   0.1),
+
     WeightInfo("movement",          "Movement",           "Exploration",  0.3,    0.0, 10.0,   0.1),
+    # Sub-weights: internal multipliers within the movement channel
+    WeightInfo("mv_forward",        "Forward (W)",        "Exploration",  3.0,    0.0, 10.0,   0.1, parent="movement"),
+    WeightInfo("mv_backward",       "Backward (S)",       "Exploration",  1.0,    0.0, 10.0,   0.1, parent="movement"),
+    WeightInfo("mv_strafe",         "Strafe (A/D)",       "Exploration",  0.4,    0.0,  5.0,   0.1, parent="movement"),
+    WeightInfo("mv_look",           "Camera Look",        "Exploration",  0.02,   0.0,  0.5,   0.01, parent="movement"),
+    WeightInfo("mv_jump",           "Jump (Space)",       "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
+    WeightInfo("mv_sprint",         "Sprint (Ctrl)",      "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
 
     # ── Resource Gathering ──────────────────────────────────────
     WeightInfo("block_break",       "Block Break",        "Resources",    4.0,    0.0, 30.0,   0.5),
@@ -62,7 +83,13 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("damage_taken",       "Damage Taken",       "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("hotbar_spam_penalty","Hotbar Spam Penalty","Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
+
     WeightInfo("height_penalty",     "Height Penalty",     "Penalties",    2.5,   0.0, 10.0,  0.1, is_penalty=True),
+    # Sub-weights: components of the height penalty
+    WeightInfo("height_underground", "Underground",        "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
+    WeightInfo("height_fall",        "Fall Damage",        "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
+    WeightInfo("height_darkness",    "Darkness",           "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
+
     WeightInfo("pitch_penalty",      "Pitch Penalty",      "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
 
     # ── Survival / Sustain ──────────────────────────────────────
@@ -72,10 +99,22 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("home_proximity",    "Home Proximity",     "Sustain",      1.5,  -5.0, 10.0,  0.1),
 ]
 
+# Lookup: which keys have children?
+PARENT_KEYS: set[str] = {w.parent for w in REWARD_WEIGHTS if w.parent} - {None}
+
 WEIGHT_MAP: Dict[str, WeightInfo] = {w.key: w for w in REWARD_WEIGHTS}
 
 # Unique group names, preserving order of first appearance.
 WEIGHT_GROUPS: List[str] = list(dict.fromkeys(w.group for w in REWARD_WEIGHTS))
+
+# Children mapping: parent_key → [child WeightInfo, ...]
+WEIGHT_CHILDREN: Dict[str, List[WeightInfo]] = {}
+for _w in REWARD_WEIGHTS:
+    if _w.parent:
+        WEIGHT_CHILDREN.setdefault(_w.parent, []).append(_w)
+
+# Top-level weights only (excludes sub-weights for grouping purposes).
+TOP_LEVEL_WEIGHTS: List[WeightInfo] = [w for w in REWARD_WEIGHTS if w.parent is None]
 
 
 class RewardWeightsState:

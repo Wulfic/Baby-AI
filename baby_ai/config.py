@@ -115,7 +115,7 @@ class TeacherConfig:
 @dataclass
 class VideoConfig:
     fps: int = 4                     # sample rate from raw video
-    resolution: Tuple[int, int] = (160, 160)  # H, W
+    resolution: Tuple[int, int] = (360, 640)  # H, W
     grayscale: bool = False
     clip_length_sec: float = 1.0     # seconds per clip
     channels: int = 3
@@ -210,7 +210,7 @@ class MinecraftConfig:
     # ── Window / capture ───────────────────────────────────────
     window_title: str = "Minecraft"         # substring matched against window titles
     input_mode: str = "active"              # "background" (safe, no cursor) or "active" (camera look, moves cursor)
-    capture_resolution: Tuple[int, int] = (160, 160)  # (H, W) for screen captures
+    capture_resolution: Tuple[int, int] = (360, 640)  # (H, W) for screen captures
     step_delay_ms: float = 100.0            # minimum ms between consecutive actions
     look_pixels_small: int = 40             # small camera rotation (pixels per step)
     look_pixels_large: int = 160            # large camera rotation

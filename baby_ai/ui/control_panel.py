@@ -36,7 +36,10 @@ from baby_ai.ui.controls_state import (
 )
 from baby_ai.ui.reward_weights import (
     REWARD_WEIGHTS,
+    WEIGHT_CHILDREN,
     WEIGHT_GROUPS,
+    PARENT_KEYS,
+    TOP_LEVEL_WEIGHTS,
     RewardWeightsState,
 )
 from baby_ai.ui.settings_store import SettingsStore
@@ -150,6 +153,11 @@ class AIControlPanel:
         self._ctrl_check_vars: dict[str, tk.BooleanVar] = {}
         self._weight_vars: dict[str, tk.DoubleVar] = {}
         self._weight_labels: dict[str, tk.Label] = {}
+        # Track expand/collapse state for parent weights with sub-weights.
+        # key = parent weight key, value = bool (True = expanded).
+        self._expand_states: dict[str, bool] = {}
+        # Frames that hold the sub-weight rows — shown/hidden on toggle.
+        self._sub_frames: dict[str, tk.Frame] = {}
         self._reward_label: Optional[tk.Label] = None
         self._step_label: Optional[tk.Label] = None
 
@@ -520,7 +528,10 @@ class AIControlPanel:
         # Update the value label next to the slider.
         lbl = self._weight_labels.get(key)
         if lbl is not None:
-            lbl.config(text=f"{fval:.1f}")
+            from baby_ai.ui.reward_weights import WEIGHT_MAP
+            winfo = WEIGHT_MAP.get(key)
+            fmt = "{:.2f}" if (winfo and winfo.step < 0.05) else "{:.1f}"
+            lbl.config(text=fmt.format(fval))
         self._persist_reward_weights()
 
     def _on_set_home(self) -> None:
@@ -539,11 +550,15 @@ class AIControlPanel:
         """Reset all reward weights to their default values."""
         self.reward_weights.reset_defaults()
         snap = self.reward_weights.snapshot()
+        from baby_ai.ui.reward_weights import WEIGHT_MAP
         for key, var in self._weight_vars.items():
-            var.set(snap.get(key, 0.0))
+            val = snap.get(key, 0.0)
+            var.set(val)
             lbl = self._weight_labels.get(key)
             if lbl is not None:
-                lbl.config(text=f"{snap.get(key, 0.0):.1f}")
+                winfo = WEIGHT_MAP.get(key)
+                fmt = "{:.2f}" if (winfo and winfo.step < 0.05) else "{:.1f}"
+                lbl.config(text=fmt.format(val))
         self._persist_reward_weights()
 
     def toggle_pause(self) -> None:
@@ -606,6 +621,8 @@ class AIControlPanel:
             self._ctrl_check_vars.clear()
             self._weight_vars.clear()
             self._weight_labels.clear()
+            self._sub_frames.clear()
+            self._expand_states.clear()
             self._reward_label = None
             self._step_label = None
             if self.root is not None:
@@ -655,7 +672,12 @@ class AIControlPanel:
     # ────────────────────────────────────────────────────────────
 
     def _build_weights_tab(self, parent: tk.Frame) -> None:
-        """Build the reward weight sliders inside *parent*."""
+        """Build the reward weight sliders inside *parent*.
+
+        Top-level weights are shown normally.  Weights that have
+        sub-weights (children) get a clickable ``▸``/``▾`` toggle:
+        clicking it reveals/hides the indented child sliders.
+        """
         s = self._scale
 
         # ── Header with Reset Defaults button ──────────────────
@@ -707,7 +729,7 @@ class AIControlPanel:
 
         from collections import OrderedDict
         grouped: OrderedDict[str, list] = OrderedDict()
-        for w in REWARD_WEIGHTS:
+        for w in TOP_LEVEL_WEIGHTS:
             grouped.setdefault(w.group, []).append(w)
 
         for group_name, weights in grouped.items():
@@ -725,60 +747,138 @@ class AIControlPanel:
             ).pack(fill=tk.X)
 
             for w in weights:
-                row = tk.Frame(grp_frame, bg=_BG_GROUP)
-                row.pack(fill=tk.X, padx=(int(4 * s), 0), pady=(int(1 * s), 0))
+                has_children = w.key in WEIGHT_CHILDREN
+                self._build_weight_row(grp_frame, w, snapshot, indent=0, has_children=has_children)
 
-                # Use grid so the label gets a fixed width and the
-                # slider expands to fill all remaining space.
-                row.columnconfigure(1, weight=1)  # slider column stretches
+                # If this parent has sub-weights, build them inside
+                # a collapsible frame (starts collapsed).
+                if has_children:
+                    sub_frame = tk.Frame(grp_frame, bg=_BG_GROUP)
+                    # Initially hidden — don't pack yet.
+                    self._sub_frames[w.key] = sub_frame
+                    self._expand_states[w.key] = False
 
-                # Label (penalty indicator) — fixed width column
-                prefix = "\u2212 " if w.is_penalty else "+ "
+                    for child in WEIGHT_CHILDREN[w.key]:
+                        self._build_weight_row(sub_frame, child, snapshot, indent=1, has_children=False)
+
+    # ── Shared helper: build one slider row ─────────────────────
+
+    def _build_weight_row(
+        self,
+        parent_frame: tk.Frame,
+        w,  # WeightInfo
+        snapshot: dict,
+        *,
+        indent: int = 0,
+        has_children: bool = False,
+    ) -> None:
+        """Create a single label + slider + value row.
+
+        ``indent`` > 0 indents the row (sub-weight).
+        ``has_children`` adds a ``▸``/``▾`` expand toggle button.
+        """
+        s = self._scale
+        left_pad = int((4 + indent * 16) * s)
+
+        row = tk.Frame(parent_frame, bg=_BG_GROUP)
+        row.pack(fill=tk.X, padx=(left_pad, 0), pady=(int(1 * s), 0))
+        row.columnconfigure(2, weight=1)  # slider column stretches
+
+        # Optional expand/collapse toggle (only on parents)
+        if has_children:
+            arrow_lbl = tk.Label(
+                row, text="\u25b8",  # ▸ (collapsed)
+                font=("Segoe UI", int(9 * s)),
+                bg=_BG_GROUP, fg=_ACCENT, anchor="w",
+                cursor="hand2",
+            )
+            arrow_lbl.grid(row=0, column=0, sticky="w", padx=(0, int(2 * s)))
+            arrow_lbl.bind(
+                "<Button-1>",
+                lambda e, k=w.key, lbl=arrow_lbl: self._toggle_expand(k, lbl),
+            )
+        else:
+            # Spacer so child rows align with parent slider
+            spacer_w = int(12 * s) if indent > 0 else 0
+            if spacer_w > 0:
                 tk.Label(
-                    row, text=prefix + w.label,
-                    font=("Segoe UI", int(8 * s)),
-                    bg=_BG_GROUP, fg=_FG, anchor="w",
-                ).grid(row=0, column=0, sticky="w",
-                       padx=(0, int(4 * s)),
-                       ipadx=int(2 * s))
+                    row, text="\u2022",  # bullet
+                    font=("Segoe UI", int(7 * s)),
+                    bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
+                    width=1,
+                ).grid(row=0, column=0, sticky="w", padx=(0, int(2 * s)))
 
-                # Current value label — right-aligned, fixed width
-                cur_val = snapshot.get(w.key, w.default)
-                val_label = tk.Label(
-                    row, text=f"{cur_val:.1f}",
-                    font=("Consolas", int(9 * s)),
-                    bg=_BG_GROUP, fg=_ACCENT, anchor="e",
-                    width=5,
-                )
-                val_label.grid(row=0, column=2, sticky="e",
-                               padx=(int(4 * s), 0))
-                self._weight_labels[w.key] = val_label
+        # Label
+        prefix = "\u2212 " if w.is_penalty else "+ "
+        lbl_text = prefix + w.label
+        tk.Label(
+            row, text=lbl_text,
+            font=("Segoe UI", int(8 * s)),
+            bg=_BG_GROUP, fg=_FG, anchor="w",
+        ).grid(row=0, column=1, sticky="w",
+               padx=(0, int(4 * s)),
+               ipadx=int(2 * s))
 
-                # Scale (slider) — fills remaining width
-                var = tk.DoubleVar(value=cur_val)
-                self._weight_vars[w.key] = var
+        # Current value label — right-aligned
+        cur_val = snapshot.get(w.key, w.default)
+        # Use more decimal places for very small step sizes
+        fmt = "{:.2f}" if w.step < 0.05 else "{:.1f}"
+        val_label = tk.Label(
+            row, text=fmt.format(cur_val),
+            font=("Consolas", int(9 * s)),
+            bg=_BG_GROUP, fg=_ACCENT, anchor="e",
+            width=5,
+        )
+        val_label.grid(row=0, column=3, sticky="e",
+                       padx=(int(4 * s), 0))
+        self._weight_labels[w.key] = val_label
 
-                slider = tk.Scale(
-                    row,
-                    from_=w.min_val,
-                    to=w.max_val,
-                    resolution=w.step,
-                    orient=tk.HORIZONTAL,
-                    variable=var,
-                    showvalue=False,
-                    command=lambda val, k=w.key: self._on_weight_change(k, val),
-                    bg=_ACCENT,               # thumb color
-                    fg=_FG,
-                    troughcolor=_ACCENT_DARK,  # visible groove
-                    activebackground="#b4d0fb", # thumb hover
-                    highlightthickness=0,
-                    bd=0,
-                    width=int(12 * s),         # thumb height
-                    sliderlength=int(16 * s),  # thumb width
-                    sliderrelief="raised",
-                )
-                slider.grid(row=0, column=1, sticky="ew",
-                            padx=(int(2 * s), int(2 * s)))
+        # Scale (slider)
+        var = tk.DoubleVar(value=cur_val)
+        self._weight_vars[w.key] = var
+
+        slider = tk.Scale(
+            row,
+            from_=w.min_val,
+            to=w.max_val,
+            resolution=w.step,
+            orient=tk.HORIZONTAL,
+            variable=var,
+            showvalue=False,
+            command=lambda val, k=w.key: self._on_weight_change(k, val),
+            bg=_ACCENT,               # thumb color
+            fg=_FG,
+            troughcolor=_ACCENT_DARK,  # visible groove
+            activebackground="#b4d0fb", # thumb hover
+            highlightthickness=0,
+            bd=0,
+            width=int(12 * s),         # thumb height
+            sliderlength=int(16 * s),  # thumb width
+            sliderrelief="raised",
+        )
+        slider.grid(row=0, column=2, sticky="ew",
+                    padx=(int(2 * s), int(2 * s)))
+
+    def _toggle_expand(self, parent_key: str, arrow_label: tk.Label) -> None:
+        """Expand or collapse the sub-weight rows for *parent_key*."""
+        expanded = self._expand_states.get(parent_key, False)
+        sub_frame = self._sub_frames.get(parent_key)
+        if sub_frame is None:
+            return
+
+        if expanded:
+            # Collapse
+            sub_frame.pack_forget()
+            arrow_label.config(text="\u25b8")  # ▸
+            self._expand_states[parent_key] = False
+        else:
+            # Expand — pack right after the parent row.
+            # We need it to appear in the right place inside its
+            # group frame.  Since pack ordering is insertion order,
+            # we pack after the parent row's position.
+            sub_frame.pack(fill=tk.X, padx=(int(4 * self._scale), 0), pady=0)
+            arrow_label.config(text="\u25be")  # ▾
+            self._expand_states[parent_key] = True
 
     # ────────────────────────────────────────────────────────────
     # Helpers

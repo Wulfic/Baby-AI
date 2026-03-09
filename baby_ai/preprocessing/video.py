@@ -21,7 +21,7 @@ class VideoPreprocessor:
 
     Pipeline:
     1. Sample at target FPS (3-6 fps)
-    2. Resize to target resolution (160x160)
+    2. Resize to target resolution (640x360)
     3. Normalize to [0, 1]
     4. Optionally convert to grayscale
     5. Stack into (T, C, H, W) tensor clips
@@ -37,7 +37,7 @@ class VideoPreprocessor:
     def __init__(
         self,
         target_fps: int = 4,
-        resolution: tuple[int, int] = (160, 160),
+        resolution: tuple[int, int] = (360, 640),
         grayscale: bool = False,
         clip_length_sec: float = 1.0,
         normalize: bool = True,

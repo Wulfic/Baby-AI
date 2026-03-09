@@ -124,23 +124,43 @@ class RewardComposer:
         frac = min(1.0, self._step / max(1, self.intrinsic_decay_steps))
         return self.intrinsic_start + frac * (self.intrinsic_end - self.intrinsic_start)
 
+    # Sparse event channels that should NEVER produce a negative
+    # normalized value.  These channels are 0 most of the time and only
+    # occasionally spike positive (block break, item pick-up, crafting…).
+    # Z-scoring them creates a systematic negative bias on the 95%+ of
+    # steps where nothing happens (because mean > 0 after any events,
+    # so z(0) < 0).  Clamping their floor to 0 ensures "nothing happened"
+    # is neutral, not punishing.
+    _SPARSE_POSITIVE_CHANNELS: frozenset[str] = frozenset({
+        "communication", "exploration", "interaction", "action_diversity",
+        "movement", "block_break", "item_pickup", "block_place",
+        "crafting", "building_streak", "creative_sequence",
+    })
+
     def _normalize_channel(self, channel: str, value: float) -> float:
         """Normalize a reward channel by running mean/std.
 
         Values are z-scored against a rolling window, then **clamped**
-        to [-3, 3] to prevent catastrophic reward spikes from sparse
-        channels (e.g. block_break fires once per hundred steps).
+        to prevent catastrophic reward spikes from sparse channels.
+
+        For *sparse positive* channels (block_break, crafting, etc.) the
+        lower clamp is 0 so that the common-case value of 0 never
+        contributes a negative reward.  Continuous channels (intrinsic,
+        extrinsic) keep the symmetric [-3, 3] clamp.
 
         Key safeguards:
         - Minimum std floor of 0.1 prevents divide-by-near-zero on
           sparse binary channels (block_break, crafting, etc.)
         - Warmup period returns scaled raw values until we have
           enough data for meaningful statistics.
-        - Tighter [-3, 3] clamp keeps per-channel contributions
-          bounded even after multiplication by channel weights.
+        - Tighter clamp keeps per-channel contributions bounded even
+          after multiplication by channel weights.
         """
         if not self.normalize:
             return value
+
+        # Determine clamp bounds: sparse channels floor at 0.
+        lo = 0.0 if channel in self._SPARSE_POSITIVE_CHANNELS else -3.0
 
         if channel not in self._stats:
             self._stats[channel] = {"values": deque(maxlen=self._window)}
@@ -150,7 +170,7 @@ class RewardComposer:
         # Warmup: not enough data for reliable statistics.
         # Return value scaled down to prevent spikes from raw magnitudes.
         if len(self._stats[channel]["values"]) < 30:
-            return float(np.clip(value, -3.0, 3.0))
+            return float(np.clip(value, lo, 3.0))
 
         arr = np.array(self._stats[channel]["values"])
         mean = arr.mean()
@@ -162,7 +182,7 @@ class RewardComposer:
         z = (value - mean) / std
         # Tight clamp: even with weights up to 2.5, max single-channel
         # contribution is 2.5 * 3.0 = 7.5 (vs old 10.0 * 5.0 = 50.0)
-        return float(np.clip(z, -3.0, 3.0))
+        return float(np.clip(z, lo, 3.0))
 
     def compose(
         self,

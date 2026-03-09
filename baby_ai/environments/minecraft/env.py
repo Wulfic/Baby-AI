@@ -100,18 +100,29 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
 # ── Movement quality categories ─────────────────────────────────
 # Actions that involve forward movement (W key) — preferred locomotion
 _FORWARD_ACTIONS = set()
+# Actions that involve backward movement (S key without W)
+_BACKWARD_ACTIONS = set()
 # Actions that involve camera look — preferred for situational awareness
 _LOOK_ACTIONS = set()
 # Pure strafe actions (A/D without W) — less desirable wandering
 _PURE_STRAFE_ACTIONS = set()
+# Jump actions (SPACE key)
+_JUMP_ACTIONS = set()
+# Sprint actions (LCTRL key)
+_SPRINT_ACTIONS = set()
 # Hotbar selection actions — spamming these produces no useful behaviour
 _HOTBAR_ACTIONS = set()
 _w_vk = _VK.get("W")
+_s_vk = _VK.get("S")
 _a_vk = _VK.get("A")
 _d_vk = _VK.get("D")
+_space_vk = _VK.get("SPACE")
+_lctrl_vk = _VK.get("LCTRL")
 for _i, _a in enumerate(MINECRAFT_ACTIONS):
     if _w_vk and _w_vk in _a.keys:
         _FORWARD_ACTIONS.add(_i)
+    if _s_vk and _s_vk in _a.keys and not (_w_vk and _w_vk in _a.keys):
+        _BACKWARD_ACTIONS.add(_i)
     if _a.look is not None:
         _LOOK_ACTIONS.add(_i)
     # Pure strafe = has A or D but NOT W
@@ -119,6 +130,10 @@ for _i, _a in enumerate(MINECRAFT_ACTIONS):
     has_forward = _w_vk and _w_vk in _a.keys
     if has_strafe and not has_forward:
         _PURE_STRAFE_ACTIONS.add(_i)
+    if _space_vk and _space_vk in _a.keys:
+        _JUMP_ACTIONS.add(_i)
+    if _lctrl_vk and _lctrl_vk in _a.keys:
+        _SPRINT_ACTIONS.add(_i)
 
 # Hotbar actions: indices that ONLY press a number key (no movement/mouse)
 for _i, _a in enumerate(MINECRAFT_ACTIONS):
@@ -152,7 +167,7 @@ class MinecraftEnv(GameEnvironment):
         self,
         window_title: str = "Minecraft",
         input_mode: str = "background",
-        resolution: Tuple[int, int] = (160, 160),
+        resolution: Tuple[int, int] = (360, 640),
         step_delay_ms: float = 100.0,
         sensor_channels: int = 16,
         # ── Auto-launcher options ───────────────────────────────
@@ -697,16 +712,23 @@ class MinecraftEnv(GameEnvironment):
         #    Only rewards MEANINGFUL interaction: requires significant
         #    visual change to prove the button press did something
         #    real in the world (not just clicking in empty air).
+        #    Sub-weights: int_impact (base impact reward),
+        #                 int_sustained (sustained mining reward).
         # ────────────────────────────────────────────────────────
+        # Read sub-weights (gracefully falls back to defaults).
+        _sw = _reward_weights.snapshot() if _reward_weights is not None else {}
+        _int_impact = _sw.get("int_impact", 0.5)
+        _int_sustained = _sw.get("int_sustained", 0.2)
+
         interaction_bonus = 0.0
         if action_id in _BLOCK_INTERACTION_ACTIONS:
             self._interaction_streak += 1
             if visual_change > 0.06:
                 # Large visual change while interacting — real impact
-                interaction_bonus = 0.5 + min(visual_change * 2.0, 0.5)
+                interaction_bonus = _int_impact + min(visual_change * 2.0, 0.5)
             elif self._interaction_streak >= 5 and visual_change > 0.03:
                 # Sustained interaction with moderate change (mining)
-                interaction_bonus = 0.2
+                interaction_bonus = _int_sustained
             # Single clicks with tiny/no visual change = no reward
         else:
             self._interaction_streak = 0
@@ -734,21 +756,41 @@ class MinecraftEnv(GameEnvironment):
         # 6. Movement bonus — reward confirmed movement with a
         #    bias towards forward locomotion and camera rotation
         #    over aimless strafing.
+        #    Sub-weights (internal multipliers, NOT outer channel weight):
+        #      mv_forward  — multiplier on forward (W) base_move
+        #      mv_backward — multiplier on backward (S) base_move
+        #      mv_strafe   — multiplier on strafe (A/D) base_move
+        #      mv_look     — flat bonus for camera rotations
+        #      mv_jump     — extra multiplier when jumping
+        #      mv_sprint   — extra multiplier when sprinting
         # ────────────────────────────────────────────────────────
+        _mv_forward  = _sw.get("mv_forward", 3.0)
+        _mv_backward = _sw.get("mv_backward", 1.0)
+        _mv_strafe   = _sw.get("mv_strafe", 0.4)
+        _mv_look     = _sw.get("mv_look", 0.02)
+        _mv_jump     = _sw.get("mv_jump", 1.5)
+        _mv_sprint   = _sw.get("mv_sprint", 1.5)
+
         movement_bonus = 0.0
         if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02:
             base_move = visual_change * 0.3
             if action_id in _FORWARD_ACTIONS:
-                # Forward movement gets a 3× bonus
-                base_move *= 3.0
+                base_move *= _mv_forward
+            elif action_id in _BACKWARD_ACTIONS:
+                base_move *= _mv_backward
             elif action_id in _PURE_STRAFE_ACTIONS:
-                # Pure strafing (no forward) is penalised to 40%
-                base_move *= 0.4
+                base_move *= _mv_strafe
+            # Jump bonus — stacks on top of directional multiplier
+            if action_id in _JUMP_ACTIONS:
+                base_move *= _mv_jump
+            # Sprint bonus — stacks on top of directional multiplier
+            if action_id in _SPRINT_ACTIONS:
+                base_move *= _mv_sprint
             movement_bonus = base_move
         # Camera look (even while standing still) gets a small bonus
         # to encourage situational awareness / scanning the environment.
         if action_id in _LOOK_ACTIONS and action_id not in _PURE_STRAFE_ACTIONS:
-            movement_bonus += 0.02
+            movement_bonus += _mv_look
         rewards["movement"] = movement_bonus
 
         # ────────────────────────────────────────────────────────
@@ -1014,7 +1056,13 @@ class MinecraftEnv(GameEnvironment):
         #    - Falling (rapid Y decrease between updates)
         #    - Darkness (low sky light = cave/underground)
         #    Combined into a single "height_penalty" channel.
+        #    Sub-weights scale individual components:
+        #      height_underground, height_fall, height_darkness.
         # ────────────────────────────────────────────────────────
+        _h_underground = _sw.get("height_underground", 1.0)
+        _h_fall        = _sw.get("height_fall", 1.0)
+        _h_darkness    = _sw.get("height_darkness", 1.0)
+
         height_penalty = 0.0
         if self._player_y is not None:
             # Underground penalty — escalates the longer the AI
@@ -1024,12 +1072,13 @@ class MinecraftEnv(GameEnvironment):
                 # Depth-proportional: deeper = bigger penalty
                 depth = max(0.0, self._surface_y - self._player_y)
                 # Base 0.03 per step underground, scaled by depth
-                height_penalty += min(0.03 + 0.005 * depth, 0.3)
+                underground_base = min(0.03 + 0.005 * depth, 0.3)
                 # Extra escalation for prolonged underground time
                 # (kicks in after ~50 steps = ~5 seconds)
                 if self._underground_steps > 50:
                     overshoot = (self._underground_steps - 50) / 100.0
-                    height_penalty += min(0.1 * overshoot, 0.4)
+                    underground_base += min(0.1 * overshoot, 0.4)
+                height_penalty += underground_base * _h_underground
             else:
                 self._underground_steps = max(0, self._underground_steps - 5)
 
@@ -1039,14 +1088,14 @@ class MinecraftEnv(GameEnvironment):
                 y_drop = self._prev_player_y - self._player_y
                 if y_drop > 3.0:
                     # Proportional to fall distance
-                    height_penalty += min(0.15 * y_drop, 1.0)
+                    height_penalty += min(0.15 * y_drop, 1.0) * _h_fall
                     log.debug("Fall detected: %.1f blocks (Y %.1f → %.1f)",
                               y_drop, self._prev_player_y, self._player_y)
 
             # Darkness penalty — low sky light means the AI is in
             # a covered/underground area (cave, ravine, dense canopy).
             if self._sky_light <= 4:
-                height_penalty += 0.05
+                height_penalty += 0.05 * _h_darkness
 
         rewards["height_penalty"] = height_penalty
 
@@ -1247,6 +1296,13 @@ class MinecraftEnv(GameEnvironment):
                 "height_penalty": 2.5, "pitch_penalty": 3.0,
                 "healing": 1.0, "food_reward": 0.8,
                 "xp_reward": 0.1, "home_proximity": 1.5,
+                # Sub-weights (internal multipliers)
+                "mv_forward": 3.0, "mv_backward": 1.0,
+                "mv_strafe": 0.4, "mv_look": 0.02,
+                "mv_jump": 1.5, "mv_sprint": 1.5,
+                "int_impact": 0.5, "int_sustained": 0.2,
+                "height_underground": 1.0, "height_fall": 1.0,
+                "height_darkness": 1.0,
             }
 
         total = (
