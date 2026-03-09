@@ -278,6 +278,18 @@ class MinecraftEnv(GameEnvironment):
         _SURFACE_Y = 58  # below this = underground penalty
         self._surface_y = _SURFACE_Y
 
+        # ── Camera pitch / yaw tracking (from mod position_update) ──
+        # Minecraft pitch: -90 = straight up (sky), 0 = horizontal,
+        #                  +90 = straight down (feet).
+        # We clamp look deltas so the AI cannot reach extreme angles
+        # and get stuck staring at the sky (or feet).
+        self._player_pitch: Optional[float] = None   # degrees
+        self._player_yaw: Optional[float] = None     # degrees
+        self._PITCH_LIMIT_UP: float = -55.0          # max upward pitch (degrees)
+        self._PITCH_LIMIT_DOWN: float = 70.0         # max downward pitch (degrees)
+        # Track how long the camera has been at extreme pitch
+        self._extreme_pitch_steps: int = 0
+
         # ── Hotbar spam tracking ────────────────────────────────
         self._hotbar_streak: int = 0  # consecutive hotbar-only actions
 
@@ -345,6 +357,9 @@ class MinecraftEnv(GameEnvironment):
         self._sky_light = 15
         self._underground_steps = 0
         self._hotbar_streak = 0
+        self._player_pitch = None
+        self._player_yaw = None
+        self._extreme_pitch_steps = 0
 
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:
@@ -413,7 +428,33 @@ class MinecraftEnv(GameEnvironment):
                 self._input.set_buttons(action.buttons)
 
                 if action.look is not None:
-                    self._input.mouse_look(action.look[0], action.look[1])
+                    dx, dy = action.look
+                    # ── Pitch clamping ──────────────────────────
+                    # Suppress vertical look deltas when the camera
+                    # is near the pitch limits to prevent the AI
+                    # from getting stuck staring at the sky/feet.
+                    # dy < 0 = looking UP (pitch decreasing toward -90)
+                    # dy > 0 = looking DOWN (pitch increasing toward +90)
+                    if self._player_pitch is not None:
+                        if dy < 0 and self._player_pitch <= self._PITCH_LIMIT_UP:
+                            # Already at/beyond upward limit — block
+                            dy = 0
+                        elif dy < 0 and self._player_pitch < self._PITCH_LIMIT_UP + 15:
+                            # Approaching upward limit — scale down
+                            room = self._player_pitch - self._PITCH_LIMIT_UP
+                            scale = max(0.0, room / 15.0)
+                            dy = int(dy * scale)
+                        elif dy > 0 and self._player_pitch >= self._PITCH_LIMIT_DOWN:
+                            # Already at/beyond downward limit — block
+                            dy = 0
+                        elif dy > 0 and self._player_pitch > self._PITCH_LIMIT_DOWN - 15:
+                            # Approaching downward limit — scale down
+                            room = self._PITCH_LIMIT_DOWN - self._player_pitch
+                            scale = max(0.0, room / 15.0)
+                            dy = int(dy * scale)
+
+                    if dx != 0 or dy != 0:
+                        self._input.mouse_look(dx, dy)
 
             # ── Pacing ──────────────────────────────────────────
             elapsed = time.perf_counter() - self._last_step_time
@@ -770,6 +811,8 @@ class MinecraftEnv(GameEnvironment):
             self._player_z = latest_pos.get("z", self._player_z)
             self._player_on_ground = latest_pos.get("on_ground", True)
             self._sky_light = latest_pos.get("light", 15)
+            self._player_pitch = latest_pos.get("pitch", self._player_pitch)
+            self._player_yaw = latest_pos.get("yaw", self._player_yaw)
 
             # First position_update ever → set as home location
             if self._home_x is None and self._player_x is not None:
@@ -996,6 +1039,35 @@ class MinecraftEnv(GameEnvironment):
         rewards["height_penalty"] = height_penalty
 
         # ────────────────────────────────────────────────────────
+        # 11e-2. Extreme pitch (sky-staring / feet-staring) penalty
+        #    When the camera pitch is far from horizontal the AI
+        #    sees mostly sky or ground — no useful visual data.
+        #    Escalating penalty discourages lingering at extremes.
+        #
+        #    Pitch convention: -90 = sky, 0 = horizontal, +90 = feet
+        #    "soft zone" starts at ±40° with a gentle nudge;
+        #    "hard zone" beyond ±60° is aggressively penalised.
+        # ────────────────────────────────────────────────────────
+        pitch_penalty = 0.0
+        if self._player_pitch is not None:
+            abs_pitch = abs(self._player_pitch)
+
+            if abs_pitch > 60:
+                # Hard zone — strong penalty, escalates with duration
+                self._extreme_pitch_steps += 1
+                pitch_penalty = 0.15 + 0.02 * min(self._extreme_pitch_steps, 30)
+            elif abs_pitch > 40:
+                # Soft zone — gentle nudge back toward horizontal
+                self._extreme_pitch_steps += 1
+                overshoot = (abs_pitch - 40) / 20.0  # 0.0 at 40°, 1.0 at 60°
+                pitch_penalty = 0.03 * overshoot
+            else:
+                # Healthy range — decay the streak counter
+                self._extreme_pitch_steps = max(0, self._extreme_pitch_steps - 3)
+
+        rewards["pitch_penalty"] = pitch_penalty
+
+        # ────────────────────────────────────────────────────────
         # 11f. Home proximity bonus / distance penalty
         #    Spawn point = home base.  Staying within 100 blocks
         #    gives a small bonus (all productive actions there are
@@ -1126,7 +1198,7 @@ class MinecraftEnv(GameEnvironment):
                 " | craft=%.3f death=%.1f"
                 " | vis_change=%.4f interact=%.3f"
                 " | long_brk=%d atk_streak=%d"
-                " | Y=%.1f sky_light=%d underground=%d"
+                " | Y=%.1f pitch=%.1f sky_light=%d underground=%d"
                 " | home_dist=%.1f",
                 self._step_count, bridge_status, raw_h, raw_w,
                 block_break_reward, item_pickup, block_place_score,
@@ -1134,6 +1206,7 @@ class MinecraftEnv(GameEnvironment):
                 visual_change, interaction_bonus,
                 self._long_break_count, self._attack_streak,
                 self._player_y if self._player_y is not None else -1.0,
+                self._player_pitch if self._player_pitch is not None else 0.0,
                 self._sky_light,
                 self._underground_steps,
                 ((((self._player_x or 0) - (self._home_x or 0)) ** 2
@@ -1169,6 +1242,7 @@ class MinecraftEnv(GameEnvironment):
             - rewards["damage_taken"] * 1.5
             - rewards["hotbar_spam_penalty"] * 2.0
             - rewards["height_penalty"] * 2.5
+            - rewards["pitch_penalty"] * 3.0
             # Survival / sustain rewards
             + rewards["healing"] * 1.0
             + rewards["food_reward"] * 0.8

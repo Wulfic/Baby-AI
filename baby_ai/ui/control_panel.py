@@ -3,10 +3,9 @@ Baby-AI Control Panel — tkinter UI for runtime control.
 
 Provides:
 - Pause / Stop buttons
-- Training-phase preset buttons (Phase 1–4)
+- Set New Home button to update the agent's home location
 - Per-channel reward toggle checkboxes in a multi-column grid
 - AI Controls tab to enable/disable individual keys/buttons/look
-- Set New Home button to update the agent's home location
 - Live reward / step readout
 
 Runs on a daemon thread so it doesn't block the training loop.
@@ -25,7 +24,6 @@ from typing import Callable, Optional
 from baby_ai.ui.reward_toggles import (
     CHANNELS,
     GROUPS,
-    PHASE_PRESETS,
     RewardToggleState,
 )
 from baby_ai.ui.controls_state import (
@@ -67,8 +65,6 @@ _PAUSE_ON    = "#a6e3a1"
 _STOP_BG     = "#f38ba8"
 _BTN_BG      = "#45475a"
 _BTN_FG      = "#cdd6f4"
-_PHASE_SEL   = "#89b4fa"
-_PHASE_UNSEL = "#45475a"
 
 # Number of columns for the reward-channel grid.
 _CHANNEL_COLS = 3
@@ -123,7 +119,6 @@ class AIControlPanel:
         self.root: Optional[tk.Tk] = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
         self._ctrl_check_vars: dict[str, tk.BooleanVar] = {}
-        self._phase_buttons: dict[str, tk.Button] = {}
         self._reward_label: Optional[tk.Label] = None
         self._step_label: Optional[tk.Label] = None
 
@@ -209,31 +204,6 @@ class AIControlPanel:
             relief="flat", bd=0, padx=int(8 * s), pady=int(4 * s),
         )
         self.btn_set_home.pack(side=tk.RIGHT, padx=(int(4 * s), 0))
-
-        # ── Phase presets row ──────────────────────────────────
-        phase_row = tk.Frame(self.root, bg=_BG)
-        phase_row.pack(fill=tk.X, pady=(0, int(6 * s)))
-
-        tk.Label(
-            phase_row, text="PHASE",
-            font=("Segoe UI", int(9 * s), "bold"),
-            bg=_BG, fg=_FG_DIM, anchor="w",
-        ).pack(side=tk.LEFT, padx=(0, int(6 * s)))
-
-        for pid, (plabel, _groups) in PHASE_PRESETS.items():
-            short = plabel.split("\u2014")[0].strip()  # "Phase 1"
-            btn = tk.Button(
-                phase_row, text=short,
-                command=lambda p=pid: self._on_phase(p),
-                bg=_PHASE_UNSEL, fg=_BTN_FG,
-                activebackground=_ACCENT_DARK,
-                font=("Segoe UI", int(9 * s), "bold"),
-                relief="flat", bd=0, padx=int(8 * s), pady=int(3 * s),
-            )
-            btn.pack(side=tk.LEFT, padx=int(2 * s))
-            self._phase_buttons[pid] = btn
-
-        self._highlight_phase(self.toggle_state.active_preset)
 
         self._sep(self.root)
 
@@ -495,7 +465,6 @@ class AIControlPanel:
         var = self._check_vars.get(key)
         if var is not None:
             self.toggle_state.set_enabled(key, var.get())
-        self._highlight_phase("custom")
 
     def _on_ctrl_toggle(self, key: str) -> None:
         """AI-control checkbox was toggled — push to shared state."""
@@ -513,12 +482,6 @@ class AIControlPanel:
         self.controls_state.set_all(enabled)
         for key, var in self._ctrl_check_vars.items():
             var.set(enabled)
-
-    def _on_phase(self, preset_id: str) -> None:
-        """Phase button clicked — apply preset and refresh checkboxes."""
-        self.toggle_state.apply_preset(preset_id)
-        self._sync_checkboxes()
-        self._highlight_phase(preset_id)
 
     def toggle_pause(self) -> None:
         self.is_paused = not self.is_paused
@@ -575,20 +538,6 @@ class AIControlPanel:
     # ────────────────────────────────────────────────────────────
     # Helpers
     # ────────────────────────────────────────────────────────────
-
-    def _sync_checkboxes(self) -> None:
-        """Refresh all checkbox vars from the shared toggle state."""
-        snapshot = self.toggle_state.snapshot()
-        for key, var in self._check_vars.items():
-            var.set(snapshot.get(key, False))
-
-    def _highlight_phase(self, active_id: str) -> None:
-        """Visually highlight the active phase button."""
-        for pid, btn in self._phase_buttons.items():
-            if pid == active_id:
-                btn.config(bg=_PHASE_SEL, fg="#1e1e2e")
-            else:
-                btn.config(bg=_PHASE_UNSEL, fg=_BTN_FG)
 
     def _poll_updates(self) -> None:
         """Periodic UI refresh (live stats + cursor release + auto-close + guard sync)."""
