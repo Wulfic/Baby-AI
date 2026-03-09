@@ -215,7 +215,24 @@ class Orchestrator:
 
         # Atomic rename — prevents corrupted checkpoints if the process
         # crashes mid-write (especially on network storage like Z:\).
-        tmp_path.replace(path)
+        # Retry with backoff because Windows / network drives can
+        # briefly lock the destination file (antivirus, indexer, SMB).
+        # Also catches FileNotFoundError which can occur if the .tmp
+        # file is moved/deleted between torch.save and rename (rare
+        # race on network drives or when two processes collide).
+        for _attempt in range(5):
+            try:
+                tmp_path.replace(path)
+                break
+            except (PermissionError, FileNotFoundError, OSError) as exc:
+                if _attempt == 4:
+                    log.error(
+                        "Could not replace checkpoint after 5 attempts (%s): %s",
+                        type(exc).__name__, path,
+                    )
+                    break
+                import time as _t
+                _t.sleep(0.3 * (2 ** _attempt))  # 0.3, 0.6, 1.2, 2.4 s
         log.info("Checkpoint saved: %s", path)
         return path
 

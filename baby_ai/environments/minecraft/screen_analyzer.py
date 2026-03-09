@@ -286,6 +286,18 @@ def detect_inventory_open(frame: np.ndarray) -> bool:
         True if an inventory-style UI is likely open.
     """
     region = _ui_center_region(frame)  # (h, w, 3)
+
+    # Downsample large regions to cap memory usage.  Inventory
+    # detection only needs coarse colour/variance stats — 240×240
+    # is more than enough and prevents OOM on 1080p+ raw frames.
+    _MAX_DIM = 240
+    rh, rw = region.shape[:2]
+    if rh > _MAX_DIM or rw > _MAX_DIM:
+        scale = _MAX_DIM / max(rh, rw)
+        new_h, new_w = max(1, int(rh * scale)), max(1, int(rw * scale))
+        import cv2
+        region = cv2.resize(region, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     b, g, r = (
         region[:, :, 0].astype(np.float32),
         region[:, :, 1].astype(np.float32),

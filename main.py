@@ -277,9 +277,12 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     icm = orchestrator.icm
     reward_composer = orchestrator.reward_composer
 
-    # ── UI Control Panel ─────────────────────────────────────────
+    # ── UI Control Panel + Reward Toggles ───────────────────────
     from baby_ai.ui.control_panel import AIControlPanel
-    control_panel = AIControlPanel()
+    from baby_ai.ui.reward_toggles import RewardToggleState
+
+    toggle_state = RewardToggleState()
+    control_panel = AIControlPanel(toggle_state=toggle_state)
     control_panel.start()
 
     # ── Training loop ──────────────────────────────────────────
@@ -340,9 +343,14 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         prev_action.to(config.device),
                     )
                 intrinsic_r = icm_out["curiosity_reward"].mean().item()
+                # Respect the intrinsic toggle — if disabled, zero it.
+                if not toggle_state.is_enabled("intrinsic"):
+                    intrinsic_r = 0.0
 
                 # Extract per-channel extrinsic rewards from env info
-                rb = info.get("reward_breakdown", {})
+                rb_raw = info.get("reward_breakdown", {})
+                # Apply reward-channel toggles (disabled channels → 0).
+                rb = toggle_state.filter_channels(rb_raw)
                 extrinsic_r = rb.get("survival", 0.005)
                 exploration_r = rb.get("exploration", 0.0)
                 interaction_r = rb.get("interaction", 0.0)
@@ -359,8 +367,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 creative_seq_r = rb.get("creative_sequence", 0.0)
 
                 # Accumulate rewards between log intervals
+                # (use raw values for diagnostics, not filtered)
                 for _k in _acc_keys:
-                    _acc[_k] += rb.get(_k, 0.0)
+                    _acc[_k] += rb_raw.get(_k, 0.0)
 
                 total_r = reward_composer.compose(
                     extrinsic=extrinsic_r,
@@ -394,6 +403,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             # ── Execute action in Minecraft ─────────────────────
             obs, ext_reward, done, info = env.step(action_id)
             episode_steps += 1
+
+            # ── Push live stats to control panel ────────────────
+            control_panel.update_live_stats(
+                reward=episode_reward, step=episode_steps,
+            )
 
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:
@@ -442,6 +456,12 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     "Episode ended after %d steps  (reward=%.2f)",
                     episode_steps, episode_reward,
                 )
+                # If the Minecraft window is gone, break out
+                # instead of trying to reset (prevents zombie loop
+                # and ensures the tkinter GUI closes too).
+                if not env._window.is_valid:
+                    log.info("Minecraft window lost — exiting.")
+                    break
                 orchestrator.inference_thread.reset_hidden()
                 obs = env.reset()
                 prev_fused, prev_action, prev_obs = None, None, None
@@ -464,6 +484,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         env.close()
         orchestrator.save_checkpoint("minecraft")
         orchestrator.stop()
+        # Ensure the tkinter control panel closes when the
+        # training loop exits for any reason.
+        control_panel.request_close()
 
     log.info("Minecraft session complete.")
     stats = orchestrator.system_stats()

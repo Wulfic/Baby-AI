@@ -61,6 +61,12 @@ class ScreenCapture:
         # Cached region dict (mss format): updated on each grab
         self._region: Optional[dict] = None
 
+        # Track the initial client-area size so we can detect resizes
+        # and log a warning.  The capture pipeline handles arbitrary
+        # sizes gracefully (all coordinates are fractional), but it's
+        # good to know when the window has been resized.
+        self._initial_size: Optional[Tuple[int, int]] = None
+
     # ── Public API ──────────────────────────────────────────────
 
     def grab_raw(self) -> np.ndarray:
@@ -130,6 +136,19 @@ class ScreenCapture:
                 1, 3, self._resolution[0], self._resolution[1],
             )
             return black, tensor
+
+        # ── Window-resize detection ────────────────────────────
+        current_size = (sh, sw)
+        if self._initial_size is None:
+            self._initial_size = current_size
+            log.info("Initial capture size: %dx%d", sw, sh)
+        elif current_size != self._initial_size:
+            log.warning(
+                "Minecraft window resized from %dx%d to %dx%d — "
+                "capture pipeline adapts automatically (fractional coords).",
+                self._initial_size[1], self._initial_size[0], sw, sh,
+            )
+            self._initial_size = current_size
 
         self._region = {"left": sx, "top": sy, "width": sw, "height": sh}
         shot = sct.grab(self._region)
