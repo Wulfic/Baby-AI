@@ -5,6 +5,7 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.minecraft.entity.Entity;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.math.BlockPos;
@@ -123,7 +124,7 @@ public class BabyAiMod implements ModInitializer {
 
         // ── Player death (Fabric API) ────────────────────────
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
-            if (entity instanceof ServerPlayerEntity) {
+            if (entity instanceof ServerPlayerEntity player) {
                 // Extract the death message for logging.  The exact
                 // API surface may shift between MC versions — the
                 // try/catch keeps the mod from crashing on changes.
@@ -138,6 +139,19 @@ public class BabyAiMod implements ModInitializer {
                         ? entity.getServer().getTicks() : 0;
                 EventBridge.INSTANCE.onPlayerDeath(deathMsg, tick);
                 LOGGER.info("[Baby-AI] Player death: {}", deathMsg);
+
+                // ── Auto-respawn ────────────────────────────────
+                // Immediately respawn the player server-side so the
+                // Python trainer never has to deal with the death
+                // screen.  Scheduled for next tick to ensure the
+                // death event processing is complete.
+                player.getServer().execute(() -> {
+                    if (player.isDead()) {
+                        player.getServer().getPlayerManager()
+                              .respawnPlayer(player, false, Entity.RemovalReason.KILLED);
+                        LOGGER.info("[Baby-AI] Auto-respawned player");
+                    }
+                });
             }
         });
 

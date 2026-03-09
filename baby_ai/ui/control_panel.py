@@ -45,6 +45,25 @@ from baby_ai.ui.reward_weights import (
 from baby_ai.ui.settings_store import SettingsStore
 
 
+# ── Thread-safe learning rate holder ─────────────────────────
+_DEFAULT_LR = 5e-5        # medium-low constant LR
+_live_lr: float = _DEFAULT_LR
+_lr_lock = threading.Lock()
+
+
+def get_live_lr() -> float:
+    """Return the current GUI learning rate (thread-safe)."""
+    with _lr_lock:
+        return _live_lr
+
+
+def set_live_lr(value: float) -> None:
+    """Set the live learning rate from the GUI (thread-safe)."""
+    global _live_lr
+    with _lr_lock:
+        _live_lr = value
+
+
 def _get_dpi_scale() -> float:
     """Return a UI scale factor based on the primary monitor DPI.
 
@@ -164,9 +183,21 @@ class AIControlPanel:
         self._live_reward: float = 0.0
         self._live_step: int = 0
 
+        # Learning rate — restore persisted value, else default.
+        saved_lr = self._store.get("learning_rate")
+        if saved_lr is not None:
+            try:
+                set_live_lr(float(saved_lr))
+            except (ValueError, TypeError):
+                pass
+
         # Flag checked by _poll_updates to self-destruct when the
         # training loop signals shutdown from another thread.
         self._close_requested: bool = False
+
+        # tk variables for LR (initialised in _build_controls_tab)
+        self._lr_var: Optional[tk.DoubleVar] = None
+        self._lr_label: Optional[tk.Label] = None
 
     # ────────────────────────────────────────────────────────────
     # Public API
@@ -500,6 +531,70 @@ class AIControlPanel:
                 col_idx = 0
                 row_idx += 1
 
+        # ── Learning Rate slider ───────────────────────────────
+        lr_frame = tk.Frame(parent, bg=_BG_GROUP,
+                            padx=int(6 * s), pady=int(4 * s))
+        lr_frame.pack(fill=tk.X, padx=int(3 * s), pady=(int(6 * s), int(3 * s)))
+
+        tk.Label(
+            lr_frame, text="LEARNING RATE",
+            font=("Segoe UI", int(8 * s), "bold"),
+            bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
+        ).pack(fill=tk.X)
+
+        lr_row = tk.Frame(lr_frame, bg=_BG_GROUP)
+        lr_row.pack(fill=tk.X, pady=(int(2 * s), 0))
+        lr_row.columnconfigure(1, weight=1)
+
+        tk.Label(
+            lr_row, text="LR",
+            font=("Segoe UI", int(8 * s)),
+            bg=_BG_GROUP, fg=_FG, anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, int(4 * s)))
+
+        cur_lr = get_live_lr()
+        self._lr_var = tk.DoubleVar(value=cur_lr)
+        self._lr_label = tk.Label(
+            lr_row, text=f"{cur_lr:.1e}",
+            font=("Consolas", int(9 * s)),
+            bg=_BG_GROUP, fg=_ACCENT, anchor="e", width=8,
+        )
+        self._lr_label.grid(row=0, column=2, sticky="e", padx=(int(4 * s), 0))
+
+        # Log-scale mapping: slider goes 1..100, mapped to 1e-6..1e-3
+        # via  lr = 10 ^ (slider_val / 100 * 3 - 6)
+        #   slider=0  → 1e-6,  slider=50 → ~3.2e-5,  slider=100 → 1e-3
+        def _lr_from_slider(v: float) -> float:
+            return 10.0 ** (v / 100.0 * 3.0 - 6.0)
+
+        def _slider_from_lr(lr: float) -> float:
+            import math
+            lr = max(lr, 1e-7)
+            return (math.log10(lr) + 6.0) / 3.0 * 100.0
+
+        def _on_lr_slide(val: str) -> None:
+            lr = _lr_from_slider(float(val))
+            set_live_lr(lr)
+            if self._lr_label is not None:
+                self._lr_label.config(text=f"{lr:.1e}")
+            self._store.set("learning_rate", lr)
+
+        lr_slider = tk.Scale(
+            lr_row,
+            from_=0, to=100, resolution=1,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            command=_on_lr_slide,
+            bg=_ACCENT, fg=_FG,
+            troughcolor=_ACCENT_DARK,
+            activebackground="#b4d0fb",
+            highlightthickness=0, bd=0,
+            width=int(12 * s), sliderlength=int(16 * s),
+            sliderrelief="raised",
+        )
+        lr_slider.set(int(_slider_from_lr(cur_lr)))
+        lr_slider.grid(row=0, column=1, sticky="ew", padx=(int(2 * s), int(2 * s)))
+
     # ────────────────────────────────────────────────────────────
     # Callbacks
     # ────────────────────────────────────────────────────────────
@@ -625,6 +720,8 @@ class AIControlPanel:
             self._expand_states.clear()
             self._reward_label = None
             self._step_label = None
+            self._lr_var = None
+            self._lr_label = None
             if self.root is not None:
                 self.root.quit()
                 self.root.destroy()

@@ -42,9 +42,15 @@ def detect_death(frame: np.ndarray) -> bool:
     """
     Detect the Minecraft "You Died!" screen.
 
-    The death screen is an unmistakable full-screen dark-red overlay
-    (in Java Edition).  We check that a large portion of the frame
-    is dominated by red channel values while blue/green are very low.
+    The death screen in Java Edition 1.21+ is a semi-transparent
+    dark-red overlay covering the viewport.  We use two complementary
+    checks to be robust across different brightness / gamma settings:
+
+    1. **Global red-shift**: a significant fraction of pixels are
+       tinted red (R channel dominates G and B).
+    2. **Title region red text**: the top-center portion of the
+       screen contains bright-red "You Died!" text on a dark
+       background.
 
     Args:
         frame: (H, W, 3) BGR uint8 array.
@@ -52,20 +58,52 @@ def detect_death(frame: np.ndarray) -> bool:
     Returns:
         True if the death screen is visible.
     """
+    h, w = frame.shape[:2]
+
     # Work in float to avoid overflow
-    b, g, r = (
-        frame[:, :, 0].astype(np.float32),
-        frame[:, :, 1].astype(np.float32),
-        frame[:, :, 2].astype(np.float32),
+    b = frame[:, :, 0].astype(np.float32)
+    g = frame[:, :, 1].astype(np.float32)
+    r = frame[:, :, 2].astype(np.float32)
+
+    # ── Check 1: Global red-tinted overlay ──────────────────────
+    # Relaxed vs. the old check — modern MC death screens are darker.
+    # Pixel qualifies if red channel clearly dominates green + blue.
+    red_mask = (
+        (r > 40)            # not too dark (floor lowered from 80)
+        & (r > g * 1.6)     # red strongly exceeds green
+        & (r > b * 1.6)     # red strongly exceeds blue
+        & (g < 100)         # green isn't too bright
+        & (b < 100)         # blue isn't too bright
     )
+    red_frac = float(red_mask.mean())
 
-    # Death-screen pixels: R > 80, R > G*2, R > B*2, G < 60, B < 60
-    red_mask = (r > 80) & (r > g * 2) & (r > b * 2) & (g < 60) & (b < 60)
-    red_frac = red_mask.mean()
+    # Require >= 20% of all pixels (lowered from 35%).
+    if red_frac >= 0.20:
+        return True
 
-    # The death overlay covers roughly the full viewport —
-    # require ≥ 35 % of all pixels to match the pattern.
-    return float(red_frac) >= 0.35
+    # ── Check 2: "You Died!" title text region ─────────────────
+    # The title sits in roughly the top 25-40% vertically,
+    # centered horizontally. Look for bright-red pixels there.
+    y_top = int(h * 0.20)
+    y_bot = int(h * 0.42)
+    x_left = int(w * 0.25)
+    x_right = int(w * 0.75)
+    region_r = r[y_top:y_bot, x_left:x_right]
+    region_g = g[y_top:y_bot, x_left:x_right]
+    region_b = b[y_top:y_bot, x_left:x_right]
+
+    bright_red = (
+        (region_r > 150)
+        & (region_g < 80)
+        & (region_b < 80)
+    )
+    bright_frac = float(bright_red.mean())
+    # The "You Died!" text is large — even 3% of this region is a
+    # strong signal (actual text typically covers 5–10%).
+    if bright_frac >= 0.03:
+        return True
+
+    return False
 
 
 # ────────────────────────────────────────────────────────────────

@@ -38,11 +38,6 @@ from baby_ai.environments.minecraft.input_guard import InputGuard
 from baby_ai.environments.minecraft.input_controller import InputController
 from baby_ai.environments.minecraft.launcher import MinecraftLauncher
 from baby_ai.environments.minecraft.screen_analyzer import (
-    detect_death,
-    BlockBreakTracker,
-    HotbarTracker,
-    CraftingTracker,
-    PlacementTracker,
     BuildingStreakTracker,
     CreativeSequenceTracker,
 )
@@ -254,11 +249,11 @@ class MinecraftEnv(GameEnvironment):
         self._baseline_frame: Optional[np.ndarray] = None
         self._baseline_frame_step: int = 0
 
-        # ── Screen-based event detectors ────────────────────────
-        self._block_break_tracker = BlockBreakTracker()
-        self._hotbar_tracker = HotbarTracker()
-        self._crafting_tracker = CraftingTracker()
-        self._placement_tracker = PlacementTracker()
+        # ── Event trackers ───────────────────────────────────────
+        # BuildingStreakTracker and CreativeSequenceTracker are pure
+        # counters (no pixel analysis) — keep them.
+        # Old pixel-based trackers are removed; all detection now
+        # comes exclusively from the Fabric mod bridge.
         self._building_streak = BuildingStreakTracker()
         self._creative_sequence = CreativeSequenceTracker()
         self._is_dead: bool = False
@@ -299,11 +294,16 @@ class MinecraftEnv(GameEnvironment):
         # the player is likely in a cave or ravine.
         self._player_y: Optional[float] = None      # last known Y
         self._prev_player_y: Optional[float] = None  # Y from previous update
+        self._prev_player_x: Optional[float] = None  # X from previous step
+        self._prev_player_z: Optional[float] = None  # Z from previous step
         self._player_on_ground: bool = True
         self._sky_light: int = 15                    # 0=total darkness, 15=full sky
         self._underground_steps: int = 0             # consecutive steps below threshold
-        _SURFACE_Y = 58  # below this = underground penalty
-        self._surface_y = _SURFACE_Y
+        # Dynamic surface threshold — set from the player's starting Y
+        # on first position_update.  Avoids false "underground" on flat
+        # worlds (Y≈57) where the old hard-coded 58 was 1 block too high.
+        self._surface_y: float = 50.0          # safe default until calibrated
+        self._surface_y_calibrated: bool = False
 
         # ── Camera pitch / yaw tracking (from mod position_update) ──
         # Minecraft pitch: -90 = straight up (sky), 0 = horizontal,
@@ -331,6 +331,16 @@ class MinecraftEnv(GameEnvironment):
         self._player_z: Optional[float] = None
         self._home_radius: float = 100.0  # blocks — full bonus zone
 
+        # ── Chunk-based exploration tracking ─────────────────────
+        # A Minecraft chunk is 16×16 blocks.  We track:
+        #   - visited_chunks: set of (cx, cz) entered this episode
+        #   - current chunk coords for detecting transitions
+        #   - steps_in_chunk: how long we’ve been in the current chunk
+        # Movement reward decays the longer we stay in one chunk.
+        self._visited_chunks: set[tuple[int, int]] = set()
+        self._current_chunk: Optional[tuple[int, int]] = None
+        self._steps_in_chunk: int = 0
+
         # ── Mod bridge (authoritative game events via TCP) ──────
         self._mod_bridge = ModBridge(port=mod_bridge_port)
         self._mod_bridge.start()
@@ -347,6 +357,15 @@ class MinecraftEnv(GameEnvironment):
     def reset(self) -> Dict[str, torch.Tensor]:
         """Release all inputs and capture the initial frame."""
         self._input.release_all()
+
+        # ── Respawn if the player died ──────────────────────────
+        # The Fabric mod auto-respawns the player server-side
+        # immediately after death.  We just need to wait briefly
+        # for chunk loading and clear the dead flag.
+        if self._is_dead:
+            log.info("Player died — mod auto-respawned, waiting for chunks.")
+            time.sleep(1.0)
+
         self._step_count = 0
         self._prev_action_id = 0
         self._last_step_time = time.perf_counter()
@@ -359,11 +378,7 @@ class MinecraftEnv(GameEnvironment):
         self._baseline_frame = None
         self._baseline_frame_step = 0
 
-        # Reset screen-based detectors
-        self._block_break_tracker.reset()
-        self._hotbar_tracker.reset()
-        self._crafting_tracker.reset()
-        self._placement_tracker.reset()
+        # Reset event trackers
         self._building_streak.reset()
         self._creative_sequence.reset()
         self._is_dead = False
@@ -380,13 +395,21 @@ class MinecraftEnv(GameEnvironment):
         # (home persists across episode resets — it's the world spawn).
         self._player_y = None
         self._prev_player_y = None
+        self._prev_player_x = None
+        self._prev_player_z = None
         self._player_on_ground = True
         self._sky_light = 15
         self._underground_steps = 0
+        self._surface_y_calibrated = False
         self._hotbar_streak = 0
         self._player_pitch = None
         self._player_yaw = None
         self._extreme_pitch_steps = 0
+
+        # Reset chunk tracking (new episode = fresh exploration)
+        self._visited_chunks.clear()
+        self._current_chunk = None
+        self._steps_in_chunk = 0
 
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:
@@ -409,6 +432,31 @@ class MinecraftEnv(GameEnvironment):
         4. Capture the next frame.
         5. Compute simple extrinsic reward signals.
         """
+        # ── Early bail-out: already dead ────────────────────────
+        # If we're on the death screen, return immediately with
+        # zero reward and done=True.  This prevents the agent from
+        # accumulating free survival / intrinsic reward while the
+        # static death screen is displayed.
+        if self._is_dead:
+            obs = self._observe()
+            # Small positive reward for being in the "about to respawn"
+            # state — teaches the agent that dying leads to respawn,
+            # not permanent punishment.  Kept very small (0.05).
+            zero_info: Dict[str, float] = {
+                "total": 0.05, "death_penalty": 1.0,
+                "movement": 0.0, "new_chunk": 0.0,
+            }
+            return obs, 0.05, True, {
+                "step": self._step_count,
+                "action_name": "noop (dead)",
+                "has_look": False,
+                "window_focused": self._window.is_focused,
+                "reward_breakdown": zero_info,
+                "long_break": False,
+                "attack_streak": 0,
+                "long_break_count": self._long_break_count,
+            }
+
         action_id = int(action_id) % NUM_ACTIONS
         action = MINECRAFT_ACTIONS[action_id]
 
@@ -500,7 +548,7 @@ class MinecraftEnv(GameEnvironment):
         reward_info = self._compute_reward(obs, action_id)
         reward = reward_info["total"]
 
-        done = not self._window.is_valid
+        done = not self._window.is_valid or self._is_dead
         info = {
             "step": self._step_count,
             "action_name": action.name,
@@ -691,8 +739,8 @@ class MinecraftEnv(GameEnvironment):
         if self._frame_history:
             prev = self._frame_history[-1]
             diff = np.abs(frame_u8.astype(np.float32) - prev.astype(np.float32)).mean() / 255.0
-            if diff > 0.02:
-                visual_change = min(diff * 5.0, 1.0)
+            if diff > 0.04:
+                visual_change = min(diff * 3.0, 1.0)
         rewards["visual_change"] = visual_change
 
         self._frame_history.append(frame_u8)
@@ -772,7 +820,18 @@ class MinecraftEnv(GameEnvironment):
         _mv_sprint   = _sw.get("mv_sprint", 1.5)
 
         movement_bonus = 0.0
-        if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02:
+        # Compute actual horizontal displacement from mod position data.
+        # This prevents rewarding "movement" when the agent walks into
+        # a wall (visual change from head-bob but zero displacement).
+        _actual_moved = False
+        if (self._player_x is not None and self._prev_player_x is not None
+                and self._player_z is not None and self._prev_player_z is not None):
+            dx = self._player_x - self._prev_player_x
+            dz = self._player_z - self._prev_player_z
+            horiz_dist = (dx * dx + dz * dz) ** 0.5
+            _actual_moved = horiz_dist > 0.1  # > 0.1 blocks confirms real motion
+
+        if action_id in _MOVEMENT_ACTIONS and visual_change > 0.02 and _actual_moved:
             base_move = visual_change * 0.3
             if action_id in _FORWARD_ACTIONS:
                 base_move *= _mv_forward
@@ -787,11 +846,44 @@ class MinecraftEnv(GameEnvironment):
             if action_id in _SPRINT_ACTIONS:
                 base_move *= _mv_sprint
             movement_bonus = base_move
-        # Camera look (even while standing still) gets a small bonus
-        # to encourage situational awareness / scanning the environment.
+        # Camera look — small bonus for scanning the environment.
+        # When mod is connected and we KNOW position, only grant
+        # look bonus if the agent actually moved (prevents gaming
+        # by spinning in place while stuck).  When disconnected,
+        # grant it unconditionally but with halved value.
+        _mod_has_position = (self._player_x is not None
+                             and self._prev_player_x is not None)
         if action_id in _LOOK_ACTIONS and action_id not in _PURE_STRAFE_ACTIONS:
-            movement_bonus += _mv_look
+            if _mod_has_position:
+                if _actual_moved:
+                    movement_bonus += _mv_look
+            else:
+                # No mod data — allow but halved so it doesn't pile up
+                movement_bonus += _mv_look * 0.5
+
+        # ── Chunk-based movement decay ───────────────────────
+        # Diminish movement reward the longer the agent stays in
+        # the same 16×16 chunk.  After ~45 steps in one chunk the
+        # multiplier bottoms out at 0.1 (never fully zero so the
+        # agent still sees a faint signal for turning around).
+        chunk_decay = max(0.1, 1.0 - self._steps_in_chunk * 0.02)
+        movement_bonus *= chunk_decay
+
         rewards["movement"] = movement_bonus
+
+        # ────────────────────────────────────────────────────────
+        # 6b. New chunk exploration bonus
+        #     Small one-time reward when stepping into a chunk the
+        #     agent hasn’t visited this episode.  Encourages the
+        #     agent to actually explore new terrain.
+        # ────────────────────────────────────────────────────────
+        new_chunk_bonus = 0.0
+        if (self._player_x is not None and self._player_z is not None
+                and self._steps_in_chunk == 0
+                and self._step_count > 0):  # skip the very first step
+            # steps_in_chunk == 0 means we JUST entered this chunk
+            new_chunk_bonus = 0.3
+        rewards["new_chunk"] = new_chunk_bonus
 
         # ────────────────────────────────────────────────────────
         # 7. Idle penalty — discourage noop / repeated same action
@@ -860,6 +952,8 @@ class MinecraftEnv(GameEnvironment):
         if mod_position:
             latest_pos = mod_position[-1]  # use most recent
             self._prev_player_y = self._player_y
+            self._prev_player_x = self._player_x
+            self._prev_player_z = self._player_z
             self._player_y = latest_pos.get("y", self._player_y)
             self._player_x = latest_pos.get("x", self._player_x)
             self._player_z = latest_pos.get("z", self._player_z)
@@ -874,6 +968,27 @@ class MinecraftEnv(GameEnvironment):
                 self._home_z = self._player_z
                 log.info("Home location set: (%.1f, %.1f)",
                          self._home_x, self._home_z)
+
+            # Calibrate underground threshold from the player's
+            # starting Y so flat worlds (Y≈57) aren't misjudged.
+            # A 5-block buffer below spawn means "underground."
+            if not self._surface_y_calibrated and self._player_y is not None:
+                self._surface_y = self._player_y - 5.0
+                self._surface_y_calibrated = True
+                log.info("Surface threshold calibrated: Y < %.1f = underground "
+                         "(player Y=%.1f)", self._surface_y, self._player_y)
+
+            # ── Chunk tracking ──────────────────────────────────
+            if self._player_x is not None and self._player_z is not None:
+                cx = int(self._player_x) // 16
+                cz = int(self._player_z) // 16
+                new_chunk = (cx, cz)
+                if new_chunk != self._current_chunk:
+                    self._current_chunk = new_chunk
+                    self._steps_in_chunk = 0
+                    self._visited_chunks.add(new_chunk)
+                else:
+                    self._steps_in_chunk += 1
 
         # Reset attack streak when a block actually breaks —
         # prevents unnecessary long-break triggers.
@@ -891,79 +1006,37 @@ class MinecraftEnv(GameEnvironment):
                      [e["event"] for e in mod_events])
 
         # ────────────────────────────────────────────────────────
-        # 8. Block-break detection
-        #    MOD: per-item reward via item_rewards table
-        #    PIXEL FALLBACK: crosshair crack animation (flat 1.0)
+        # 8. Block-break detection  (mod-only, no pixel fallback)
         # ────────────────────────────────────────────────────────
+        block_break_reward = 0.0
         if use_mod:
-            # Sum per-block rewards based on rarity / difficulty.
-            # Mod only fires block_broken on COMPLETE breaks —
-            # no partial-damage reward is possible here.
             block_break_reward = sum(
                 get_item_reward(e.get("block", ""), "block_broken")
                 for e in mod_blocks_broken
             )
-            # Still update pixel tracker state so it stays in sync
-            if self._raw_frame is not None:
-                is_attacking = action_id in _ATTACK_ACTIONS
-                self._block_break_tracker.update(
-                    self._raw_frame, is_attacking=is_attacking,
-                )
-            block_break_score = block_break_reward
-        else:
-            block_break_score = 0.0
-            if self._raw_frame is not None:
-                is_attacking = action_id in _ATTACK_ACTIONS
-                block_break_score = self._block_break_tracker.update(
-                    self._raw_frame, is_attacking=is_attacking,
-                )
-            # Only reward near-complete breaks (score ≥ 0.85).
-            # This prevents partial damage from generating reward —
-            # the agent must fully break the block to get credit.
-            block_break_reward = block_break_score if block_break_score > 0.85 else 0.0
         rewards["block_break"] = block_break_reward
 
         # ────────────────────────────────────────────────────────
-        # 9. Crafting detection
-        #    MOD: per-item reward via item_rewards table (2× base)
-        #    PIXEL FALLBACK: inventory UI + hotbar change
+        # 9. Crafting detection  (mod-only, no pixel fallback)
         # ────────────────────────────────────────────────────────
-        craft_info = {"ui_open": False, "craft_score": 0.0, "frames_in_ui": 0}
-        if self._raw_frame is not None:
-            craft_info = self._crafting_tracker.update(self._raw_frame)
-
+        craft_score = 0.0
         if use_mod:
-            # Per-item crafting reward scaled by rarity (2× multiplier)
-            craft_score_mod = sum(
+            craft_score = sum(
                 get_item_reward(e.get("item", ""), "item_crafted")
                 * e.get("count", 1)
                 for e in mod_items_crafted
             )
-            # Override pixel tracker score with mod score
-            craft_info = dict(craft_info)  # copy
-            craft_info["craft_score"] = craft_score_mod
 
         # ────────────────────────────────────────────────────────
-        # 10. Item pickup
-        #    MOD: per-item reward via item_rewards table
-        #    PIXEL FALLBACK: hotbar region change (suppressed during UI)
+        # 10. Item pickup  (mod-only, no pixel fallback)
         # ────────────────────────────────────────────────────────
+        item_pickup = 0.0
         if use_mod:
-            # Per-item pickup reward scaled by rarity
             item_pickup = sum(
                 get_item_reward(e.get("item", ""), "item_picked_up")
-                * min(e.get("count", 1), 10)  # cap count to curb inflation
+                * min(e.get("count", 1), 10)
                 for e in mod_items_picked
             )
-            # Keep pixel tracker in sync
-            if self._raw_frame is not None:
-                self._hotbar_tracker.update(self._raw_frame)
-        else:
-            item_pickup = 0.0
-            if self._raw_frame is not None and not craft_info["ui_open"]:
-                item_pickup = self._hotbar_tracker.update(self._raw_frame)
-            elif self._raw_frame is not None:
-                self._hotbar_tracker.update(self._raw_frame)
 
         # Suppress pickup reward shortly after a drop action —
         # prevents the agent from gaming rewards by dropping items
@@ -987,26 +1060,14 @@ class MinecraftEnv(GameEnvironment):
         rewards["item_drop_penalty"] = item_drop_penalty
 
         # ────────────────────────────────────────────────────────
-        # 11. Death penalty
-        #    MOD: 1.0 per death event
-        #    PIXEL FALLBACK: red "You Died!" overlay
+        # 11. Death detection  (mod-only; no penalty — mod auto-
+        #     respawns the player immediately so death is just a
+        #     brief interruption, not something to penalise).
         # ────────────────────────────────────────────────────────
-        if use_mod:
-            death_penalty = float(len(mod_deaths))
-            if death_penalty > 0:
-                log.info("Death detected via mod at step %d", self._step_count)
-            # Keep pixel tracker in sync
-            if self._raw_frame is not None:
-                self._is_dead = detect_death(self._raw_frame)
-        else:
-            death_penalty = 0.0
-            if self._raw_frame is not None:
-                died_now = detect_death(self._raw_frame)
-                if died_now and not self._is_dead:
-                    death_penalty = 1.0
-                    log.info("Death detected at step %d", self._step_count)
-                self._is_dead = died_now
-        rewards["death_penalty"] = death_penalty
+        if mod_deaths:
+            log.info("Death detected via mod at step %d", self._step_count)
+            self._is_dead = True
+        rewards["death_penalty"] = 0.0
 
         # ────────────────────────────────────────────────────────
         # 11b. Damage / Healing (from health_changed events)
@@ -1158,45 +1219,20 @@ class MinecraftEnv(GameEnvironment):
         # ============================================
 
         # ────────────────────────────────────────────────────────
-        # 12. Block placement detection
-        #    MOD: per-block reward via item_rewards table (1.2× base)
-        #    PIXEL FALLBACK: right-click + forward visual change
+        # 12. Block placement detection  (mod-only, no pixel fallback)
         # ────────────────────────────────────────────────────────
+        block_place_score = 0.0
         if use_mod:
-            # Per-block placement reward — incentivises building with
-            # rarer materials (1.2× multiplier for intentional building)
             block_place_score = sum(
                 get_item_reward(e.get("block", ""), "block_placed")
                 for e in mod_blocks_placed
             )
-            # Keep pixel tracker in sync
-            if self._raw_frame is not None:
-                is_using = action_id in _USE_ACTIONS
-                self._placement_tracker.update(
-                    self._raw_frame, is_using=is_using,
-                )
-        else:
-            block_place_score = 0.0
-            if self._raw_frame is not None:
-                is_using = action_id in _USE_ACTIONS
-                block_place_score = self._placement_tracker.update(
-                    self._raw_frame, is_using=is_using,
-                )
         rewards["block_place"] = block_place_score
 
         # ────────────────────────────────────────────────────────
-        # 13. Crafting reward (craft_info from section 9)
+        # 13. Crafting reward (from section 9)
         # ────────────────────────────────────────────────────────
-        rewards["crafting"] = craft_info["craft_score"]
-
-        # Small bonus for engaging with the crafting UI long enough
-        # to actually craft — only when pixel fallback is in use
-        # and the tracker hasn't already fired a real craft_score.
-        if (not use_mod
-                and craft_info["ui_open"]
-                and craft_info["frames_in_ui"] > 15
-                and craft_info["craft_score"] == 0.0):
-            rewards["crafting"] += 0.02
+        rewards["crafting"] = craft_score
 
         # ────────────────────────────────────────────────────────
         # 14. Building streak — consecutive placements build
@@ -1213,7 +1249,7 @@ class MinecraftEnv(GameEnvironment):
         seq_info = self._creative_sequence.update(
             block_break=block_break_reward,
             item_pickup=item_pickup,
-            craft_score=craft_info["craft_score"],
+            craft_score=craft_score,
             block_place=block_place_score,
         )
         rewards["creative_sequence"] = seq_info["stage_reward"] + seq_info["cycle_bonus"]
@@ -1225,7 +1261,7 @@ class MinecraftEnv(GameEnvironment):
         # ────────────────────────────────────────────────────────
         productive = (
             block_break_reward > 0
-            or craft_info["craft_score"] > 0
+            or craft_score > 0
             or block_place_score > 0.3
             or item_pickup > 0
         )
@@ -1263,7 +1299,7 @@ class MinecraftEnv(GameEnvironment):
                 " | home_dist=%.1f",
                 self._step_count, bridge_status, raw_h, raw_w,
                 block_break_reward, item_pickup, block_place_score,
-                craft_info["craft_score"], death_penalty,
+                craft_score, 0.0,
                 visual_change, interaction_bonus,
                 self._long_break_count, self._attack_streak,
                 self._player_y if self._player_y is not None else -1.0,
@@ -1284,13 +1320,14 @@ class MinecraftEnv(GameEnvironment):
         else:
             # Hardcoded fallback (matches RewardWeightsState defaults)
             w = {
-                "survival": 1.0, "visual_change": 0.2,
+                "intrinsic": 0.1,
+                "survival": 1.0, "visual_change": 0.1,
                 "action_diversity": 0.5, "interaction": 0.8,
                 "exploration": 0.8, "movement": 0.3,
                 "block_break": 4.0, "item_pickup": 6.0,
                 "block_place": 4.0, "crafting": 25.0,
                 "building_streak": 3.0, "creative_sequence": 6.0,
-                "idle_penalty": 2.0, "death_penalty": 10.0,
+                "idle_penalty": 2.0, "death_penalty": 0.0,
                 "stagnation_penalty": 3.0, "item_drop_penalty": 3.0,
                 "damage_taken": 1.5, "hotbar_spam_penalty": 2.0,
                 "height_penalty": 2.5, "pitch_penalty": 3.0,
@@ -1308,12 +1345,13 @@ class MinecraftEnv(GameEnvironment):
         total = (
             # Baseline
             rewards["survival"]          * w.get("survival", 1.0)
-            + rewards["visual_change"]   * w.get("visual_change", 0.2)
+            + rewards["visual_change"]   * w.get("visual_change", 0.1)
             # Exploration
             + rewards["action_diversity"]* w.get("action_diversity", 0.5)
             + rewards["interaction"]     * w.get("interaction", 0.8)
             + rewards["exploration"]     * w.get("exploration", 0.8)
             + rewards["movement"]        * w.get("movement", 0.3)
+            + rewards["new_chunk"]       * w.get("new_chunk", 1.0)
             # Resource gathering
             + rewards["block_break"]     * w.get("block_break", 4.0)
             + rewards["item_pickup"]     * w.get("item_pickup", 6.0)
@@ -1324,7 +1362,7 @@ class MinecraftEnv(GameEnvironment):
             + rewards["creative_sequence"]* w.get("creative_sequence", 6.0)
             # Penalties (subtracted)
             - rewards["idle_penalty"]    * w.get("idle_penalty", 2.0)
-            - rewards["death_penalty"]   * w.get("death_penalty", 10.0)
+            - rewards["death_penalty"]   * w.get("death_penalty", 0.0)
             - rewards["stagnation_penalty"]* w.get("stagnation_penalty", 3.0)
             - rewards["item_drop_penalty"]* w.get("item_drop_penalty", 3.0)
             - rewards["damage_taken"]    * w.get("damage_taken", 1.5)

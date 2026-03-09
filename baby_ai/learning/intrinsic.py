@@ -93,8 +93,10 @@ class ICM(nn.Module):
         forward_input = torch.cat([phi_s, action_oh], dim=-1)
         phi_ns_pred = self.forward_model(forward_input)  # (B, hidden)
 
-        # Curiosity reward = L2 prediction error
-        forward_error = 0.5 * (phi_ns_pred - phi_ns.detach()).pow(2).sum(dim=-1)  # (B,)
+        # Curiosity reward = L2 prediction error (mean over hidden dims so
+        # the magnitude is independent of hidden_dim and stays in a
+        # reasonable range even with an untrained forward model).
+        forward_error = 0.5 * (phi_ns_pred - phi_ns.detach()).pow(2).mean(dim=-1)  # (B,)
         forward_loss = forward_error.mean()
 
         # Inverse model

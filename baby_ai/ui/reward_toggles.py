@@ -40,6 +40,7 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("exploration",        "Exploration",          "Exploration",   True),
     ChannelInfo("action_diversity",   "Action Diversity",     "Exploration",   True),
     ChannelInfo("movement",           "Movement",             "Exploration",   True),
+    ChannelInfo("new_chunk",          "New Chunk",            "Exploration",   True),
 
     # ── Interaction ─────────────────────────────────────────────
     ChannelInfo("interaction",        "Interaction",          "Interaction",   False),
@@ -54,7 +55,6 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("creative_sequence",  "Creative Sequence",    "Creation",      False),
 
     # ── Survival ────────────────────────────────────────────────
-    ChannelInfo("death_penalty",      "Death Penalty",        "Survival",      True,  is_penalty=True),
     ChannelInfo("damage_taken",       "Damage Taken",         "Survival",      False, is_penalty=True),
     ChannelInfo("healing",            "Healing",              "Survival",      False),
     ChannelInfo("food_reward",        "Food Reward",          "Survival",      False),

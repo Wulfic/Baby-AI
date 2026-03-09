@@ -124,17 +124,29 @@ class RewardComposer:
         frac = min(1.0, self._step / max(1, self.intrinsic_decay_steps))
         return self.intrinsic_start + frac * (self.intrinsic_end - self.intrinsic_start)
 
-    # Sparse event channels that should NEVER produce a negative
-    # normalized value.  These channels are 0 most of the time and only
-    # occasionally spike positive (block break, item pick-up, crafting…).
-    # Z-scoring them creates a systematic negative bias on the 95%+ of
-    # steps where nothing happens (because mean > 0 after any events,
-    # so z(0) < 0).  Clamping their floor to 0 ensures "nothing happened"
-    # is neutral, not punishing.
-    _SPARSE_POSITIVE_CHANNELS: frozenset[str] = frozenset({
+    # Channels whose normalized value should NEVER go negative.
+    #
+    # Two categories:
+    # 1. **Sparse events** (block_break, crafting …): 0 most of the
+    #    time, occasional positive spike.  Z-scoring them creates a
+    #    systematic negative bias on idle steps.
+    # 2. **Inherently-positive continuous** (intrinsic, extrinsic):
+    #    always > 0 but the level can shift (e.g. after distillation
+    #    the curiosity baseline drops).  The rolling z-score window
+    #    (1000 steps) lags behind, producing hundreds of negative
+    #    z-scores until the mean catches up — this was the primary
+    #    driver of the runaway-negative episode reward.
+    #
+    # Clamping the floor to 0 ensures "below average" is neutral (0),
+    # not punishing.  Positive deviations still get full credit.
+    _POSITIVE_ONLY_CHANNELS: frozenset[str] = frozenset({
+        # Continuous positive signals
+        "intrinsic", "extrinsic",
+        # Sparse event channels
         "communication", "exploration", "interaction", "action_diversity",
         "movement", "block_break", "item_pickup", "block_place",
         "crafting", "building_streak", "creative_sequence",
+        "new_chunk",
     })
 
     def _normalize_channel(self, channel: str, value: float) -> float:
@@ -159,8 +171,8 @@ class RewardComposer:
         if not self.normalize:
             return value
 
-        # Determine clamp bounds: sparse channels floor at 0.
-        lo = 0.0 if channel in self._SPARSE_POSITIVE_CHANNELS else -3.0
+        # Determine clamp bounds: positive-only channels floor at 0.
+        lo = 0.0 if channel in self._POSITIVE_ONLY_CHANNELS else -3.0
 
         if channel not in self._stats:
             self._stats[channel] = {"values": deque(maxlen=self._window)}

@@ -79,12 +79,9 @@ class LearnerThread:
             {"params": core_params, "lr": self.config.core_lr},
             {"params": policy_params, "lr": self.config.policy_lr},
         ])
-        
-        # Add learning rate warmup to prevent wild training swings early on
-        warmup_steps = getattr(self.config, "warmup_steps", 1000)
-        self.scheduler = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=0.01, total_iters=warmup_steps
-        )
+
+        # No warmup scheduler — constant LR controlled by the GUI.
+        # The live LR is read from the control panel each optimizer step.
 
         # AMP scaler
         self.scaler = torch.amp.GradScaler("cuda") if self.config.use_amp else None
@@ -184,16 +181,18 @@ class LearnerThread:
                 scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                # If scale decreases, it hit an inf/nan and skipped the step
-                skip_scheduler = (self.scaler.get_scale() < scale_before)
             else:
                 self.optimizer.step()
-                skip_scheduler = False
-            
-            # Step the scheduler safely
-            if hasattr(self, "scheduler") and not skip_scheduler:
-                self.scheduler.step()
-                
+
+            # ── Sync learning rate from GUI ───────────────────────
+            try:
+                from baby_ai.ui.control_panel import get_live_lr
+                gui_lr = get_live_lr()
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = gui_lr
+            except Exception:
+                pass  # GUI not available yet
+
             self.optimizer.zero_grad()
             self._accum_count = 0
 

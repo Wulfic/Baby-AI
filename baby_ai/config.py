@@ -149,10 +149,10 @@ class SensorConfig:
 
 @dataclass
 class TrainingConfig:
-    # Learning rates
-    encoder_lr: float = 1e-4
-    core_lr: float = 1e-4
-    policy_lr: float = 3e-4
+    # Learning rates (overridden by GUI slider at runtime)
+    encoder_lr: float = 5e-5
+    core_lr: float = 5e-5
+    policy_lr: float = 5e-5
     distill_lr: float = 5e-5
 
     # Batching
@@ -164,7 +164,7 @@ class TrainingConfig:
     replay_disk_cap_gb: float = 4.0  # compressed on-disk cap
 
     # Distillation
-    distill_every_n_steps: int = 250
+    distill_every_n_steps: int = 100
     distill_kl_weight: float = 1.0
     distill_feature_weight: float = 0.5
 
@@ -179,9 +179,6 @@ class TrainingConfig:
 
     # Mixed precision
     use_amp: bool = True
-
-    # Learning Rate Warmup
-    warmup_steps: int = 1000
 
     # Checkpointing
     checkpoint_every_n_steps: int = 5000

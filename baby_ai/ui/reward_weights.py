@@ -44,8 +44,9 @@ class WeightInfo:
 # Sub-weights MUST appear immediately after their parent.
 REWARD_WEIGHTS: List[WeightInfo] = [
     # ── Baseline ────────────────────────────────────────────────
+    WeightInfo("intrinsic",         "Intrinsic (ICM)",    "Baseline",     0.1,    0.0, 10.0,   0.1),
     WeightInfo("survival",          "Survival",           "Baseline",     1.0,    0.0,  5.0,   0.1),
-    WeightInfo("visual_change",     "Visual Change",      "Baseline",     0.2,    0.0,  5.0,   0.1),
+    WeightInfo("visual_change",     "Visual Change",      "Baseline",     0.1,    0.0,  5.0,   0.1),
 
     # ── Exploration ─────────────────────────────────────────────
     WeightInfo("action_diversity",  "Action Diversity",   "Exploration",  0.5,    0.0, 10.0,   0.1),
@@ -65,7 +66,7 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("mv_look",           "Camera Look",        "Exploration",  0.02,   0.0,  0.5,   0.01, parent="movement"),
     WeightInfo("mv_jump",           "Jump (Space)",       "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
     WeightInfo("mv_sprint",         "Sprint (Ctrl)",      "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
-
+    WeightInfo("new_chunk",          "New Chunk",          "Exploration",  1.0,    0.0, 10.0,   0.1),
     # ── Resource Gathering ──────────────────────────────────────
     WeightInfo("block_break",       "Block Break",        "Resources",    4.0,    0.0, 30.0,   0.5),
     WeightInfo("item_pickup",       "Item Pickup",        "Resources",    6.0,    0.0, 30.0,   0.5),
@@ -78,7 +79,6 @@ REWARD_WEIGHTS: List[WeightInfo] = [
 
     # ── Penalties ───────────────────────────────────────────────
     WeightInfo("idle_penalty",       "Idle Penalty",       "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("death_penalty",      "Death Penalty",      "Penalties",   10.0,   0.0, 30.0,  0.5, is_penalty=True),
     WeightInfo("stagnation_penalty", "Stagnation Penalty", "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("damage_taken",       "Damage Taken",       "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),

@@ -275,7 +275,6 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
     # ── ICM for intrinsic reward ────────────────────────────────
     icm = orchestrator.icm
-    reward_composer = orchestrator.reward_composer
 
     # ── UI Control Panel + Reward Toggles ───────────────────────
     from baby_ai.ui.control_panel import AIControlPanel
@@ -335,9 +334,18 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     prev_fused: torch.Tensor | None = None
     prev_action: torch.Tensor | None = None
     prev_obs: dict | None = None
+    raw_ir: float = 0.0        # raw ICM curiosity (before normalisation)
+    intrinsic_r: float = 0.0   # normalised + clamped curiosity reward
     episode_reward = 0.0
     episode_steps = 0
     last_distill_count = 0  # track distillation rounds for reward reset
+
+    # Running RMS normalizer for intrinsic (ICM) reward.  Keeps the
+    # curiosity signal bounded regardless of forward-model training
+    # state.  EMA of squared values → divide by RMS → clamp [0, 5].
+    _ir_ema_sq: float = 1.0   # EMA of intrinsic_r² (init 1.0 to avoid /0)
+    _IR_EMA_DECAY: float = 0.99
+    _IR_MAX: float = 1.0      # hard ceiling after normalisation
 
     # Accumulators for reward channels between log intervals.
     # Without these, events that happen between logged steps are invisible.
@@ -348,7 +356,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         "item_drop_penalty", "damage_taken", "healing",
         "food_reward", "xp_reward",
         "hotbar_spam_penalty", "height_penalty",
-        "home_proximity",
+        "pitch_penalty", "stagnation_penalty",
+        "home_proximity", "visual_change", "movement",
+        "new_chunk",
     )
     _acc = {k: 0.0 for k in _acc_keys}
 
@@ -388,7 +398,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         fused.to(config.device),
                         prev_action.to(config.device),
                     )
-                intrinsic_r = icm_out["curiosity_reward"].mean().item()
+                raw_ir = icm_out["curiosity_reward"].mean().item()
+                # Running RMS normalisation — keeps magnitude stable
+                # even while the forward model is poorly trained.
+                _ir_ema_sq = (_IR_EMA_DECAY * _ir_ema_sq
+                              + (1.0 - _IR_EMA_DECAY) * (raw_ir ** 2 + 1e-8))
+                intrinsic_r = raw_ir / max(_ir_ema_sq ** 0.5, 1e-8)
+                intrinsic_r = max(0.0, min(intrinsic_r, _IR_MAX))
                 # Respect the intrinsic toggle — if disabled, zero it.
                 if not toggle_state.is_enabled("intrinsic"):
                     intrinsic_r = 0.0
@@ -397,42 +413,59 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 rb_raw = info.get("reward_breakdown", {})
                 # Apply reward-channel toggles (disabled channels → 0).
                 rb = toggle_state.filter_channels(rb_raw)
-                extrinsic_r = rb.get("survival", 0.005)
-                exploration_r = rb.get("exploration", 0.0)
-                interaction_r = rb.get("interaction", 0.0)
-                action_div_r = rb.get("action_diversity", 0.0)
-                movement_r = rb.get("movement", 0.0)
-                block_break_r = rb.get("block_break", 0.0)
-                item_pickup_r = rb.get("item_pickup", 0.0)
-                death_pen_r = rb.get("death_penalty", 0.0)
-                idle_pen = rb.get("idle_penalty", 0.0)
-                # ★ Creation-focused channels
-                block_place_r = rb.get("block_place", 0.0)
-                crafting_r = rb.get("crafting", 0.0)
-                building_streak_r = rb.get("building_streak", 0.0)
-                creative_seq_r = rb.get("creative_sequence", 0.0)
 
-                # Accumulate rewards between log intervals
-                # (use raw values for diagnostics, not filtered)
-                for _k in _acc_keys:
-                    _acc[_k] += rb_raw.get(_k, 0.0)
+                # ── Compute total reward from env breakdown ─────
+                # The env computes raw per-channel values; the Reward
+                # Weights UI sets the multipliers; toggles zero disabled
+                # channels.  We recompute the weighted total here using
+                # the *filtered* breakdown so that:
+                #   1. ALL channels are included (not just a subset)
+                #   2. Toggles take effect instantly
+                #   3. Weight slider changes are reflected live
+                #   4. ICM intrinsic is layered on top
+                w = reward_weights.snapshot()
 
-                total_r = reward_composer.compose(
-                    extrinsic=extrinsic_r,
-                    intrinsic=intrinsic_r,
-                    exploration=exploration_r,
-                    interaction=interaction_r,
-                    action_diversity=action_div_r,
-                    movement=movement_r,
-                    block_break=block_break_r,
-                    item_pickup=item_pickup_r,
-                    block_place=block_place_r,
-                    crafting=crafting_r,
-                    building_streak=building_streak_r,
-                    creative_sequence=creative_seq_r,
-                    death_penalty=death_pen_r,
-                    safety_penalty=idle_pen,
+                # Positive channels (reward)
+                extrinsic_total = (
+                    rb.get("survival", 0.005)      * w.get("survival", 1.0)
+                    + rb.get("visual_change", 0.0) * w.get("visual_change", 0.1)
+                    + rb.get("action_diversity", 0.0) * w.get("action_diversity", 0.5)
+                    + rb.get("interaction", 0.0)   * w.get("interaction", 0.8)
+                    + rb.get("exploration", 0.0)   * w.get("exploration", 0.8)
+                    + rb.get("movement", 0.0)      * w.get("movement", 0.3)
+                    + rb.get("new_chunk", 0.0)     * w.get("new_chunk", 1.0)
+                    + rb.get("block_break", 0.0)   * w.get("block_break", 4.0)
+                    + rb.get("item_pickup", 0.0)   * w.get("item_pickup", 6.0)
+                    + rb.get("block_place", 0.0)   * w.get("block_place", 4.0)
+                    + rb.get("crafting", 0.0)      * w.get("crafting", 25.0)
+                    + rb.get("building_streak", 0.0) * w.get("building_streak", 3.0)
+                    + rb.get("creative_sequence", 0.0) * w.get("creative_sequence", 6.0)
+                    + rb.get("healing", 0.0)       * w.get("healing", 1.0)
+                    + rb.get("food_reward", 0.0)   * w.get("food_reward", 0.8)
+                    + rb.get("xp_reward", 0.0)     * w.get("xp_reward", 0.1)
+                    + rb.get("home_proximity", 0.0) * w.get("home_proximity", 1.5)
                 )
+
+                # Penalty channels (subtracted)
+                penalty_total = (
+                    rb.get("idle_penalty", 0.0)    * w.get("idle_penalty", 2.0)
+                    # death_penalty removed — mod auto-respawns
+                    + rb.get("stagnation_penalty", 0.0) * w.get("stagnation_penalty", 3.0)
+                    + rb.get("item_drop_penalty", 0.0) * w.get("item_drop_penalty", 3.0)
+                    + rb.get("damage_taken", 0.0)  * w.get("damage_taken", 1.5)
+                    + rb.get("hotbar_spam_penalty", 0.0) * w.get("hotbar_spam_penalty", 2.0)
+                    + rb.get("height_penalty", 0.0) * w.get("height_penalty", 2.5)
+                    + rb.get("pitch_penalty", 0.0) * w.get("pitch_penalty", 3.0)
+                )
+
+                # Intrinsic curiosity — added on top of env rewards
+                intrinsic_contribution = intrinsic_r * w.get("intrinsic", 0.1)
+
+                total_r = extrinsic_total - penalty_total + intrinsic_contribution
+
+                # Accumulate filtered channel values for periodic logging
+                for _k in _acc_keys:
+                    _acc[_k] += rb.get(_k, 0.0)
 
                 transition = {
                     "vision": prev_obs["vision"].squeeze(0),
@@ -468,21 +501,25 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:
+                ir_raw_str = f"{raw_ir:.4f}" if prev_fused is not None else "N/A"
                 ir_str = f"{intrinsic_r:.4f}" if prev_fused is not None else "N/A"
                 # Show accumulated rewards since the last log interval
                 # (so events between log steps are visible).
                 log.info(
-                    "Step %5d | action=%-28s | curiosity=%s"
-                    " | interact=%.3f | explore=%.3f"
+                    "Step %5d | action=%-28s | curiosity=%s(raw=%s)"
+                    " | move=%.3f | vis=%.3f | interact=%.3f | explore=%.3f"
                     " | blk_break=%.3f | item=%.3f | place=%.3f"
                     " | craft=%.3f | bld_streak=%.3f | creative=%.3f"
-                    " | death=%.1f | drop=%.2f"
+                    " | death=%.1f | drop=%.2f | stag=%.2f"
                     " | dmg=%.2f | heal=%.2f | food=%.2f | xp=%.2f"
-                    " | hbar=%.2f | height=%.2f | home=%.2f"
+                    " | hbar=%.2f | height=%.2f | pitch=%.2f | home=%.2f"
                     " | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
                     action_name(action_id),
                     ir_str,
+                    ir_raw_str,
+                    _acc["movement"],
+                    _acc["visual_change"],
                     _acc["interaction"],
                     _acc["exploration"],
                     _acc["block_break"],
@@ -493,12 +530,14 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     _acc["creative_sequence"],
                     _acc["death_penalty"],
                     _acc["item_drop_penalty"],
+                    _acc["stagnation_penalty"],
                     _acc["damage_taken"],
                     _acc["healing"],
                     _acc["food_reward"],
                     _acc["xp_reward"],
                     _acc["hotbar_spam_penalty"],
                     _acc["height_penalty"],
+                    _acc["pitch_penalty"],
                     _acc["home_proximity"],
                     episode_reward,
                     result.get("latency_ms", 0),
