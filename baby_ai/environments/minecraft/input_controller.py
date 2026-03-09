@@ -36,6 +36,18 @@ from baby_ai.utils.logging import get_logger
 
 log = get_logger("mc_input")
 
+# Forward-declare; set at runtime via set_controls_state().
+_controls_state = None
+
+def set_controls_state(state) -> None:
+    """Inject the shared AIControlsState so the controller can respect it.
+
+    Called once from main.py after creating the env and controls_state.
+    Must be called before the training loop starts.
+    """
+    global _controls_state
+    _controls_state = state
+
 # ── Win32 message constants ─────────────────────────────────────
 WM_KEYDOWN      = 0x0100
 WM_KEYUP        = 0x0101
@@ -180,11 +192,18 @@ class InputController:
 
         Blocked keys (ESC, F3, F5, TAB) are silently dropped unless
         *force=True* (used only by the launcher/wrapper code).
+
+        Keys disabled via the AI Controls panel are also silently
+        dropped unless *force=True*.
         """
         vk = VK[key] if isinstance(key, str) else key
         if not force and vk in BLOCKED_KEYS:
             log.debug("Blocked key %s (vk=0x%02X) — not allowed for AI.", key, vk)
             return
+        # Check AI Controls state (UI toggles).
+        if not force and _controls_state is not None:
+            if not _controls_state.is_vk_allowed(vk, VK):
+                return
         sc = self._scan(vk)
         ext = vk in _EXTENDED_KEYS
         lp = _make_key_lparam(sc, extended=ext, down=True)
@@ -239,9 +258,15 @@ class InputController:
 
         This uses PostMessage which targets the MC window by handle,
         so clicks NEVER affect other windows.
+
+        Buttons disabled via the AI Controls panel are silently dropped.
         """
         if not self._window.is_valid:
             return
+        # Check AI Controls state (UI toggles).
+        if _controls_state is not None:
+            if not _controls_state.is_button_allowed(button):
+                return
 
         if x < 0 or y < 0:
             x, y = self._get_cursor_client_pos()
@@ -291,9 +316,15 @@ class InputController:
 
         In **active** mode this warps the OS cursor relative to the
         window center.
+
+        Camera look disabled via the AI Controls panel is silently dropped.
         """
         if not self._window.is_valid:
             return False
+        # Check AI Controls state (UI toggles).
+        if _controls_state is not None:
+            if not _controls_state.is_look_allowed():
+                return False
 
         if self._mode == "background":
             # ── Background mode: accumulate cursor position ──────
@@ -358,7 +389,14 @@ class InputController:
         Minecraft sees one clean press event without a lingering
         KEYDOWN that conflicts with the game's own keybind toggle
         logic.
+
+        Keys disabled via the AI Controls panel are filtered out
+        before processing.
         """
+        # Filter through AI Controls state.
+        if _controls_state is not None:
+            desired_keys = _controls_state.filter_keys(desired_keys, VK)
+
         # Separate tap-only keys from holdable keys
         hold_desired = desired_keys - _TAP_KEYS
         tap_desired = desired_keys & _TAP_KEYS
@@ -378,7 +416,14 @@ class InputController:
             self.release_key(vk)
 
     def set_buttons(self, desired_buttons: Set[str]) -> None:
-        """Transition to exactly the set of *desired_buttons* being held."""
+        """Transition to exactly the set of *desired_buttons* being held.
+
+        Buttons disabled via the AI Controls panel are filtered out.
+        """
+        # Filter through AI Controls state.
+        if _controls_state is not None:
+            desired_buttons = _controls_state.filter_buttons(desired_buttons)
+
         to_release = self._held_buttons - desired_buttons
         to_press = desired_buttons - self._held_buttons
         for btn in to_release:

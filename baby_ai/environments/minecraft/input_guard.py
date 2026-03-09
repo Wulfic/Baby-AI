@@ -280,9 +280,17 @@ class InputGuard:
                     return _BLOCK
 
                 if vk == _VK_P:
-                    # Ctrl+P  →  toggle AI pause
+                    # Ctrl+P  →  toggle AI pause + unlock/lock controls
                     self._ai_paused = not self._ai_paused
-                    state = "PAUSED" if self._ai_paused else "RUNNING"
+                    if self._ai_paused:
+                        # Pausing → unlock controls so user can play
+                        self._kb_blocked = False
+                        self._mouse_blocked = False
+                    else:
+                        # Resuming → re-lock controls
+                        self._kb_blocked = True
+                        self._mouse_blocked = True
+                    state = "PAUSED (controls unlocked)" if self._ai_paused else "RUNNING (controls locked)"
                     log.info("Ctrl+P pressed — AI %s", state)
                     return _BLOCK
 

@@ -280,10 +280,45 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     # ── UI Control Panel + Reward Toggles ───────────────────────
     from baby_ai.ui.control_panel import AIControlPanel
     from baby_ai.ui.reward_toggles import RewardToggleState
+    from baby_ai.ui.controls_state import AIControlsState
+    from baby_ai.environments.minecraft.input_controller import set_controls_state
 
     toggle_state = RewardToggleState()
-    control_panel = AIControlPanel(toggle_state=toggle_state)
+    controls_state = AIControlsState()
+
+    # Wire AI Controls state into the input controller so it can
+    # filter disabled keys/buttons/look before sending them.
+    set_controls_state(controls_state)
+
+    # Set-home callback: grabs current coords and updates env.
+    def _on_set_home() -> None:
+        env.set_home()
+
+    control_panel = AIControlPanel(
+        toggle_state=toggle_state,
+        controls_state=controls_state,
+        on_set_home=_on_set_home,
+        input_guard=env._guard,
+    )
     control_panel.start()
+
+    # ── 10-second warm-up (no input lock, no training) ──────────
+    # Give the user time to arrange windows, alt-tab, etc.
+    # Temporarily disable the input guard so keyboard/mouse are free.
+    _WARMUP_SEC = 10
+    if env._guard is not None:
+        env._guard._kb_blocked = False
+        env._guard._mouse_blocked = False
+    log.info("")
+    for remaining in range(_WARMUP_SEC, 0, -1):
+        log.info("  AI starts in %d s — arrange your windows now …", remaining)
+        time.sleep(1.0)
+    log.info("  GO!  Training/inference starting now.")
+    log.info("")
+    # Re-enable input guard blocking.
+    if env._guard is not None:
+        env._guard._kb_blocked = True
+        env._guard._mouse_blocked = True
 
     # ── Training loop ──────────────────────────────────────────
     log.info("Minecraft training loop started — Ctrl+C to stop.")

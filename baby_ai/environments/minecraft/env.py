@@ -540,6 +540,22 @@ class MinecraftEnv(GameEnvironment):
         """Return the last captured BGR frame for display."""
         return self._last_frame
 
+    def set_home(self) -> None:
+        """Set the home location to the player's current position.
+
+        Called from the UI 'Set New Home' button.  Grabs the latest
+        known coordinates from the mod bridge position updates and
+        makes them the new home base for the proximity reward channel.
+        """
+        if self._player_x is not None and self._player_z is not None:
+            self._home_x = self._player_x
+            self._home_z = self._player_z
+            log.info("Home location updated: (%.1f, %.1f)",
+                     self._home_x, self._home_z)
+        else:
+            log.warning("Cannot set home — player position not yet known "
+                        "(waiting for first position_update from mod).")
+
     # ── Internals ───────────────────────────────────────────────
 
     def _observe(self) -> Dict[str, torch.Tensor]:
