@@ -160,6 +160,18 @@ class LearnerThread:
 
             total_loss = loss_dict["total"]
 
+            # Guard: skip backward when the loss has no computation graph.
+            # This happens when the batch lacks "action"/"reward" keys
+            # (e.g. incomplete transitions) and EWC isn't initialized,
+            # leaving loss as a detached scalar 0.
+            if total_loss.grad_fn is None and not total_loss.requires_grad:
+                log.debug(
+                    "Skipping backward at step %d: loss has no grad_fn "
+                    "(batch keys: %s)", self._step, list(batch.keys()),
+                )
+                self._step += 1
+                return
+
             # Backward with gradient accumulation
             if self.scaler is not None:
                 self.scaler.scale(total_loss / self.config.gradient_accumulation_steps).backward()
@@ -249,8 +261,10 @@ class LearnerThread:
         # clamp so the value head can slightly overshoot without penalty.
         value = 7.0 * torch.tanh(value / 7.0)
 
-        # Policy loss (if we have targets)
-        loss = torch.tensor(0.0, device=self.device)
+        # Anchor loss to the computation graph via a zero derived from
+        # model output.  This ensures loss.grad_fn is set even when no
+        # policy / ICM branch fires, so backward() won't crash.
+        loss = (action_logits.sum() * 0.0).squeeze()
 
         if "action" in batch and "reward" in batch:
             # Actor-critic loss
@@ -312,9 +326,10 @@ class LearnerThread:
             if isinstance(values[0], torch.Tensor):
                 try:
                     batch[key] = torch.stack(values).to(self.device)
-                except RuntimeError:
-                    # Can't stack (variable sizes) — skip
-                    pass
+                except RuntimeError as e:
+                    # Variable-size tensors can't be stacked — skip the key
+                    # but log it so shape mismatches are visible.
+                    log.debug("Skipping key '%s' in collate: %s", key, e)
             elif isinstance(values[0], (int, float)):
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)
 

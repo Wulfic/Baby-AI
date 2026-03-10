@@ -443,11 +443,17 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             # ── Store transition (using PREVIOUS step's data) ───
             if prev_fused is not None and fused is not None:
                 with torch.no_grad():
-                    icm_out = icm(
-                        prev_fused.to(config.device),
-                        fused.to(config.device),
-                        prev_action.to(config.device),
-                    )
+                    # Ensure all inputs have a batch dimension (B=1)
+                    _icm_state = prev_fused.to(config.device)
+                    _icm_next  = fused.to(config.device)
+                    _icm_act   = prev_action.to(config.device)
+                    if _icm_state.dim() == 1:
+                        _icm_state = _icm_state.unsqueeze(0)
+                    if _icm_next.dim() == 1:
+                        _icm_next = _icm_next.unsqueeze(0)
+                    if _icm_act.dim() == 0:
+                        _icm_act = _icm_act.unsqueeze(0)
+                    icm_out = icm(_icm_state, _icm_next, _icm_act)
                 raw_ir = icm_out["curiosity_reward"].mean().item()
                 # Running RMS normalisation — keeps magnitude stable
                 # even while the forward model is poorly trained.
@@ -564,7 +570,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         fname = _ss_dir / f"distill_{cur_distill:04d}_{ts}.png"
                         cv2.imwrite(str(fname), frame)
-                        log.info("Distillation screenshot saved → %s", fname)
+                        log.info("Distillation screenshot saved -> %s", fname)
                 except Exception as _ss_err:
                     log.warning("Failed to save distillation screenshot: %s", _ss_err)
 
