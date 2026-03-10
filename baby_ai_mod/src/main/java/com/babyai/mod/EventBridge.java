@@ -246,4 +246,27 @@ public class EventBridge {
         j.addProperty("tick", tick);
         broadcast(j);
     }
+
+    /**
+     * Fired when the player sets a home waypoint via {@code /sethome}
+     * or the GUI "Set New Home" button.
+     *
+     * <p>The Python agent uses this to update the home-proximity
+     * reward channel so the AI is incentivised to stay near the
+     * chosen base.
+     *
+     * @param x    Home X coordinate.
+     * @param y    Home Y coordinate.
+     * @param z    Home Z coordinate.
+     * @param tick Current server tick.
+     */
+    public void onHomeSet(double x, double y, double z, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "home_set");
+        j.addProperty("x", x);
+        j.addProperty("y", y);
+        j.addProperty("z", z);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
 }

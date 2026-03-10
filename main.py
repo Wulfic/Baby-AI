@@ -297,19 +297,38 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     # Wire reward weights into the env so it reads dynamic weights.
     set_reward_weights(reward_weights)
 
+    # Inject settings store into env for home location persistence.
+    env.set_settings_store(settings_store)
+
     # Set-home callback: grabs current coords and updates env.
     def _on_set_home() -> None:
         env.set_home()
+
+    # Manual home coordinate callback from GUI entry fields.
+    def _on_set_home_coords(x: float, y: float, z: float) -> None:
+        env.set_home_coords(x, y, z)
 
     control_panel = AIControlPanel(
         toggle_state=toggle_state,
         controls_state=controls_state,
         reward_weights=reward_weights,
         on_set_home=_on_set_home,
+        on_set_home_coords=_on_set_home_coords,
         input_guard=env._guard,
         settings_store=settings_store,
     )
     control_panel.start()
+
+    # Wire home-change notifications so the GUI updates when
+    # /sethome is used in-game or set_home() is called.
+    def _notify_gui_home_changed() -> None:
+        hx, hy, hz = env.get_home()
+        if hx is not None and hz is not None:
+            control_panel.update_home_display(
+                hx, hy if hy is not None else 64.0, hz
+            )
+
+    env.set_on_home_changed(_notify_gui_home_changed)
 
     # ── 10-second warm-up (no input lock, no training) ──────────
     # Give the user time to arrange windows, alt-tab, etc.

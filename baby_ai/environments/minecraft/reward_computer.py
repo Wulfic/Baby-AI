@@ -220,9 +220,22 @@ class RewardComputer:
         mod_food = [e for e in mod_events if e.get("event") == "food_changed"]
         mod_xp = [e for e in mod_events if e.get("event") == "xp_gained"]
         mod_position = [e for e in mod_events if e.get("event") == "position_update"]
+        mod_home_set = [e for e in mod_events if e.get("event") == "home_set"]
 
         # ── Update player position ──────────────────────────────
         self._process_position_updates(mod_position, env)
+
+        # ── Process /sethome from mod ────────────────────────
+        if mod_home_set:
+            latest = mod_home_set[-1]
+            env._home_x = latest.get("x")
+            env._home_z = latest.get("z")
+            env._home_y = latest.get("y")
+            log.info("Home location updated via mod event: (%.1f, %.1f)",
+                     env._home_x, env._home_z)
+            # Persist to settings store if available
+            if hasattr(env, '_persist_home'):
+                env._persist_home()
 
         # Reset attack streak when a block actually breaks
         if mod_blocks_broken:
@@ -481,7 +494,13 @@ class RewardComputer:
         if env._home_x is None and env._player_x is not None:
             env._home_x = env._player_x
             env._home_z = env._player_z
+            env._home_y = env._player_y
             log.info("Home location set: (%.1f, %.1f)", env._home_x, env._home_z)
+            # Persist and notify GUI
+            if hasattr(env, '_persist_home'):
+                env._persist_home()
+            if hasattr(env, '_on_home_changed') and env._on_home_changed:
+                env._on_home_changed()
 
         # Calibrate underground threshold
         if not env._surface_y_calibrated and env._player_y is not None:

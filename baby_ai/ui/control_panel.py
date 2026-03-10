@@ -108,6 +108,9 @@ class AIControlPanel:
     on_set_home : callable, optional
         Invoked when the user clicks *Set New Home*.  Should grab the
         current player coordinates and update the env's home location.
+    on_set_home_coords : callable, optional
+        Invoked when the user enters manual home coordinates via the
+        GUI.  Signature: ``(x: float, y: float, z: float) -> None``.
     input_guard : object, optional
         Reference to the :class:`InputGuard` so the Pause button can
         toggle keyboard/mouse blocking in sync.
@@ -122,6 +125,7 @@ class AIControlPanel:
         controls_state: Optional[AIControlsState] = None,
         reward_weights: Optional[RewardWeightsState] = None,
         on_set_home: Optional[Callable[[], None]] = None,
+        on_set_home_coords: Optional[Callable] = None,
         input_guard: Optional[object] = None,
         settings_store: Optional[SettingsStore] = None,
     ):
@@ -129,6 +133,7 @@ class AIControlPanel:
         self.is_stopped: bool = False
         self.on_stop = on_stop
         self.on_set_home = on_set_home
+        self.on_set_home_coords = on_set_home_coords
         self._input_guard = input_guard
 
         # Settings persistence
@@ -191,6 +196,14 @@ class AIControlPanel:
 
         # tk variable for imitation learning toggle
         self._imit_var: Optional[tk.BooleanVar] = None
+
+        # Home waypoint coordinate labels (updated when home changes)
+        self._home_x_label: Optional[tk.Label] = None
+        self._home_y_label: Optional[tk.Label] = None
+        self._home_z_label: Optional[tk.Label] = None
+        self._home_x_entry: Optional[tk.Entry] = None
+        self._home_y_entry: Optional[tk.Entry] = None
+        self._home_z_entry: Optional[tk.Entry] = None
 
     # ────────────────────────────────────────────────────────────
     # Public API
@@ -267,6 +280,76 @@ class AIControlPanel:
             relief="flat", bd=0, padx=int(8 * s), pady=int(4 * s),
         )
         self.btn_set_home.pack(side=tk.RIGHT, padx=(int(4 * s), 0))
+
+        # ── Home Waypoint section ─────────────────────────────
+        home_frame = tk.Frame(self.root, bg=_BG_GROUP,
+                              padx=int(6 * s), pady=int(4 * s))
+        home_frame.pack(fill=tk.X, pady=(int(2 * s), int(2 * s)))
+
+        home_title_row = tk.Frame(home_frame, bg=_BG_GROUP)
+        home_title_row.pack(fill=tk.X)
+
+        tk.Label(
+            home_title_row, text="\U0001f3e0 HOME WAYPOINT",
+            font=("Segoe UI", int(8 * s), "bold"),
+            bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
+        ).pack(side=tk.LEFT)
+
+        # Apply button for manual coordinate entry
+        tk.Button(
+            home_title_row, text="Apply",
+            command=self._on_apply_home_coords,
+            bg=_ACCENT, fg="#1e1e2e", activebackground=_ACCENT_DARK,
+            font=("Segoe UI", int(7 * s), "bold"),
+            relief="flat", bd=0, padx=int(6 * s), pady=int(1 * s),
+        ).pack(side=tk.RIGHT, padx=(int(4 * s), 0))
+
+        # Coordinate display/entry row
+        coord_row = tk.Frame(home_frame, bg=_BG_GROUP)
+        coord_row.pack(fill=tk.X, pady=(int(2 * s), 0))
+
+        # Restore saved home or show placeholder
+        saved_home = self._store.get("home_location")
+        hx_text = f"{saved_home['x']:.1f}" if saved_home and saved_home.get('x') is not None else "—"
+        hy_text = f"{saved_home['y']:.1f}" if saved_home and saved_home.get('y') is not None else "—"
+        hz_text = f"{saved_home['z']:.1f}" if saved_home and saved_home.get('z') is not None else "—"
+
+        _entry_font = ("Consolas", int(9 * s))
+        _label_font = ("Segoe UI", int(8 * s), "bold")
+        _entry_width = 8
+
+        tk.Label(coord_row, text="X:", font=_label_font,
+                 bg=_BG_GROUP, fg=_FG).pack(side=tk.LEFT, padx=(0, int(2 * s)))
+        self._home_x_entry = tk.Entry(
+            coord_row, width=_entry_width, font=_entry_font,
+            bg=_BG_FRAME, fg=_ACCENT, insertbackground=_ACCENT,
+            relief="flat", bd=1, highlightthickness=1,
+            highlightbackground=_ACCENT_DARK, highlightcolor=_ACCENT,
+        )
+        self._home_x_entry.insert(0, hx_text)
+        self._home_x_entry.pack(side=tk.LEFT, padx=(0, int(6 * s)))
+
+        tk.Label(coord_row, text="Y:", font=_label_font,
+                 bg=_BG_GROUP, fg=_FG).pack(side=tk.LEFT, padx=(0, int(2 * s)))
+        self._home_y_entry = tk.Entry(
+            coord_row, width=_entry_width, font=_entry_font,
+            bg=_BG_FRAME, fg=_ACCENT, insertbackground=_ACCENT,
+            relief="flat", bd=1, highlightthickness=1,
+            highlightbackground=_ACCENT_DARK, highlightcolor=_ACCENT,
+        )
+        self._home_y_entry.insert(0, hy_text)
+        self._home_y_entry.pack(side=tk.LEFT, padx=(0, int(6 * s)))
+
+        tk.Label(coord_row, text="Z:", font=_label_font,
+                 bg=_BG_GROUP, fg=_FG).pack(side=tk.LEFT, padx=(0, int(2 * s)))
+        self._home_z_entry = tk.Entry(
+            coord_row, width=_entry_width, font=_entry_font,
+            bg=_BG_FRAME, fg=_ACCENT, insertbackground=_ACCENT,
+            relief="flat", bd=1, highlightthickness=1,
+            highlightbackground=_ACCENT_DARK, highlightcolor=_ACCENT,
+        )
+        self._home_z_entry.insert(0, hz_text)
+        self._home_z_entry.pack(side=tk.LEFT)
 
         self._sep(self.root)
 
@@ -665,6 +748,49 @@ class AIControlPanel:
         if self.on_set_home:
             self.on_set_home()
 
+    def _on_apply_home_coords(self) -> None:
+        """Apply manually-entered home coordinates from the GUI fields."""
+        try:
+            x_text = self._home_x_entry.get().strip() if self._home_x_entry else ""
+            y_text = self._home_y_entry.get().strip() if self._home_y_entry else ""
+            z_text = self._home_z_entry.get().strip() if self._home_z_entry else ""
+
+            if not x_text or not z_text or x_text == "\u2014" or z_text == "\u2014":
+                return
+
+            x = float(x_text)
+            y = float(y_text) if y_text and y_text != "\u2014" else 64.0
+            z = float(z_text)
+
+            if self.on_set_home_coords:
+                self.on_set_home_coords(x, y, z)
+        except (ValueError, TypeError):
+            pass  # Invalid coordinate input — silently ignore
+
+    def update_home_display(self, x: float, y: float, z: float) -> None:
+        """Update the home coordinate entry fields from another thread.
+
+        Called when the home location changes via /sethome or the
+        Set New Home button, so the GUI reflects the current value.
+        """
+        def _update():
+            if self._home_x_entry is not None:
+                self._home_x_entry.delete(0, tk.END)
+                self._home_x_entry.insert(0, f"{x:.1f}")
+            if self._home_y_entry is not None:
+                self._home_y_entry.delete(0, tk.END)
+                self._home_y_entry.insert(0, f"{y:.1f}")
+            if self._home_z_entry is not None:
+                self._home_z_entry.delete(0, tk.END)
+                self._home_z_entry.insert(0, f"{z:.1f}")
+
+        # Schedule on the tk thread to be safe.
+        try:
+            if self.root is not None:
+                self.root.after(0, _update)
+        except Exception:
+            pass
+
     def _set_all_controls(self, enabled: bool) -> None:
         """Enable or disable all AI controls and refresh checkboxes."""
         self.controls_state.set_all(enabled)
@@ -763,6 +889,9 @@ class AIControlPanel:
             self._lr_var = None
             self._lr_label = None
             self._imit_var = None
+            self._home_x_entry = None
+            self._home_y_entry = None
+            self._home_z_entry = None
             if self.root is not None:
                 self.root.quit()
                 self.root.destroy()

@@ -1,6 +1,7 @@
 package com.babyai.mod;
 
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -145,15 +146,42 @@ public class BabyAiMod implements ModInitializer {
                 // Python trainer never has to deal with the death
                 // screen.  Scheduled for next tick to ensure the
                 // death event processing is complete.
+                //
+                // If a home waypoint is set, teleport the player
+                // there after respawning instead of the world spawn.
                 player.getServer().execute(() -> {
                     if (player.isDead()) {
-                        player.getServer().getPlayerManager()
+                        ServerPlayerEntity respawned = player.getServer()
+                              .getPlayerManager()
                               .respawnPlayer(player, false, Entity.RemovalReason.KILLED);
                         LOGGER.info("[Baby-AI] Auto-respawned player");
+
+                        // Teleport to home waypoint if one exists.
+                        HomeManager.HomePos home = HomeManager.INSTANCE
+                                .getHome(respawned.getUuid());
+                        if (home != null) {
+                            respawned.teleport(
+                                respawned.getServerWorld(),
+                                home.x(), home.y(), home.z(),
+                                java.util.Set.of(),
+                                respawned.getYaw(),
+                                respawned.getPitch()
+                            );
+                            LOGGER.info("[Baby-AI] Teleported to home after respawn: ({}, {}, {})",
+                                        home.x(), home.y(), home.z());
+                        }
                     }
                 });
             }
         });
+
+        // ── /sethome and /home commands ────────────────────────
+        CommandRegistrationCallback.EVENT.register(
+            (dispatcher, registryAccess, environment) -> {
+                SetHomeCommand.register(dispatcher);
+                HomeCommand.register(dispatcher);
+            }
+        );
 
         // ── Shutdown cleanup ─────────────────────────────────
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {

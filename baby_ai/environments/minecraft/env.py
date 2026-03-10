@@ -251,10 +251,18 @@ class MinecraftEnv(GameEnvironment):
         # home get a small proximity bonus; actions far away get a
         # gentle distance penalty that grows with distance.
         self._home_x: Optional[float] = None
+        self._home_y: Optional[float] = None
         self._home_z: Optional[float] = None
         self._player_x: Optional[float] = None
         self._player_z: Optional[float] = None
         self._home_radius: float = 100.0  # blocks — full bonus zone
+
+        # ── Settings store (injected via set_settings_store) ─────
+        self._settings_store: Optional[Any] = None
+
+        # ── Home-change callback (set via set_on_home_changed) ───
+        # Called whenever home location changes so the GUI can update.
+        self._on_home_changed: Optional[Any] = None
 
         # ── Chunk-based exploration tracking ─────────────────────
         # A Minecraft chunk is 16×16 blocks.  We track:
@@ -627,15 +635,66 @@ class MinecraftEnv(GameEnvironment):
         Called from the UI 'Set New Home' button.  Grabs the latest
         known coordinates from the mod bridge position updates and
         makes them the new home base for the proximity reward channel.
+        Also persists the location to the settings store.
         """
         if self._player_x is not None and self._player_z is not None:
             self._home_x = self._player_x
             self._home_z = self._player_z
+            self._home_y = self._player_y
             log.info("Home location updated: (%.1f, %.1f)",
                      self._home_x, self._home_z)
+            self._persist_home()
+            if self._on_home_changed:
+                self._on_home_changed()
         else:
             log.warning("Cannot set home — player position not yet known "
                         "(waiting for first position_update from mod).")
+
+    def set_home_coords(self, x: float, y: float, z: float) -> None:
+        """Set the home location to specific coordinates.
+
+        Called from the GUI manual coordinate entry fields.
+        """
+        self._home_x = x
+        self._home_y = y
+        self._home_z = z
+        log.info("Home location set manually: (%.1f, %.1f, %.1f)", x, y, z)
+        self._persist_home()
+        if self._on_home_changed:
+            self._on_home_changed()
+
+    def get_home(self) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """Return the current home coordinates (x, y, z)."""
+        return self._home_x, self._home_y, self._home_z
+
+    def set_settings_store(self, store: Any) -> None:
+        """Inject the settings store for home location persistence."""
+        self._settings_store = store
+        # Restore persisted home location if available
+        saved = store.get("home_location")
+        if saved and isinstance(saved, dict):
+            sx = saved.get("x")
+            sz = saved.get("z")
+            sy = saved.get("y")
+            if sx is not None and sz is not None:
+                self._home_x = float(sx)
+                self._home_z = float(sz)
+                self._home_y = float(sy) if sy is not None else None
+                log.info("Restored persisted home location: (%.1f, %.1f)",
+                         self._home_x, self._home_z)
+
+    def set_on_home_changed(self, callback: Any) -> None:
+        """Register a callback for when home location changes."""
+        self._on_home_changed = callback
+
+    def _persist_home(self) -> None:
+        """Save current home location to the settings store."""
+        if self._settings_store is not None and self._home_x is not None:
+            self._settings_store.set("home_location", {
+                "x": round(self._home_x, 2),
+                "y": round(self._home_y, 2) if self._home_y is not None else None,
+                "z": round(self._home_z, 2),
+            })
 
     def get_look_delta(self) -> tuple[float, float]:
         """
