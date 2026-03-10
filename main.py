@@ -449,7 +449,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 # Penalty channels (subtracted)
                 penalty_total = (
                     rb.get("idle_penalty", 0.0)    * w.get("idle_penalty", 2.0)
-                    # death_penalty removed — mod auto-respawns
+                    + rb.get("death_penalty", 0.0) * w.get("death_penalty", 5.0)
                     + rb.get("stagnation_penalty", 0.0) * w.get("stagnation_penalty", 3.0)
                     + rb.get("item_drop_penalty", 0.0) * w.get("item_drop_penalty", 3.0)
                     + rb.get("damage_taken", 0.0)  * w.get("damage_taken", 1.5)

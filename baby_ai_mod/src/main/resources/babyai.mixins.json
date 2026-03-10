@@ -7,6 +7,9 @@
     "ItemPickupMixin",
     "CraftingMixin"
   ],
+  "client": [
+    "DeathScreenMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }

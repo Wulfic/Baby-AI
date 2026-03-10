@@ -26,24 +26,27 @@ from typing import Callable, Optional
 
 from baby_ai.ui.reward_toggles import (
     CHANNELS,
-    GROUPS,
     RewardToggleState,
 )
 from baby_ai.ui.controls_state import (
     AI_CONTROLS,
-    CONTROL_GROUPS,
     AIControlsState,
 )
-from baby_ai.ui.reward_weights import (
-    REWARD_WEIGHTS,
-    WEIGHT_CHILDREN,
-    WEIGHT_GROUPS,
-    PARENT_KEYS,
-    TOP_LEVEL_WEIGHTS,
-    RewardWeightsState,
-)
+from baby_ai.ui.reward_weights import RewardWeightsState
 from baby_ai.ui.settings_store import SettingsStore
-
+from baby_ai.ui.theme import (
+    get_dpi_scale as _get_dpi_scale,
+    BG as _BG, BG_FRAME as _BG_FRAME, BG_GROUP as _BG_GROUP,
+    FG as _FG, FG_DIM as _FG_DIM,
+    ACCENT as _ACCENT, ACCENT_DARK as _ACCENT_DARK,
+    PAUSE_ON as _PAUSE_ON, STOP_BG as _STOP_BG,
+    BTN_BG as _BTN_BG, BTN_FG as _BTN_FG,
+    CHANNEL_COLS as _CHANNEL_COLS,
+)
+from baby_ai.ui.weights_tab import (
+    build_weights_tab as _build_weights_tab_impl,
+    toggle_expand as _toggle_expand_impl,
+)
 
 # ── Thread-safe learning rate holder ─────────────────────────
 _DEFAULT_LR = 5e-5        # medium-low constant LR
@@ -64,41 +67,7 @@ def set_live_lr(value: float) -> None:
         _live_lr = value
 
 
-def _get_dpi_scale() -> float:
-    """Return a UI scale factor based on the primary monitor DPI.
-
-    On standard 96-dpi screens this returns 1.0.
-    On 4K / HiDPI screens (typically 144-192 dpi) it returns 1.5-2.0+.
-    Falls back to 1.0 if DPI detection fails.
-    """
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    try:
-        hdc = ctypes.windll.user32.GetDC(0)
-        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
-        ctypes.windll.user32.ReleaseDC(0, hdc)
-        return max(dpi / 96.0, 1.0)
-    except Exception:
-        return 1.0
-
-
-# ── Colour palette (dark-mode inspired) ────────────────────────
-_BG          = "#1e1e2e"
-_BG_FRAME    = "#2a2a3c"
-_BG_GROUP    = "#33334d"
-_FG          = "#cdd6f4"
-_FG_DIM      = "#6c7086"
-_ACCENT      = "#89b4fa"
-_ACCENT_DARK = "#585b70"
-_PAUSE_ON    = "#a6e3a1"
-_STOP_BG     = "#f38ba8"
-_BTN_BG      = "#45475a"
-_BTN_FG      = "#cdd6f4"
-
-# Number of columns for the reward-channel grid.
-_CHANNEL_COLS = 3
+# Theme constants and DPI helper are now imported from baby_ai.ui.theme.
 
 
 class AIControlPanel:
@@ -195,6 +164,9 @@ class AIControlPanel:
         # training loop signals shutdown from another thread.
         self._close_requested: bool = False
 
+        # Reference to the daemon thread running tkinter mainloop.
+        self._thread: Optional[threading.Thread] = None
+
         # tk variables for LR (initialised in _build_controls_tab)
         self._lr_var: Optional[tk.DoubleVar] = None
         self._lr_label: Optional[tk.Label] = None
@@ -205,8 +177,8 @@ class AIControlPanel:
 
     def start(self) -> None:
         """Launch the UI on a daemon thread."""
-        thread = threading.Thread(target=self._run_ui, daemon=True)
-        thread.start()
+        self._thread = threading.Thread(target=self._run_ui, daemon=True)
+        self._thread.start()
 
     def update_live_stats(self, reward: float, step: int) -> None:
         """Push live stats from the training loop (thread-safe)."""
@@ -692,6 +664,11 @@ class AIControlPanel:
         guaranteeing the destroy runs on the tk event-loop thread
         regardless of whether ``root.after()`` works cross-thread.
         Also attempts the direct ``root.after`` approach as a fast-path.
+
+        After signalling, **joins the UI thread** so that all Tcl
+        resources are freed on the thread that created them before
+        the caller (main thread) continues to exit — preventing
+        ``Tcl_AsyncDelete: async handler deleted by the wrong thread``.
         """
         self.is_stopped = True
         self._close_requested = True
@@ -701,6 +678,10 @@ class AIControlPanel:
                 self.root.after(0, self._destroy)
         except Exception:
             pass
+        # Wait for the tk thread to finish so Tcl cleanup happens
+        # on the correct thread before the process tears down.
+        if hasattr(self, "_thread") and self._thread is not None:
+            self._thread.join(timeout=3.0)
 
     def _destroy(self) -> None:
         """Destroy the root window (must run on the tk thread).
@@ -765,217 +746,16 @@ class AIControlPanel:
         self._store.set("reward_weights", self.reward_weights.snapshot())
 
     # ────────────────────────────────────────────────────────────
-    # Tab builder: Reward Weights
+    # Tab builder: Reward Weights (delegated to weights_tab module)
     # ────────────────────────────────────────────────────────────
 
     def _build_weights_tab(self, parent: tk.Frame) -> None:
-        """Build the reward weight sliders inside *parent*.
-
-        Top-level weights are shown normally.  Weights that have
-        sub-weights (children) get a clickable ``▸``/``▾`` toggle:
-        clicking it reveals/hides the indented child sliders.
-        """
-        s = self._scale
-
-        # ── Header with Reset Defaults button ──────────────────
-        header = tk.Frame(parent, bg=_BG)
-        header.pack(fill=tk.X, pady=(int(4 * s), int(3 * s)))
-
-        tk.Label(
-            header, text="REWARD WEIGHT MULTIPLIERS",
-            font=("Segoe UI", int(9 * s), "bold"),
-            bg=_BG, fg=_FG_DIM, anchor="w",
-        ).pack(side=tk.LEFT)
-
-        tk.Button(
-            header, text="Reset Defaults",
-            command=self._reset_weights_to_defaults,
-            bg=_STOP_BG, fg="#1e1e2e", activebackground="#eba0ac",
-            font=("Segoe UI", int(8 * s), "bold"),
-            relief="flat", bd=0, padx=int(6 * s), pady=int(2 * s),
-        ).pack(side=tk.RIGHT, padx=(int(4 * s), 0))
-
-        # ── Scrollable area ────────────────────────────────────
-        canvas_frame = tk.Frame(parent, bg=_BG)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, pady=(0, int(4 * s)))
-
-        canvas = tk.Canvas(canvas_frame, bg=_BG, highlightthickness=0, bd=0)
-        scrollbar = tk.Scrollbar(
-            canvas_frame, orient="vertical", command=canvas.yview,
-        )
-        inner = tk.Frame(canvas, bg=_BG)
-
-        inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Mouse-wheel scrolling.
-        def _on_mousewheel_weights(event: tk.Event) -> None:
-            canvas.yview_scroll(-1 * (event.delta // 120), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel_weights)
-
-        # ── Build groups with sliders ──────────────────────────
-        snapshot = self.reward_weights.snapshot()
-
-        from collections import OrderedDict
-        grouped: OrderedDict[str, list] = OrderedDict()
-        for w in TOP_LEVEL_WEIGHTS:
-            grouped.setdefault(w.group, []).append(w)
-
-        for group_name, weights in grouped.items():
-            grp_frame = tk.Frame(
-                inner, bg=_BG_GROUP,
-                padx=int(6 * s), pady=int(4 * s),
-            )
-            grp_frame.pack(fill=tk.X, padx=int(3 * s), pady=int(3 * s))
-
-            # Group header
-            tk.Label(
-                grp_frame, text=group_name.upper(),
-                font=("Segoe UI", int(8 * s), "bold"),
-                bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
-            ).pack(fill=tk.X)
-
-            for w in weights:
-                has_children = w.key in WEIGHT_CHILDREN
-                self._build_weight_row(grp_frame, w, snapshot, indent=0, has_children=has_children)
-
-                # If this parent has sub-weights, build them inside
-                # a collapsible frame (starts collapsed).
-                if has_children:
-                    sub_frame = tk.Frame(grp_frame, bg=_BG_GROUP)
-                    # Initially hidden — don't pack yet.
-                    self._sub_frames[w.key] = sub_frame
-                    self._expand_states[w.key] = False
-
-                    for child in WEIGHT_CHILDREN[w.key]:
-                        self._build_weight_row(sub_frame, child, snapshot, indent=1, has_children=False)
-
-    # ── Shared helper: build one slider row ─────────────────────
-
-    def _build_weight_row(
-        self,
-        parent_frame: tk.Frame,
-        w,  # WeightInfo
-        snapshot: dict,
-        *,
-        indent: int = 0,
-        has_children: bool = False,
-    ) -> None:
-        """Create a single label + slider + value row.
-
-        ``indent`` > 0 indents the row (sub-weight).
-        ``has_children`` adds a ``▸``/``▾`` expand toggle button.
-        """
-        s = self._scale
-        left_pad = int((4 + indent * 16) * s)
-
-        row = tk.Frame(parent_frame, bg=_BG_GROUP)
-        row.pack(fill=tk.X, padx=(left_pad, 0), pady=(int(1 * s), 0))
-        row.columnconfigure(2, weight=1)  # slider column stretches
-
-        # Optional expand/collapse toggle (only on parents)
-        if has_children:
-            arrow_lbl = tk.Label(
-                row, text="\u25b8",  # ▸ (collapsed)
-                font=("Segoe UI", int(9 * s)),
-                bg=_BG_GROUP, fg=_ACCENT, anchor="w",
-                cursor="hand2",
-            )
-            arrow_lbl.grid(row=0, column=0, sticky="w", padx=(0, int(2 * s)))
-            arrow_lbl.bind(
-                "<Button-1>",
-                lambda e, k=w.key, lbl=arrow_lbl: self._toggle_expand(k, lbl),
-            )
-        else:
-            # Spacer so child rows align with parent slider
-            spacer_w = int(12 * s) if indent > 0 else 0
-            if spacer_w > 0:
-                tk.Label(
-                    row, text="\u2022",  # bullet
-                    font=("Segoe UI", int(7 * s)),
-                    bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
-                    width=1,
-                ).grid(row=0, column=0, sticky="w", padx=(0, int(2 * s)))
-
-        # Label
-        prefix = "\u2212 " if w.is_penalty else "+ "
-        lbl_text = prefix + w.label
-        tk.Label(
-            row, text=lbl_text,
-            font=("Segoe UI", int(8 * s)),
-            bg=_BG_GROUP, fg=_FG, anchor="w",
-        ).grid(row=0, column=1, sticky="w",
-               padx=(0, int(4 * s)),
-               ipadx=int(2 * s))
-
-        # Current value label — right-aligned
-        cur_val = snapshot.get(w.key, w.default)
-        # Use more decimal places for very small step sizes
-        fmt = "{:.2f}" if w.step < 0.05 else "{:.1f}"
-        val_label = tk.Label(
-            row, text=fmt.format(cur_val),
-            font=("Consolas", int(9 * s)),
-            bg=_BG_GROUP, fg=_ACCENT, anchor="e",
-            width=5,
-        )
-        val_label.grid(row=0, column=3, sticky="e",
-                       padx=(int(4 * s), 0))
-        self._weight_labels[w.key] = val_label
-
-        # Scale (slider)
-        var = tk.DoubleVar(value=cur_val)
-        self._weight_vars[w.key] = var
-
-        slider = tk.Scale(
-            row,
-            from_=w.min_val,
-            to=w.max_val,
-            resolution=w.step,
-            orient=tk.HORIZONTAL,
-            variable=var,
-            showvalue=False,
-            command=lambda val, k=w.key: self._on_weight_change(k, val),
-            bg=_ACCENT,               # thumb color
-            fg=_FG,
-            troughcolor=_ACCENT_DARK,  # visible groove
-            activebackground="#b4d0fb", # thumb hover
-            highlightthickness=0,
-            bd=0,
-            width=int(12 * s),         # thumb height
-            sliderlength=int(16 * s),  # thumb width
-            sliderrelief="raised",
-        )
-        slider.grid(row=0, column=2, sticky="ew",
-                    padx=(int(2 * s), int(2 * s)))
+        """Build the reward weight sliders inside *parent*."""
+        _build_weights_tab_impl(self, parent)
 
     def _toggle_expand(self, parent_key: str, arrow_label: tk.Label) -> None:
         """Expand or collapse the sub-weight rows for *parent_key*."""
-        expanded = self._expand_states.get(parent_key, False)
-        sub_frame = self._sub_frames.get(parent_key)
-        if sub_frame is None:
-            return
-
-        if expanded:
-            # Collapse
-            sub_frame.pack_forget()
-            arrow_label.config(text="\u25b8")  # ▸
-            self._expand_states[parent_key] = False
-        else:
-            # Expand — pack right after the parent row.
-            # We need it to appear in the right place inside its
-            # group frame.  Since pack ordering is insertion order,
-            # we pack after the parent row's position.
-            sub_frame.pack(fill=tk.X, padx=(int(4 * self._scale), 0), pady=0)
-            arrow_label.config(text="\u25be")  # ▾
-            self._expand_states[parent_key] = True
+        _toggle_expand_impl(self, parent_key, arrow_label)
 
     # ────────────────────────────────────────────────────────────
     # Helpers

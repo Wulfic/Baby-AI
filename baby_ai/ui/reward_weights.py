@@ -78,6 +78,7 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("creative_sequence", "Creative Sequence",  "Creation",     6.0,    0.0, 30.0,   0.5),
 
     # ── Penalties ───────────────────────────────────────────────
+    WeightInfo("death_penalty",      "Death Penalty",      "Penalties",    5.0,   0.0, 20.0,  0.5, is_penalty=True),
     WeightInfo("idle_penalty",       "Idle Penalty",       "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("stagnation_penalty", "Stagnation Penalty", "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
