@@ -43,6 +43,12 @@ class TeacherModel(BabyAgentBase):
             audio_width_mult=2.5,
             code_hidden_dim=config.encoder.code_embed_dim * 2,
             code_num_layers=5,
+            # Jamba temporal core (Top-2 MoE, 8 experts)
+            temporal_type=config.temporal_type,
+            jamba_config=config.jamba,
+            # Diffusion policy (continuous actions, 20 DDIM steps)
+            policy_type=config.policy_type,
+            diffusion_config=config.diffusion,
         )
 
     def get_distillation_targets(

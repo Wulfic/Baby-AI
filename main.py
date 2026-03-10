@@ -216,6 +216,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     """
     from baby_ai.environments.minecraft import MinecraftEnv
     from baby_ai.environments.minecraft.actions import action_name, match_player_action
+    from baby_ai.environments.minecraft.action_decoder import continuous_action_name
     from baby_ai.config import CHECKPOINT_DIR
 
     mc = config.minecraft
@@ -437,7 +438,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
             # ── Model inference ──────────────────────────────────
             result = orchestrator.step(obs)
-            action_id = result["action"].item()
+            # Action is now a 20-dim continuous tensor from DiffusionPolicy
+            action_tensor = result["action"]   # (20,) continuous
             fused = result.get("fused")
 
             # ── Store transition (using PREVIOUS step's data) ───
@@ -451,8 +453,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         _icm_state = _icm_state.unsqueeze(0)
                     if _icm_next.dim() == 1:
                         _icm_next = _icm_next.unsqueeze(0)
-                    if _icm_act.dim() == 0:
-                        _icm_act = _icm_act.unsqueeze(0)
+                    if _icm_act.dim() == 1:
+                        _icm_act = _icm_act.unsqueeze(0)  # (20,) → (1, 20)
                     icm_out = icm(_icm_state, _icm_next, _icm_act)
                 raw_ir = icm_out["curiosity_reward"].mean().item()
                 # Running RMS normalisation — keeps magnitude stable
@@ -537,7 +539,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
             # ── Execute action in Minecraft ─────────────────────
             obs, ext_reward, done, info = env.step(
-                action_id, observation_only=_imitation_active,
+                action_tensor, observation_only=_imitation_active,
             )
             episode_steps += 1
 
@@ -590,7 +592,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     " | hbar=%.2f | height=%.2f | pitch=%.2f | home=%.2f"
                     " | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
-                    action_name(action_id),
+                    continuous_action_name(action_tensor),
                     ir_str,
                     ir_raw_str,
                     _acc["movement"],
@@ -622,11 +624,19 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
                 # Extra imitation mode info — show the player's actual action
                 if _imitation_active and prev_action is not None:
-                    player_aid = prev_action.item()
-                    log.info(
-                        "  [IMITATION] player_action=%d (%s)",
-                        player_aid, action_name(player_aid),
-                    )
+                    if prev_action.numel() == 1:
+                        # Discrete action from imitation learning
+                        player_aid = prev_action.item()
+                        log.info(
+                            "  [IMITATION] player_action=%d (%s)",
+                            player_aid, action_name(player_aid),
+                        )
+                    else:
+                        # Continuous action tensor
+                        log.info(
+                            "  [IMITATION] player_action=%s",
+                            continuous_action_name(prev_action),
+                        )
 
             # ── Episode boundary ────────────────────────────────
             max_steps = mc.max_episode_steps
@@ -666,7 +676,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 )
                 prev_action = torch.tensor(player_action_id, dtype=torch.long)
             else:
-                prev_action = result["action"]
+                prev_action = action_tensor
             prev_obs = obs
 
     except KeyboardInterrupt:

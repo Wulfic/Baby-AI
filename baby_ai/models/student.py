@@ -43,6 +43,12 @@ class StudentModel(BabyAgentBase):
             audio_width_mult=1.0,
             code_hidden_dim=config.encoder.code_embed_dim,
             code_num_layers=3,
+            # Jamba temporal core (Top-1 MoE, 4 experts)
+            temporal_type=config.temporal_type,
+            jamba_config=config.jamba,
+            # Diffusion policy (continuous actions, 3-5 DDIM steps)
+            policy_type=config.policy_type,
+            diffusion_config=config.diffusion,
         )
 
     @torch.no_grad()

@@ -198,10 +198,10 @@ class DistillationEngine:
 
     def _compute_loss(self, student_out: dict, teacher_out: dict) -> dict:
         """Compute combined distillation loss."""
-        # KL on action logits
-        action_kl = self._kl_loss(
-            student_out["action_logits"],
-            teacher_out["action_logits"],
+        # Continuous action MSE (diffusion policy outputs)
+        action_loss = F.mse_loss(
+            student_out["action"],
+            teacher_out["action"].detach(),
         )
 
         # KL on communication logits
@@ -217,13 +217,13 @@ class DistillationEngine:
         )
 
         total = (
-            self.kl_weight * (action_kl + comm_kl)
+            self.kl_weight * (action_loss + comm_kl)
             + self.feature_weight * feat_loss
         )
 
         return {
             "total": total,
-            "action_kl": action_kl,
+            "action_loss": action_loss,
             "comm_kl": comm_kl,
             "feature_loss": feat_loss,
         }

@@ -27,12 +27,13 @@ from baby_ai.models.student import StudentModel
 from baby_ai.models.teacher import TeacherModel
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.memory.consolidation import Consolidator
-from baby_ai.learning.intrinsic import ICM
+from baby_ai.learning.intrinsic import JEPACuriosity
 from baby_ai.learning.distillation import DistillationEngine
 from baby_ai.learning.rewards import RewardComposer
 from baby_ai.runtime.inference_thread import InferenceThread
 from baby_ai.runtime.learner_thread import LearnerThread
 from baby_ai.runtime.distill_thread import DistillThread
+from baby_ai.config import System2Config
 from baby_ai.utils.logging import get_logger
 from baby_ai.utils.profiling import count_parameters, full_system_report
 
@@ -75,9 +76,10 @@ class Orchestrator:
         )
 
         # --- Learning modules ---
-        self.icm = ICM(
-            state_dim=self.config.student.encoder.fused_dim,
-            action_dim=self.config.student.action_dim,
+        self.icm = JEPACuriosity(
+            world_model=self.student.predictive,
+            reward_scale=1.0,
+            max_reward=5.0,
         ).to(device)
 
         self.consolidator = Consolidator(
@@ -111,6 +113,7 @@ class Orchestrator:
             student=self.student,
             device=device,
             target_latency_ms=self.config.runtime.inference_target_ms,
+            system2_config=self.config.student.system2,
         )
 
         self.learner_thread = LearnerThread(

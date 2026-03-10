@@ -69,29 +69,22 @@ class ActionFilter:
         self,
         action: torch.Tensor,
         context: Optional[dict] = None,
-        fallback_action: int = 0,
     ) -> tuple[torch.Tensor, float]:
         """
-        Filter a batch of actions.
+        Filter a batch of continuous actions.
+
+        Continuous actions are bounded by tanh/sigmoid in the policy head,
+        so discrete rule checking is not applicable. Returns actions as-is
+        with zero penalty. Override for custom continuous safety rules.
 
         Args:
-            action: (B,) action indices.
+            action: (B, D) continuous action vectors.
             context: Optional context dict.
-            fallback_action: Safe default action if blocked.
 
         Returns:
             (filtered_actions, total_penalty)
         """
-        filtered = action.clone()
-        total_penalty = 0.0
-
-        for i in range(action.shape[0]):
-            allowed, penalty, reason = self.check(action[i].item(), context)
-            if not allowed:
-                filtered[i] = fallback_action
-                total_penalty += penalty
-
-        return filtered, total_penalty
+        return action, 0.0
 
     @staticmethod
     def _default_block_rule(action_idx: int, context: dict) -> tuple[bool, str]:

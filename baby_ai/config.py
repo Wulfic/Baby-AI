@@ -68,6 +68,49 @@ GPU_MEM_GB = (
 # ---------------------------------------------------------------------------
 
 @dataclass
+class System2Config:
+    """System 2 test-time compute — threshold-triggered latent planning."""
+    enabled: bool = True
+    uncertainty_threshold: float = 0.5   # trigger planning when uncertainty > this
+    num_trajectories: int = 8            # parallel trajectories to evaluate
+    planning_horizon: int = 5            # latent rollout steps per trajectory
+    planning_budget_ms: float = 150.0    # max time for a single planning episode
+    discount: float = 0.99              # discount factor for trajectory scoring
+    pause_game: bool = True             # send pause command to MC mod during planning
+
+
+@dataclass
+class DiffusionPolicyConfig:
+    """Diffusion policy hyperparameters for continuous action generation."""
+    action_continuous_dim: int = 20   # continuous action vector size
+    num_train_steps: int = 100        # diffusion timesteps during training
+    num_infer_steps: int = 4          # DDIM sampling steps for inference (<200ms)
+    time_embed_dim: int = 64          # sinusoidal timestep embedding dim
+    beta_start: float = 0.0001        # noise schedule start
+    beta_end: float = 0.02            # noise schedule end
+
+
+@dataclass
+class JambaConfig:
+    """Jamba architecture hyperparameters (Mamba SSM + Mixture of Experts).
+
+    Controls the Jamba temporal core that replaces the legacy GRU.
+    Interleaves Mamba-2 selective state-space blocks with sparse MoE FFNs
+    for O(1) per-step inference with infinite context caching.
+    """
+    num_layers: int = 4           # number of stacked Jamba blocks
+    d_state: int = 16             # SSM state dimension (N in Mamba notation)
+    d_conv: int = 4               # causal convolution kernel size
+    expand: int = 2               # Mamba inner dimension multiplier
+    dt_rank: int = 0              # dt projection rank (0 = auto: ceil(dim/16))
+    num_experts: int = 4          # total MoE experts per MoE layer
+    top_k_routing: int = 1        # experts activated per token
+    moe_every_n: int = 2          # MoE every N blocks (others use dense FFN)
+    ffn_mult: int = 2             # FFN hidden dimension multiplier
+    load_balance_weight: float = 0.01  # auxiliary load-balancing loss weight
+
+
+@dataclass
 class EncoderConfig:
     """Shared encoder dimensionality."""
     vision_embed_dim: int = 256
@@ -89,6 +132,17 @@ class StudentConfig:
     action_dim: int = 128  # discrete action space size
     total_target_params: str = "10-30M"
 
+    # Jamba temporal core (replaces GRU when temporal_type="jamba")
+    temporal_type: str = "jamba"  # "gru" (legacy) or "jamba"
+    jamba: JambaConfig = field(default_factory=JambaConfig)
+
+    # Diffusion policy (replaces discrete PolicyHead when policy_type="diffusion")
+    policy_type: str = "diffusion"  # "discrete" (legacy) or "diffusion"
+    diffusion: DiffusionPolicyConfig = field(default_factory=DiffusionPolicyConfig)
+
+    # System 2 test-time search
+    system2: System2Config = field(default_factory=System2Config)
+
 
 @dataclass
 class TeacherConfig:
@@ -107,6 +161,26 @@ class TeacherConfig:
     comm_max_len: int = 64
     action_dim: int = 128
     total_target_params: str = "50-100M"
+
+    # Jamba temporal core — scaled up for Teacher
+    temporal_type: str = "jamba"
+    jamba: JambaConfig = field(default_factory=lambda: JambaConfig(
+        num_layers=4,
+        d_state=16,
+        expand=1,           # keep inner dim = hidden_dim to control total param count
+        num_experts=8,
+        top_k_routing=2,
+        ffn_mult=1,         # slim experts — 8 experts compensate for narrower FFN
+    ))
+
+    # Diffusion policy — Teacher uses more refinement steps
+    policy_type: str = "diffusion"
+    diffusion: DiffusionPolicyConfig = field(default_factory=lambda: DiffusionPolicyConfig(
+        num_infer_steps=20,
+    ))
+
+    # System 2 — disabled for Teacher (Teacher trains, doesn't plan)
+    system2: System2Config = field(default_factory=lambda: System2Config(enabled=False))
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,10 @@ from baby_ai.environments.minecraft.actions import (
     NUM_ACTIONS,
     has_look,
 )
+from baby_ai.environments.minecraft.action_decoder import (
+    ContinuousActionDecoder,
+    decode_continuous_action,
+)
 from baby_ai.environments.minecraft.capture import ScreenCapture
 from baby_ai.environments.minecraft.input_guard import InputGuard
 from baby_ai.environments.minecraft.input_controller import InputController
@@ -350,11 +354,15 @@ class MinecraftEnv(GameEnvironment):
         log.info("Environment reset — episode starts.")
         return obs
 
-    def step(self, action_id: int, observation_only: bool = False) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
+    def step(self, action_id: torch.Tensor, observation_only: bool = False) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
         """
-        Execute *action_id* and return (obs, reward, done, info).
+        Execute an action and return (obs, reward, done, info).
 
-        1. Translate action_id → key/button/look specification.
+        Args:
+            action_id: (20,) continuous action vector from the diffusion policy.
+            observation_only: If True, skip AI input sending (imitation mode).
+
+        1. Decode continuous vector → key/button/look specification.
         2. Send input to the Minecraft window.
         3. Wait for step delay (pacing).
         4. Capture the next frame.
@@ -366,13 +374,8 @@ class MinecraftEnv(GameEnvironment):
         rewards (block break, crafting, etc.) still fire normally.
         """
         # ── Auto-respawn handled by mod ────────────────────────
-        # The Fabric mod auto-respawns both server-side (BabyAiMod
-        # AFTER_DEATH callback) and client-side (DeathScreenMixin
-        # dismisses the death screen after 1 s).  We just skip
-        # actions while dead and wait for the flag to clear.
         if self._is_dead:
             obs = self._observe()
-            # Check if the death screen has been dismissed by the mod
             from baby_ai.environments.minecraft.screen_analyzer import detect_death
             frame = self._capture.grab_raw()
             if frame is not None and not detect_death(frame):
@@ -392,8 +395,15 @@ class MinecraftEnv(GameEnvironment):
                 "long_break_count": self._long_break_count,
             }
 
-        action_id = int(action_id) % NUM_ACTIONS
-        action = MINECRAFT_ACTIONS[action_id]
+        # ── Decode continuous action vector ──────────────────────
+        decoded = decode_continuous_action(action_id)
+        action_keys = decoded["keys"]
+        action_buttons = decoded["buttons"]
+        action_look = decoded["look"]
+        action_name_str = decoded["action_name"]
+        is_attack = decoded["is_attack"]
+        is_drop = False  # not in the 20-dim layout
+        disc_action_id = decoded["approx_action_id"]
 
         # ── Observation-only mode (imitation learning) ──────────
         # Skip all AI input sending and action-based tracking.
@@ -411,7 +421,7 @@ class MinecraftEnv(GameEnvironment):
 
             # Reward computation — action-based channels skipped
             reward_info = self._reward_computer.compute(
-                obs, action_id, _reward_weights, self._step_count,
+                obs, disc_action_id, _reward_weights, self._step_count,
                 observation_only=True,
             )
             reward = reward_info["total"]
@@ -419,7 +429,7 @@ class MinecraftEnv(GameEnvironment):
             done = not self._window.is_valid
             info = {
                 "step": self._step_count,
-                "action_name": f"observe ({action.name})",
+                "action_name": f"observe ({action_name_str})",
                 "has_look": False,
                 "window_focused": self._window.is_focused,
                 "reward_breakdown": reward_info,
@@ -428,18 +438,17 @@ class MinecraftEnv(GameEnvironment):
                 "long_break_count": self._long_break_count,
             }
             self._step_count += 1
-            self._prev_action_id = action_id
+            self._prev_action_id = disc_action_id
             return obs, reward, done, info
 
         # ── Long-break check ────────────────────────────────────
         # If the agent has been issuing attack actions repeatedly
         # without any block breaking, override with a sustained
         # hold so blocks that take many seconds actually break.
-        is_attack = action_id in ATTACK_ACTIONS
         long_break_triggered = False
 
         # Track item drops for pickup-reward suppression
-        if action_id in DROP_ACTIONS:
+        if is_drop:
             self._last_drop_time = time.monotonic()
 
         if is_attack:
@@ -465,16 +474,16 @@ class MinecraftEnv(GameEnvironment):
                 self._long_break_count, self._step_count,
                 self._attack_streak, self._long_break_duration,
             )
-            obs = self._execute_long_break(action)
+            obs = self._execute_long_break_raw(action_keys, action_buttons, action_look)
             self._attack_streak = 0  # reset after long break
         else:
             # ── Normal action execution ─────────────────────────
             if self._window.is_valid:
-                self._input.set_keys(action.keys)
-                self._input.set_buttons(action.buttons)
+                self._input.set_keys(action_keys)
+                self._input.set_buttons(action_buttons)
 
-                if action.look is not None:
-                    dx, dy = action.look
+                if action_look is not None:
+                    dx, dy = action_look
                     # ── Pitch clamping ──────────────────────────
                     # Suppress vertical look deltas when the camera
                     # is near the pitch limits to prevent the AI
@@ -513,19 +522,19 @@ class MinecraftEnv(GameEnvironment):
             obs = self._observe()
 
         # ── Track action for reward shaping ─────────────────────
-        self._action_history.append(action_id)
+        self._action_history.append(disc_action_id)
 
         # ── Reward heuristics ───────────────────────────────────
         reward_info = self._reward_computer.compute(
-            obs, action_id, _reward_weights, self._step_count,
+            obs, disc_action_id, _reward_weights, self._step_count,
         )
         reward = reward_info["total"]
 
         done = not self._window.is_valid
         info = {
             "step": self._step_count,
-            "action_name": action.name,
-            "has_look": action.look is not None,
+            "action_name": action_name_str,
+            "has_look": action_look is not None,
             "window_focused": self._window.is_focused,
             "reward_breakdown": reward_info,
             "long_break": long_break_triggered,
@@ -534,13 +543,22 @@ class MinecraftEnv(GameEnvironment):
         }
 
         self._step_count += 1
-        self._prev_action_id = action_id
+        self._prev_action_id = disc_action_id
 
         return obs, reward, done, info
 
     # ── Long-break helper ───────────────────────────────────────
 
     def _execute_long_break(self, action) -> Dict[str, torch.Tensor]:
+        """Long-break using a MinecraftAction dataclass (legacy discrete)."""
+        return self._execute_long_break_raw(action.keys, action.buttons, action.look)
+
+    def _execute_long_break_raw(
+        self,
+        keys: frozenset,
+        buttons: frozenset,
+        look=None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Hold left-click (attack) for an extended duration to break
         tough blocks that need sustained mining.
@@ -558,8 +576,8 @@ class MinecraftEnv(GameEnvironment):
         """
         # Hold the same keys/buttons as the triggering action
         if self._window.is_valid:
-            self._input.set_keys(action.keys)
-            self._input.set_buttons(action.buttons | frozenset({"left"}))
+            self._input.set_keys(keys)
+            self._input.set_buttons(buttons | frozenset({"left"}))
 
         poll_interval = 0.25   # check for break every 250 ms
         start = time.perf_counter()

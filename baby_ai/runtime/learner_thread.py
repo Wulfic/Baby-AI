@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from baby_ai.config import TrainingConfig, DEFAULT_CONFIG
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
-from baby_ai.learning.intrinsic import ICM, LearningProgressEstimator
+from baby_ai.learning.intrinsic import ICM, JEPACuriosity, LearningProgressEstimator
 from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
@@ -208,6 +208,10 @@ class LearnerThread:
             self.optimizer.zero_grad()
             self._accum_count = 0
 
+            # Update JEPA target encoder via EMA after each optimizer step
+            if hasattr(self.teacher, 'predictive') and hasattr(self.teacher.predictive, 'update_target_encoder'):
+                self.teacher.predictive.update_target_encoder()
+
         # Update replay priorities
         new_priorities = [
             max(loss_dict.get("per_sample_loss", [0.1])[i] if i < len(loss_dict.get("per_sample_loss", [])) else 0.1, 1e-6)
@@ -239,71 +243,86 @@ class LearnerThread:
 
     def _compute_loss(self, batch: dict, weights: torch.Tensor) -> dict:
         """Compute combined training loss."""
-        # Teacher forward
-        outputs = self.teacher(**{
+        # Teacher forward — pass actions for diffusion denoising loss
+        forward_kwargs = {
             k: v for k, v in batch.items()
             if k in ("vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor")
-        })
+        }
+        if "action" in batch and hasattr(self.teacher, 'policy_type') and self.teacher.policy_type == "diffusion":
+            forward_kwargs["actions"] = batch["action"]
 
-        action_logits = outputs["action_logits"]
-        # Use moderately clamped bounds to prevent overflow without causing a massive dead
-        # gradient zone, allowing gradients to recover if logits briefly spike.
-        action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-        action_logits = torch.clamp(action_logits, min=-100.0, max=100.0)
-        
+        outputs = self.teacher(**forward_kwargs)
+
         value = outputs["value"]
 
         # Soft-clamp value predictions via tanh squashing to [-7, 7].
-        # Rewards are now clamped to [-5, 5], so values should stay in
-        # a similar range.  tanh preserves gradients everywhere (no dead
-        # zones), but smoothly compresses extreme predictions back toward
-        # the valid range.  The 7.0 scale gives headroom above the reward
-        # clamp so the value head can slightly overshoot without penalty.
         value = 7.0 * torch.tanh(value / 7.0)
 
         # Anchor loss to the computation graph via a zero derived from
         # model output.  This ensures loss.grad_fn is set even when no
-        # policy / ICM branch fires, so backward() won't crash.
-        loss = (action_logits.sum() * 0.0).squeeze()
+        # policy branch fires, so backward() won't crash.
+        action_logits = outputs.get("action_logits")
+        if action_logits is not None:
+            loss = (action_logits.sum() * 0.0).squeeze()
+        else:
+            loss = (value.sum() * 0.0).squeeze()
 
         if "action" in batch and "reward" in batch:
-            # Actor-critic loss
             actions = batch["action"]
             rewards = batch["reward"]
             old_values = batch.get("value", torch.zeros_like(rewards))
 
             advantage = rewards - old_values.squeeze(-1)
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-            # Clamp advantage to prevent catastrophic policy updates.
-            # Tighter [-3, 3] range aligns with the reduced reward scale
-            # and prevents any single sample from dominating the batch.
             advantage = torch.clamp(advantage, -3.0, 3.0)
 
-            dist = torch.distributions.Categorical(logits=action_logits)
-            log_prob = dist.log_prob(actions)
-            entropy = dist.entropy()
-
-            policy_loss = -(log_prob * advantage.detach() * weights).mean()
-            # Use Huber loss (SmoothL1) instead of MSE to reduce
-            # sensitivity to outlier value predictions.
-            # Weight value loss by replay priorities.
+            # Value loss (shared by both policy types)
             value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
 
-            # Entropy bonus — encourages exploration but must NOT be
-            # weighted by replay priorities (which would make high-
-            # priority samples produce disproportionate entropy signal).
-            entropy_bonus = 0.01 * entropy.mean()
+            if hasattr(self.teacher, 'policy_type') and self.teacher.policy_type == "diffusion":
+                # Diffusion policy: reward-weighted denoising loss
+                denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
+                # Weight denoising loss by advantage (reward-weighted regression)
+                policy_loss = torch.clamp(denoising_loss, max=10.0)
+                loss = policy_loss + 0.5 * value_loss
+            else:
+                # Legacy discrete policy: PPO-style categorical loss
+                action_logits = outputs["action_logits"]
+                action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+                action_logits = torch.clamp(action_logits, min=-100.0, max=100.0)
 
-            loss = policy_loss + 0.5 * value_loss - entropy_bonus
+                dist = torch.distributions.Categorical(logits=action_logits)
+                log_prob = dist.log_prob(actions)
+                entropy = dist.entropy()
 
-        # ICM loss (if we have next-state info)
+                policy_loss = -(log_prob * advantage.detach() * weights).mean()
+                entropy_bonus = 0.01 * entropy.mean()
+                loss = policy_loss + 0.5 * value_loss - entropy_bonus
+
+        # JEPA world-model loss (replaces legacy ICM)
         if "next_fused" in batch and "action" in batch:
-            icm_out = self.icm(batch["fused"], batch["next_fused"], batch["action"])
-            # Clamp the ICM losses to avoid wild gradient swings from unpredictable states
-            fwd_loss_clamped = torch.clamp(icm_out["forward_loss"], max=10.0)
-            inv_loss_clamped = torch.clamp(icm_out["inverse_loss"], max=10.0)
-            icm_loss = fwd_loss_clamped + inv_loss_clamped
-            loss = loss + 0.1 * icm_loss
+            # If teacher has a LatentWorldModel, use JEPA curiosity;
+            # otherwise fall back to legacy ICM.
+            if hasattr(self.teacher, 'predictive') and hasattr(self.teacher.predictive, 'predict_next_latent'):
+                wm_out = self.teacher.predictive(
+                    outputs["core_state"], batch["next_fused"], batch["action"],
+                )
+                dynamics_loss = torch.clamp(wm_out["dynamics_loss"], max=10.0)
+                kl_loss = torch.clamp(wm_out["kl_loss"], max=10.0)
+                loss = loss + 0.1 * dynamics_loss + 0.01 * kl_loss
+            else:
+                # Legacy ICM fallback
+                icm_out = self.icm(batch["fused"], batch["next_fused"], batch["action"])
+                fwd_loss_clamped = torch.clamp(icm_out["forward_loss"], max=10.0)
+                inv_loss_clamped = torch.clamp(icm_out["inverse_loss"], max=10.0)
+                icm_loss = fwd_loss_clamped + inv_loss_clamped
+                loss = loss + 0.1 * icm_loss
+
+        # MoE load-balancing auxiliary loss (from Jamba temporal core)
+        if hasattr(self.teacher, 'temporal') and hasattr(self.teacher.temporal, 'aux_loss'):
+            moe_loss = self.teacher.temporal.aux_loss
+            if moe_loss.requires_grad or moe_loss.item() > 0:
+                loss = loss + moe_loss
 
         # EWC penalty
         ewc_penalty = self.consolidator.consolidation_loss(self.teacher)

@@ -4,6 +4,10 @@ Inference thread — serves the Student model for real-time action selection.
 Runs on a dedicated thread with the Student model pinned to GPU.
 Handles incoming observation requests and returns actions within
 the latency target (<200ms).
+
+Integrates System 2 test-time compute: when the uncertainty estimator
+detects a novel or difficult situation, the agent pauses and runs
+Latent MCTS planning before committing to an action.
 """
 
 from __future__ import annotations
@@ -15,6 +19,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from baby_ai.core.planner import LatentMCTS, UncertaintyEstimator
+from baby_ai.config import System2Config
 from baby_ai.utils.logging import get_logger, LatencyTracker
 
 log = get_logger("inference", log_file="inference.log")
@@ -56,6 +62,8 @@ class InferenceThread:
         device: str = "cuda",
         target_latency_ms: float = 200.0,
         queue_size: int = 64,
+        system2_config: System2Config | None = None,
+        mod_bridge=None,
     ):
         self.student = student
         self.device = device
@@ -64,10 +72,30 @@ class InferenceThread:
         self._queue: queue.Queue[Optional[InferenceRequest]] = queue.Queue(maxsize=queue_size)
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._hidden: Optional[torch.Tensor] = None
+        self._hidden = None  # JambaState or torch.Tensor (GRU legacy)
         self._latency = LatencyTracker("inference")
         self._step = 0
         self._swap_lock = threading.Lock()
+
+        # ── System 2: test-time planning ──
+        self._s2_config = system2_config or System2Config()
+        self._uncertainty = UncertaintyEstimator(
+            threshold=self._s2_config.uncertainty_threshold,
+        )
+        self._planner: LatentMCTS | None = None
+        self._mod_bridge = mod_bridge
+        self._s2_trigger_count = 0
+
+        # Lazily initialise planner once student model is available
+        if self._s2_config.enabled and hasattr(student, 'predictive') and hasattr(student, 'policy'):
+            self._planner = LatentMCTS(
+                world_model=student.predictive,
+                policy=student.policy,
+                num_trajectories=self._s2_config.num_trajectories,
+                horizon=self._s2_config.planning_horizon,
+                discount=self._s2_config.discount,
+                budget_ms=self._s2_config.planning_budget_ms,
+            )
 
     def start(self) -> None:
         """Start the inference thread."""
@@ -148,7 +176,7 @@ class InferenceThread:
 
     @torch.no_grad()
     def _infer(self, observation: Dict[str, Any]) -> Dict[str, Any]:
-        """Run Student inference on a single observation."""
+        """Run Student inference, potentially triggering System 2 planning."""
         # Move tensors to device
         inputs = {}
         for k, v in observation.items():
@@ -163,6 +191,50 @@ class InferenceThread:
         # Update hidden state
         self._hidden = result["hidden"].detach()
 
+        # ── System 2 uncertainty check ──
+        used_planning = False
+        if (
+            self._s2_config.enabled
+            and self._planner is not None
+        ):
+            u = self._uncertainty.update(
+                value=result.get("value"),
+                log_prob=result.get("log_prob"),
+            )
+
+            if self._uncertainty.should_plan:
+                used_planning = True
+                self._s2_trigger_count += 1
+                log.info(
+                    "System 2 triggered at step %d (uncertainty=%.3f > %.3f)",
+                    self._step, u, self._s2_config.uncertainty_threshold,
+                )
+
+                # Request game pause via mod bridge (if available)
+                if self._s2_config.pause_game and self._mod_bridge is not None:
+                    self._send_pause(True)
+
+                # Run latent MCTS planning
+                plan_result = self._planner.plan(
+                    core_state=result["core_state"],
+                )
+
+                # Override the System 1 action with the planned action
+                result["action"] = plan_result["best_action"].squeeze(0)
+                result["planning_ms"] = plan_result["planning_ms"]
+                result["system2_triggered"] = True
+
+                log.info(
+                    "  Planning: %.1f ms, %d trajectories, expected_v=%.3f",
+                    plan_result["planning_ms"],
+                    plan_result["num_trajectories"],
+                    plan_result["expected_value"].item(),
+                )
+
+                # Resume game
+                if self._s2_config.pause_game and self._mod_bridge is not None:
+                    self._send_pause(False)
+
         # Move results back to CPU for downstream use
         cpu_result = {}
         for k, v in result.items():
@@ -172,7 +244,18 @@ class InferenceThread:
                 cpu_result[k] = v
 
         cpu_result["latency_ms"] = self._latency.last_ms
+        cpu_result["system2_triggered"] = used_planning
+        cpu_result["uncertainty"] = self._uncertainty.current
         return cpu_result
+
+    def _send_pause(self, paused: bool) -> None:
+        """Send pause/resume command to the Minecraft mod bridge."""
+        try:
+            if hasattr(self._mod_bridge, 'send_command'):
+                cmd = "pause" if paused else "resume"
+                self._mod_bridge.send_command({"command": cmd, "reason": "system2_planning"})
+        except Exception as e:
+            log.debug("Could not send pause command: %s", e)
 
     def reset_hidden(self) -> None:
         """Reset the GRU hidden state (e.g., start of new episode)."""
@@ -191,4 +274,6 @@ class InferenceThread:
             "last_latency_ms": self._latency.last_ms,
             "queue_size": self._queue.qsize(),
             "running": self._running,
+            "system2_trigger_count": self._s2_trigger_count,
+            "uncertainty": self._uncertainty.current,
         }

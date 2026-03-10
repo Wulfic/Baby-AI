@@ -66,22 +66,22 @@ class EWC:
             if count >= num_samples:
                 break
 
-            # Forward pass — use policy logits as the "output"
+            # Forward pass — use continuous action output for Fisher
             model.zero_grad()
             outputs = model(**{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()})
-            logits = outputs["action_logits"]
 
-            # Compute log-likelihood of most likely action
-            log_probs = F.log_softmax(logits, dim=-1)
-            pseudo_label = logits.argmax(dim=-1)
-            loss = F.nll_loss(log_probs, pseudo_label)
+            # Squared-norm of continuous action → scalar loss for Fisher
+            action = outputs["action"]
+            loss = action.pow(2).sum(dim=-1).mean()
+            batch_size = action.size(0)
+
             loss.backward()
 
             for n, p in model.named_parameters():
                 if p.requires_grad and p.grad is not None:
                     fisher[n] += p.grad.data.pow(2)
 
-            count += logits.size(0)
+            count += batch_size
 
         # Average
         for n in fisher:
