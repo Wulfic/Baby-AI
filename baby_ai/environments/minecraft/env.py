@@ -238,6 +238,9 @@ class MinecraftEnv(GameEnvironment):
         self._PITCH_LIMIT_DOWN: float = 70.0         # max downward pitch (degrees)
         # Track how long the camera has been at extreme pitch
         self._extreme_pitch_steps: int = 0
+        # Previous yaw/pitch for computing per-step deltas (imitation learning)
+        self._prev_yaw: Optional[float] = None
+        self._prev_pitch: Optional[float] = None
 
         # ── Hotbar spam tracking ────────────────────────────────
         self._hotbar_streak: int = 0  # consecutive hotbar-only actions
@@ -320,6 +323,8 @@ class MinecraftEnv(GameEnvironment):
         self._player_pitch = None
         self._player_yaw = None
         self._extreme_pitch_steps = 0
+        self._prev_yaw = None
+        self._prev_pitch = None
 
         # Reset chunk tracking (new episode = fresh exploration)
         self._visited_chunks.clear()
@@ -337,7 +342,7 @@ class MinecraftEnv(GameEnvironment):
         log.info("Environment reset — episode starts.")
         return obs
 
-    def step(self, action_id: int) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
+    def step(self, action_id: int, observation_only: bool = False) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
         """
         Execute *action_id* and return (obs, reward, done, info).
 
@@ -346,6 +351,11 @@ class MinecraftEnv(GameEnvironment):
         3. Wait for step delay (pacing).
         4. Capture the next frame.
         5. Compute simple extrinsic reward signals.
+
+        When *observation_only* is ``True`` (imitation learning mode):
+        the AI does **not** send any inputs, action-based accumulators
+        and penalties are frozen, but frame capture and mod-event
+        rewards (block break, crafting, etc.) still fire normally.
         """
         # ── Auto-respawn handled by mod ────────────────────────
         # The Fabric mod auto-respawns both server-side (BabyAiMod
@@ -376,6 +386,42 @@ class MinecraftEnv(GameEnvironment):
 
         action_id = int(action_id) % NUM_ACTIONS
         action = MINECRAFT_ACTIONS[action_id]
+
+        # ── Observation-only mode (imitation learning) ──────────
+        # Skip all AI input sending and action-based tracking.
+        # Still capture frames, process mod events, and compute
+        # non-action-based rewards.
+        if observation_only:
+            # Pacing
+            elapsed = time.perf_counter() - self._last_step_time
+            remaining = self._step_delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_step_time = time.perf_counter()
+
+            obs = self._observe()
+
+            # Reward computation — action-based channels skipped
+            reward_info = self._reward_computer.compute(
+                obs, action_id, _reward_weights, self._step_count,
+                observation_only=True,
+            )
+            reward = reward_info["total"]
+
+            done = not self._window.is_valid
+            info = {
+                "step": self._step_count,
+                "action_name": f"observe ({action.name})",
+                "has_look": False,
+                "window_focused": self._window.is_focused,
+                "reward_breakdown": reward_info,
+                "long_break": False,
+                "attack_streak": 0,
+                "long_break_count": self._long_break_count,
+            }
+            self._step_count += 1
+            self._prev_action_id = action_id
+            return obs, reward, done, info
 
         # ── Long-break check ────────────────────────────────────
         # If the agent has been issuing attack actions repeatedly
@@ -590,6 +636,42 @@ class MinecraftEnv(GameEnvironment):
         else:
             log.warning("Cannot set home — player position not yet known "
                         "(waiting for first position_update from mod).")
+
+    def get_look_delta(self) -> tuple[float, float]:
+        """
+        Return (dyaw, dpitch) in degrees since the last call,
+        then reset the baseline to the current yaw/pitch.
+
+        Used during imitation learning to infer which direction the
+        player moved their camera between env steps.
+
+        Returns (0.0, 0.0) if yaw/pitch data is not yet available
+        from the mod bridge.
+        """
+        yaw = self._player_yaw
+        pitch = self._player_pitch
+
+        if yaw is None or pitch is None:
+            return 0.0, 0.0
+
+        if self._prev_yaw is None or self._prev_pitch is None:
+            # First call — establish baseline, return zero
+            self._prev_yaw = yaw
+            self._prev_pitch = pitch
+            return 0.0, 0.0
+
+        dyaw = yaw - self._prev_yaw
+        dpitch = pitch - self._prev_pitch
+
+        # Handle yaw wrap-around (-180 to 180)
+        if dyaw > 180:
+            dyaw -= 360
+        elif dyaw < -180:
+            dyaw += 360
+
+        self._prev_yaw = yaw
+        self._prev_pitch = pitch
+        return dyaw, dpitch
 
     # ── Internals ───────────────────────────────────────────────
 

@@ -215,7 +215,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     goes directly to the Minecraft window handle.
     """
     from baby_ai.environments.minecraft import MinecraftEnv
-    from baby_ai.environments.minecraft.actions import action_name
+    from baby_ai.environments.minecraft.actions import action_name, match_player_action
     from baby_ai.config import CHECKPOINT_DIR
 
     mc = config.minecraft
@@ -277,7 +277,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     icm = orchestrator.icm
 
     # ── UI Control Panel + Reward Toggles ───────────────────────
-    from baby_ai.ui.control_panel import AIControlPanel
+    from baby_ai.ui.control_panel import AIControlPanel, get_imitation_enabled
     from baby_ai.ui.reward_toggles import RewardToggleState
     from baby_ai.ui.controls_state import AIControlsState
     from baby_ai.ui.reward_weights import RewardWeightsState
@@ -362,6 +362,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     )
     _acc = {k: 0.0 for k in _acc_keys}
 
+    # Track whether imitation mode was active on the previous tick so
+    # we can toggle the input guard exactly once on state transitions.
+    _prev_imitation_active: bool = False
+
     try:
         obs = env.reset()
 
@@ -384,6 +388,33 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if env._guard is not None and env._guard.ai_paused:
                 time.sleep(0.5)
                 continue
+
+            # ── Imitation learning mode ──────────────────────────
+            # When active: suppress AI outputs (noop), unblock user
+            # keyboard/mouse so the human can play and demonstrate.
+            # Observations and reward collection continue normally.
+            _imitation_active = get_imitation_enabled()
+
+            if _imitation_active and not _prev_imitation_active:
+                # Just switched ON — release AI held keys, unblock user
+                if env._input is not None:
+                    env._input.release_all()
+                if env._guard is not None:
+                    env._guard._kb_blocked = False
+                    env._guard._mouse_blocked = False
+                    env._guard.clear_player_input()
+                # Reset yaw/pitch baseline so first delta is clean
+                env._prev_yaw = None
+                env._prev_pitch = None
+                log.info("Imitation learning ON — AI inputs suppressed, user controls unlocked.")
+            elif not _imitation_active and _prev_imitation_active:
+                # Just switched OFF — re-lock user input, clear tracked state
+                if env._guard is not None:
+                    env._guard._kb_blocked = True
+                    env._guard._mouse_blocked = True
+                    env._guard.clear_player_input()
+                log.info("Imitation learning OFF — AI inputs resumed, user controls locked.")
+            _prev_imitation_active = _imitation_active
 
             # ── Model inference ──────────────────────────────────
             result = orchestrator.step(obs)
@@ -480,7 +511,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 episode_reward += total_r
 
             # ── Execute action in Minecraft ─────────────────────
-            obs, ext_reward, done, info = env.step(action_id)
+            obs, ext_reward, done, info = env.step(
+                action_id, observation_only=_imitation_active,
+            )
             episode_steps += 1
 
             # ── Push live stats to control panel ────────────────
@@ -498,6 +531,23 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 )
                 episode_reward = 0.0
                 last_distill_count = cur_distill
+
+                # ── Save screenshot of what the AI sees ─────────
+                # Captures the last frame the env observed, which is
+                # exactly what the vision encoder processed.
+                try:
+                    import cv2, datetime
+                    from baby_ai.config import SCREENSHOT_DIR
+                    _ss_dir = SCREENSHOT_DIR
+                    _ss_dir.mkdir(parents=True, exist_ok=True)
+                    frame = getattr(env, "_last_frame", None)
+                    if frame is not None:
+                        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        fname = _ss_dir / f"distill_{cur_distill:04d}_{ts}.png"
+                        cv2.imwrite(str(fname), frame)
+                        log.info("Distillation screenshot saved → %s", fname)
+                except Exception as _ss_err:
+                    log.warning("Failed to save distillation screenshot: %s", _ss_err)
 
             # ── Logging (every 50 steps) ────────────────────────
             if episode_steps % 50 == 0:
@@ -545,6 +595,14 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 # Reset accumulators after logging
                 _acc = {k: 0.0 for k in _acc_keys}
 
+                # Extra imitation mode info — show the player's actual action
+                if _imitation_active and prev_action is not None:
+                    player_aid = prev_action.item()
+                    log.info(
+                        "  [IMITATION] player_action=%d (%s)",
+                        player_aid, action_name(player_aid),
+                    )
+
             # ── Episode boundary ────────────────────────────────
             max_steps = mc.max_episode_steps
             if done or (max_steps > 0 and episode_steps >= max_steps):
@@ -571,7 +629,19 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 orchestrator.save_checkpoint("minecraft")
 
             prev_fused = fused
-            prev_action = result["action"]
+            # ── Record the action for the NEXT transition ───────
+            # During imitation mode, use the *player's actual input*
+            # instead of the AI's prediction — this is the entire
+            # point of imitation learning.
+            if _imitation_active and env._guard is not None:
+                held_keys, held_buttons = env._guard.snapshot_player_input()
+                dyaw, dpitch = env.get_look_delta()
+                player_action_id = match_player_action(
+                    held_keys, held_buttons, dyaw, dpitch,
+                )
+                prev_action = torch.tensor(player_action_id, dtype=torch.long)
+            else:
+                prev_action = result["action"]
             prev_obs = obs
 
     except KeyboardInterrupt:

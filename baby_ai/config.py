@@ -41,11 +41,12 @@ REPLAY_DIR = NETWORK_STORAGE / "replay"
 LOG_DIR = NETWORK_STORAGE / "logs"
 TENSORBOARD_DIR = NETWORK_STORAGE / "tensorboard"
 RAW_DATA_DIR = NETWORK_STORAGE / "raw_data"
+SCREENSHOT_DIR = NETWORK_STORAGE / "screenshots"
 
 
 def ensure_dirs() -> None:
     """Create all required directories if they do not exist."""
-    for d in (CHECKPOINT_DIR, REPLAY_DIR, LOG_DIR, TENSORBOARD_DIR, RAW_DATA_DIR):
+    for d in (CHECKPOINT_DIR, REPLAY_DIR, LOG_DIR, TENSORBOARD_DIR, RAW_DATA_DIR, SCREENSHOT_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

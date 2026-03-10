@@ -78,11 +78,18 @@ class RewardComputer:
         action_id: int,
         reward_weights: Any,
         step_count: int,
+        observation_only: bool = False,
     ) -> Dict[str, float]:
         """Compute multi-channel extrinsic reward from frame analysis and action.
 
         Returns a dict with per-channel values AND a ``"total"`` key with
         the combined extrinsic signal.
+
+        When *observation_only* is ``True`` (imitation learning mode),
+        action-based channels (idle penalty, hotbar spam, action
+        diversity, movement, interaction, item drop) are zeroed out
+        and their accumulators are not updated.  Frame-based and
+        mod-event-based channels still fire normally.
         """
         env = self._env
         rewards: Dict[str, float] = {}
@@ -116,18 +123,20 @@ class RewardComputer:
 
         # ── 3. Action diversity ─────────────────────────────────
         action_div = 0.0
-        if len(self.action_history) >= 10:
+        if not observation_only and len(self.action_history) >= 10:
             recent = list(self.action_history)[-30:]
             unique_ratio = len(set(recent)) / max(len(recent), 1)
             action_div = unique_ratio * 0.3
         rewards["action_diversity"] = action_div
 
-        # ── 4. Interaction bonus ────────────────────────────────
+        # ── 4. Interaction bonus ──────────────────────────────
         _int_impact = _sw.get("int_impact", 0.5)
         _int_sustained = _sw.get("int_sustained", 0.2)
 
         interaction_bonus = 0.0
-        if action_id in BLOCK_INTERACTION_ACTIONS:
+        if observation_only:
+            pass  # Don't update interaction_streak during observation
+        elif action_id in BLOCK_INTERACTION_ACTIONS:
             self.interaction_streak += 1
             if visual_change > 0.06:
                 interaction_bonus = _int_impact + min(visual_change * 2.0, 0.5)
@@ -158,12 +167,14 @@ class RewardComputer:
         rewards["exploration"] = exploration_bonus
 
         # ── 6. Movement bonus ───────────────────────────────────
-        movement_bonus = self._compute_movement(
-            action_id, visual_change, _sw, env
-        )
-        # Chunk-based movement decay
-        chunk_decay = max(0.1, 1.0 - env._steps_in_chunk * 0.02)
-        movement_bonus *= chunk_decay
+        movement_bonus = 0.0
+        if not observation_only:
+            movement_bonus = self._compute_movement(
+                action_id, visual_change, _sw, env
+            )
+            # Chunk-based movement decay
+            chunk_decay = max(0.1, 1.0 - env._steps_in_chunk * 0.02)
+            movement_bonus *= chunk_decay
         rewards["movement"] = movement_bonus
 
         # ── 6b. New chunk exploration bonus ─────────────────────
@@ -178,11 +189,20 @@ class RewardComputer:
         rewards["new_chunk"] = new_chunk_bonus
 
         # ── 7. Idle penalty ─────────────────────────────────────
-        idle_penalty = self._compute_idle_penalty(action_id)
+        if observation_only:
+            idle_penalty = 0.0
+            # Reset streak so it doesn't explode when switching back
+            self.idle_streak = 0
+        else:
+            idle_penalty = self._compute_idle_penalty(action_id)
         rewards["idle_penalty"] = idle_penalty
 
-        # ── 7b. Hotbar spam penalty ─────────────────────────────
-        hotbar_spam_penalty = self._compute_hotbar_spam(action_id)
+        # ── 7b. Hotbar spam penalty ───────────────────────────
+        if observation_only:
+            hotbar_spam_penalty = 0.0
+            self.hotbar_streak = 0
+        else:
+            hotbar_spam_penalty = self._compute_hotbar_spam(action_id)
         rewards["hotbar_spam_penalty"] = hotbar_spam_penalty
 
         # ── Mod events ──────────────────────────────────────────
@@ -260,7 +280,10 @@ class RewardComputer:
         rewards["item_pickup"] = item_pickup
 
         # ── Item drop penalty ───────────────────────────────────
-        item_drop_penalty = 0.3 if action_id in DROP_ACTIONS else 0.0
+        if observation_only:
+            item_drop_penalty = 0.0
+        else:
+            item_drop_penalty = 0.3 if action_id in DROP_ACTIONS else 0.0
         rewards["item_drop_penalty"] = item_drop_penalty
 
         # ── 11. Death detection (mod-only) ──────────────────────

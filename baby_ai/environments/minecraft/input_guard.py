@@ -185,6 +185,14 @@ class InputGuard:
         self._ready = threading.Event()
         self._stats = {"kb_blocked": 0, "mouse_blocked": 0, "passed": 0}
 
+        # ── Player input tracking (for imitation learning) ──────
+        # When the guard is NOT blocking (imitation mode), these
+        # capture what the human player is actually pressing so the
+        # replay buffer can store the real demonstrated actions.
+        self._player_lock = threading.Lock()
+        self._player_held_keys: set[int] = set()     # VK codes currently held
+        self._player_held_buttons: set[str] = set()   # "left"/"right"/"middle"
+
         # Keep references to prevent garbage collection of callbacks
         self._kb_proc = HOOKPROC(self._keyboard_hook_proc)
         self._mouse_proc = HOOKPROC(self._mouse_hook_proc)
@@ -318,8 +326,14 @@ class InputGuard:
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             # If keyboard blocking is disabled via Ctrl+M, let keys through
+            # but also TRACK them for imitation learning.
             if not self._kb_blocked:
                 self._stats["passed"] += 1
+                with self._player_lock:
+                    if is_keydown:
+                        self._player_held_keys.add(vk)
+                    else:
+                        self._player_held_keys.discard(vk)
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             # Block this key event
@@ -345,8 +359,23 @@ class InputGuard:
         """
         if nCode >= 0 and self._should_block():
             # If mouse blocking is disabled via Ctrl+M, let everything through
+            # but also TRACK button presses for imitation learning.
             if not self._mouse_blocked:
                 self._stats["passed"] += 1
+                # Track mouse button state for imitation learning
+                with self._player_lock:
+                    if wParam == 0x0201:    # WM_LBUTTONDOWN
+                        self._player_held_buttons.add("left")
+                    elif wParam == 0x0202:  # WM_LBUTTONUP
+                        self._player_held_buttons.discard("left")
+                    elif wParam == 0x0204:  # WM_RBUTTONDOWN
+                        self._player_held_buttons.add("right")
+                    elif wParam == 0x0205:  # WM_RBUTTONUP
+                        self._player_held_buttons.discard("right")
+                    elif wParam == 0x0207:  # WM_MBUTTONDOWN
+                        self._player_held_buttons.add("middle")
+                    elif wParam == 0x0208:  # WM_MBUTTONUP
+                        self._player_held_buttons.discard("middle")
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
@@ -453,3 +482,24 @@ class InputGuard:
         """Update the guarded window handle (e.g. after MC restart)."""
         self._mc_hwnd = new_hwnd
         log.info("Input guard target updated: hwnd=%s", hex(new_hwnd))
+
+    # ── Imitation learning helpers ──────────────────────────────
+
+    def snapshot_player_input(self) -> tuple[frozenset[int], frozenset[str]]:
+        """
+        Atomically read which keys and mouse buttons the player is
+        currently holding.
+
+        Returns:
+            (held_keys, held_buttons) where held_keys is a frozenset
+            of VK codes and held_buttons is a frozenset of button names
+            ("left", "right", "middle").
+        """
+        with self._player_lock:
+            return frozenset(self._player_held_keys), frozenset(self._player_held_buttons)
+
+    def clear_player_input(self) -> None:
+        """Reset all tracked player input state (e.g. on mode switch)."""
+        with self._player_lock:
+            self._player_held_keys.clear()
+            self._player_held_buttons.clear()

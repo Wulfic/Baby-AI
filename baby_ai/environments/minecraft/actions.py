@@ -247,3 +247,154 @@ def describe_action(action_id: int) -> str:
     if a.look:
         parts.append(f"look=({a.look[0]},{a.look[1]})")
     return " | ".join(parts)
+
+
+# ── Imitation learning: map player input → best action_id ──────
+
+# VK codes used by gameplay actions (subset of VK dict that appear
+# in the action table).  Modifier/system codes are excluded.
+_GAMEPLAY_VKS: FrozenSet[int] = frozenset(
+    a.keys for a in MINECRAFT_ACTIONS for _ in (None,)
+).union(*(a.keys for a in MINECRAFT_ACTIONS)) if False else frozenset().union(
+    *(a.keys for a in MINECRAFT_ACTIONS if a.keys)
+)
+
+# Pre-compute a reverse lookup: VK name → VK code (only gameplay keys)
+_GAMEPLAY_BUTTON_NAMES: FrozenSet[str] = frozenset().union(
+    *(a.buttons for a in MINECRAFT_ACTIONS if a.buttons)
+)
+
+
+def _quantize_look(dyaw: float, dpitch: float) -> Optional[Tuple[int, int]]:
+    """
+    Convert yaw/pitch deltas (degrees) into the closest discrete
+    look vector from the action table, or None if movement is negligible.
+
+    Minecraft yaw:  positive = turning RIGHT, negative = LEFT.
+    Minecraft pitch: positive = looking DOWN, negative = UP.
+
+    The action table uses pixel deltas:
+        dx>0 = look RIGHT, dx<0 = look LEFT
+        dy>0 = look DOWN,  dy<0 = look UP
+
+    We map degrees to the closest LOOK_SM or LOOK_LG magnitude.
+    Threshold: < 1.5 degrees of movement → no look component.
+    """
+    # Rough conversion: LOOK_SM (40px) ≈ 5-8° and LOOK_LG (160px) ≈ 20-30°.
+    # We use thresholds in degrees to decide SM vs LG.
+    _THRESHOLD_DEG = 1.5
+    _LG_THRESHOLD_DEG = 12.0  # above this → use LOOK_LG
+    
+    abs_dyaw = abs(dyaw)
+    abs_dpitch = abs(dpitch)
+    
+    # If both below threshold, no look
+    if abs_dyaw < _THRESHOLD_DEG and abs_dpitch < _THRESHOLD_DEG:
+        return None
+    
+    # Pick the dominant axis
+    if abs_dyaw >= abs_dpitch:
+        # Horizontal look
+        mag = LOOK_LG if abs_dyaw >= _LG_THRESHOLD_DEG else LOOK_SM
+        dx = mag if dyaw > 0 else -mag
+        return (dx, 0)
+    else:
+        # Vertical look
+        mag = LOOK_LG if abs_dpitch >= _LG_THRESHOLD_DEG else LOOK_SM
+        dy = mag if dpitch > 0 else -mag
+        return (0, dy)
+
+
+def match_player_action(
+    held_keys: FrozenSet[int],
+    held_buttons: FrozenSet[str],
+    dyaw: float = 0.0,
+    dpitch: float = 0.0,
+) -> int:
+    """
+    Find the action_id in the 128-action table that best matches the
+    player's current physical input state.
+
+    Used during imitation learning to record what the human *actually*
+    did, rather than the AI's predicted action.
+
+    Scoring for each candidate action:
+      +2  for each key in common with the player
+      -1  for each key the action requires but the player isn't pressing
+      -0.5 for each extra key the player has that the action doesn't use
+      +3  for each mouse button in common
+      -2  for each mouse button the action requires but missing
+      +2  if look direction matches (both have compatible look)
+      -1  if action has look but player doesn't (or vice versa)
+
+    Args:
+        held_keys:    frozenset of VK codes the player is holding.
+        held_buttons: frozenset of mouse button names ("left"/"right"/"middle").
+        dyaw:         yaw change in degrees since last step (>0 = right).
+        dpitch:       pitch change in degrees since last step (>0 = down).
+
+    Returns:
+        The action_id (0-127) of the best matching action.
+    """
+    # Filter held_keys to only gameplay-relevant VK codes
+    player_keys = held_keys & _GAMEPLAY_VKS
+    player_buttons = held_buttons & _GAMEPLAY_BUTTON_NAMES
+    player_look = _quantize_look(dyaw, dpitch)
+    
+    best_id = 0
+    best_score = -999.0
+    
+    for idx, action in enumerate(MINECRAFT_ACTIONS):
+        score = 0.0
+        
+        # ── Key matching ────────────────────────────────
+        a_keys = action.keys
+        common_keys = player_keys & a_keys
+        missing_keys = a_keys - player_keys       # action needs, player doesn't have
+        extra_keys = player_keys - a_keys          # player has, action doesn't need
+        
+        score += len(common_keys) * 2.0
+        score -= len(missing_keys) * 1.0
+        score -= len(extra_keys) * 0.5
+        
+        # ── Button matching ─────────────────────────────
+        a_buttons = action.buttons
+        common_buttons = player_buttons & a_buttons
+        missing_buttons = a_buttons - player_buttons
+        extra_buttons = player_buttons - a_buttons
+        
+        score += len(common_buttons) * 3.0
+        score -= len(missing_buttons) * 2.0
+        score -= len(extra_buttons) * 0.5
+        
+        # ── Look matching ──────────────────────────────
+        a_look = action.look
+        if player_look is not None and a_look is not None:
+            # Both have look — check if directions match
+            if player_look == a_look:
+                score += 2.0
+            else:
+                # Same axis, same direction? Partial credit
+                p_dx, p_dy = player_look
+                a_dx, a_dy = a_look
+                if (p_dx != 0 and a_dx != 0 and (p_dx > 0) == (a_dx > 0)):
+                    score += 1.0  # same horizontal direction, different magnitude
+                elif (p_dy != 0 and a_dy != 0 and (p_dy > 0) == (a_dy > 0)):
+                    score += 1.0  # same vertical direction, different magnitude
+                else:
+                    score -= 1.0  # wrong direction
+        elif player_look is None and a_look is None:
+            # Neither has look — slight bonus for matching "no look"
+            score += 0.5
+        elif a_look is not None:
+            # Action expects look but player isn't looking
+            score -= 1.0
+        else:
+            # Player is looking but action has no look component
+            score -= 0.3
+        
+        if score > best_score:
+            best_score = score
+            best_id = idx
+    
+    return best_id

@@ -61,6 +61,7 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("xp_reward",          "XP Reward",            "Survival",      False),
 
     # ── Penalties / Shaping ─────────────────────────────────────
+    ChannelInfo("death_penalty",      "Death Penalty",        "Penalties",     False, is_penalty=True),
     ChannelInfo("idle_penalty",       "Idle Penalty",         "Penalties",     True,  is_penalty=True),
     ChannelInfo("stagnation_penalty", "Stagnation Penalty",   "Penalties",     False, is_penalty=True),
     ChannelInfo("hotbar_spam_penalty","Hotbar Spam Penalty",  "Penalties",     True,  is_penalty=True),

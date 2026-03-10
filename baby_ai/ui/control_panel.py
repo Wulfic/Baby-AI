@@ -67,6 +67,24 @@ def set_live_lr(value: float) -> None:
         _live_lr = value
 
 
+# ── Thread-safe imitation learning (distillation) toggle ─────
+_imitation_enabled: bool = True
+_imitation_lock = threading.Lock()
+
+
+def get_imitation_enabled() -> bool:
+    """Return whether imitation learning (distillation) is enabled (thread-safe)."""
+    with _imitation_lock:
+        return _imitation_enabled
+
+
+def set_imitation_enabled(value: bool) -> None:
+    """Enable or disable imitation learning from the GUI (thread-safe)."""
+    global _imitation_enabled
+    with _imitation_lock:
+        _imitation_enabled = value
+
+
 # Theme constants and DPI helper are now imported from baby_ai.ui.theme.
 
 
@@ -170,6 +188,9 @@ class AIControlPanel:
         # tk variables for LR (initialised in _build_controls_tab)
         self._lr_var: Optional[tk.DoubleVar] = None
         self._lr_label: Optional[tk.Label] = None
+
+        # tk variable for imitation learning toggle
+        self._imit_var: Optional[tk.BooleanVar] = None
 
     # ────────────────────────────────────────────────────────────
     # Public API
@@ -503,6 +524,44 @@ class AIControlPanel:
                 col_idx = 0
                 row_idx += 1
 
+        # ── Imitation Learning (Distillation) toggle ───────────
+        imit_frame = tk.Frame(parent, bg=_BG_GROUP,
+                              padx=int(6 * s), pady=int(4 * s))
+        imit_frame.pack(fill=tk.X, padx=int(3 * s), pady=(int(6 * s), int(3 * s)))
+
+        tk.Label(
+            imit_frame, text="TRAINING OPTIONS",
+            font=("Segoe UI", int(8 * s), "bold"),
+            bg=_BG_GROUP, fg=_FG_DIM, anchor="w",
+        ).pack(fill=tk.X)
+
+        # Restore persisted value, default to True (enabled).
+        saved_imit = self._store.get("imitation_learning")
+        imit_default = bool(saved_imit) if saved_imit is not None else True
+        set_imitation_enabled(imit_default)
+
+        self._imit_var = tk.BooleanVar(value=imit_default)
+
+        def _on_imit_toggle() -> None:
+            enabled = self._imit_var.get()
+            set_imitation_enabled(enabled)
+            self._store.set("imitation_learning", enabled)
+
+        imit_cb = tk.Checkbutton(
+            imit_frame,
+            text="Imitation Learning (Teacher → Student Distillation)",
+            variable=self._imit_var,
+            command=_on_imit_toggle,
+            bg=_BG_GROUP, fg=_FG,
+            selectcolor=_BG_FRAME,
+            activebackground=_BG_GROUP,
+            activeforeground=_ACCENT,
+            font=("Segoe UI", int(9 * s)),
+            anchor="w",
+            bd=0, highlightthickness=0,
+        )
+        imit_cb.pack(fill=tk.X, padx=(int(12 * s), 0))
+
         # ── Learning Rate slider ───────────────────────────────
         lr_frame = tk.Frame(parent, bg=_BG_GROUP,
                             padx=int(6 * s), pady=int(4 * s))
@@ -703,6 +762,7 @@ class AIControlPanel:
             self._step_label = None
             self._lr_var = None
             self._lr_label = None
+            self._imit_var = None
             if self.root is not None:
                 self.root.quit()
                 self.root.destroy()
