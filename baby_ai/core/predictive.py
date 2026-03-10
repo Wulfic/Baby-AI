@@ -163,7 +163,7 @@ class LatentWorldModel(nn.Module):
 
         Args:
             core_state: (B, state_dim) from temporal core.
-            action:     (B,) discrete indices or (B, continuous_action_dim) floats.
+            action:     (B, action_dim) continuous action vector.
 
         Returns:
             (B, latent_dim) predicted next latent.
@@ -204,7 +204,7 @@ class LatentWorldModel(nn.Module):
         Args:
             core_state: (B, state_dim) temporal core output at time t.
             next_fused: (B, state_dim) fused embedding at time t+1.
-            action:     (B,) discrete action or (B, continuous_action_dim) floats.
+            action:     (B, action_dim) continuous action vector.
 
         Returns:
             dict with:
@@ -288,75 +288,3 @@ def _kl_divergence(
         - 1.0
     )
     return kl.sum(dim=-1)  # (B,)
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Legacy PredictiveHead  (deprecated — kept for backward compatibility)
-# ────────────────────────────────────────────────────────────────────────────
-
-class PredictiveHead(nn.Module):
-    """
-    Forward dynamics model *(deprecated — use LatentWorldModel)*:
-    predicts next state embedding from current state + action.
-
-    Also includes an inverse model for feature learning stability
-    (predicts action from consecutive states).
-
-    Args:
-        state_dim: Dimension of the fused state embedding.
-        action_dim: Number of discrete actions (for one-hot encoding).
-        hidden_dim: Hidden layer size.
-    """
-
-    def __init__(
-        self,
-        state_dim: int = 256,
-        action_dim: int = 64,
-        hidden_dim: int = 256,
-    ):
-        super().__init__()
-
-        # Forward model: (state, action) → predicted next state
-        self.forward_model = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim),
-        )
-
-        # Inverse model: (state, next_state) → predicted action
-        self.inverse_model = nn.Sequential(
-            nn.Linear(state_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-        self.action_dim = action_dim
-
-    def predict_next_state(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-    ) -> torch.Tensor:
-        action_oh = F.one_hot(action.long(), num_classes=self.action_dim).float()
-        x = torch.cat([state, action_oh], dim=-1)
-        return self.forward_model(x)
-
-    def predict_action(
-        self,
-        state: torch.Tensor,
-        next_state: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([state, next_state], dim=-1)
-        return self.inverse_model(x)
-
-    def forward(
-        self,
-        state: torch.Tensor,
-        next_state: torch.Tensor,
-        action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        predicted_next = self.predict_next_state(state, action)
-        action_logits = self.predict_action(state, next_state)
-        return predicted_next, action_logits

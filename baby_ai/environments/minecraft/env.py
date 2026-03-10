@@ -550,7 +550,7 @@ class MinecraftEnv(GameEnvironment):
     # ── Long-break helper ───────────────────────────────────────
 
     def _execute_long_break(self, action) -> Dict[str, torch.Tensor]:
-        """Long-break using a MinecraftAction dataclass (legacy discrete)."""
+        """Long-break using a MinecraftAction dataclass."""
         return self._execute_long_break_raw(action.keys, action.buttons, action.look)
 
     def _execute_long_break_raw(

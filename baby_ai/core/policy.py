@@ -1,12 +1,10 @@
 """
-Policy heads — action selection from core hidden state.
+Policy head — action selection from core hidden state.
 
-Provides two policy architectures:
-  1. **DiffusionPolicyHead** — Conditional DDIM diffusion for continuous
-     compound actions (pitch, yaw, movement, attack, hotbar, …).
-     Generates a unified continuous action vector in 3-5 denoising steps
-     conditioned on the JambaCore hidden state.
-  2. **PolicyHead** *(legacy)* — MLP + Categorical for discrete actions.
+**DiffusionPolicyHead** — Conditional DDIM diffusion for continuous
+compound actions (pitch, yaw, movement, attack, hotbar, …).
+Generates a unified continuous action vector in 3-5 denoising steps
+conditioned on the JambaCore hidden state.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -395,73 +392,4 @@ class DiffusionPolicyHead(nn.Module):
         entropy = torch.ones(B, device=device) * 0.5  # placeholder constant
 
         value = self.value_head(state)
-        return log_prob, entropy, value
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Legacy discrete policy head  (deprecated — kept for backward compat)
-# ────────────────────────────────────────────────────────────────────────────
-
-class PolicyHead(nn.Module):
-    """
-    MLP-based policy head for discrete action selection *(deprecated)*.
-
-    Args:
-        input_dim: Core hidden state dimension.
-        hidden_dim: MLP hidden size.
-        action_dim: Number of discrete actions.
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 256,
-        hidden_dim: int = 256,
-        action_dim: int = 64,
-    ):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-        # Value head for actor-critic
-        self.value_head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.net(state)
-        value = self.value_head(state)
-        return logits, value
-
-    def act(
-        self,
-        state: torch.Tensor,
-        deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(state)
-        dist = Categorical(logits=logits)
-
-        if deterministic:
-            action = logits.argmax(dim=-1)
-        else:
-            action = dist.sample()
-
-        log_prob = dist.log_prob(action)
-        return action, log_prob, value
-
-    def evaluate(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(state)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
         return log_prob, entropy, value

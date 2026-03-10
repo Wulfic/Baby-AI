@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from baby_ai.config import TrainingConfig, DEFAULT_CONFIG
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
-from baby_ai.learning.intrinsic import ICM, JEPACuriosity, LearningProgressEstimator
+from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
 from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
@@ -31,14 +31,14 @@ class LearnerThread:
 
     Continuously:
     1. Samples prioritized minibatches from replay
-    2. Computes policy + ICM + consolidation losses
+    2. Computes policy + JEPA curiosity + consolidation losses
     3. Updates Teacher weights
     4. Updates transition priorities based on learning progress
 
     Args:
         teacher: Teacher model to train.
         replay: Prioritized replay buffer.
-        icm: Intrinsic Curiosity Module.
+        curiosity: JEPA curiosity module.
         consolidator: EWC consolidation module.
         config: Training hyperparameters.
         device: Device for training.
@@ -48,7 +48,7 @@ class LearnerThread:
         self,
         teacher: nn.Module,
         replay: PrioritizedReplayBuffer,
-        icm: ICM,
+        curiosity: JEPACuriosity,
         consolidator: Consolidator,
         config: TrainingConfig | None = None,
         device: str = "cuda",
@@ -56,7 +56,7 @@ class LearnerThread:
     ):
         self.teacher = teacher
         self.replay = replay
-        self.icm = icm
+        self.curiosity = curiosity
         self.consolidator = consolidator
         self.config = config or DEFAULT_CONFIG.training
         self.device = device
@@ -149,7 +149,7 @@ class LearnerThread:
 
         # Forward pass with AMP
         # Acquire the teacher lock to prevent the distillation thread
-        # from running a concurrent forward on the same cuDNN GRU
+        # from running a concurrent forward on the same SSM
         # (whose internal reserve buffers are not thread-safe).
         with self._teacher_lock:
             if self.config.use_amp:
@@ -248,7 +248,7 @@ class LearnerThread:
             k: v for k, v in batch.items()
             if k in ("vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor")
         }
-        if "action" in batch and hasattr(self.teacher, 'policy_type') and self.teacher.policy_type == "diffusion":
+        if "action" in batch:
             forward_kwargs["actions"] = batch["action"]
 
         outputs = self.teacher(**forward_kwargs)
@@ -261,11 +261,7 @@ class LearnerThread:
         # Anchor loss to the computation graph via a zero derived from
         # model output.  This ensures loss.grad_fn is set even when no
         # policy branch fires, so backward() won't crash.
-        action_logits = outputs.get("action_logits")
-        if action_logits is not None:
-            loss = (action_logits.sum() * 0.0).squeeze()
-        else:
-            loss = (value.sum() * 0.0).squeeze()
+        loss = (value.sum() * 0.0).squeeze()
 
         if "action" in batch and "reward" in batch:
             actions = batch["action"]
@@ -276,47 +272,22 @@ class LearnerThread:
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
             advantage = torch.clamp(advantage, -3.0, 3.0)
 
-            # Value loss (shared by both policy types)
+            # Value loss
             value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
 
-            if hasattr(self.teacher, 'policy_type') and self.teacher.policy_type == "diffusion":
-                # Diffusion policy: reward-weighted denoising loss
-                denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
-                # Weight denoising loss by advantage (reward-weighted regression)
-                policy_loss = torch.clamp(denoising_loss, max=10.0)
-                loss = policy_loss + 0.5 * value_loss
-            else:
-                # Legacy discrete policy: PPO-style categorical loss
-                action_logits = outputs["action_logits"]
-                action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-                action_logits = torch.clamp(action_logits, min=-100.0, max=100.0)
+            # Diffusion policy: reward-weighted denoising loss
+            denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
+            policy_loss = torch.clamp(denoising_loss, max=10.0)
+            loss = policy_loss + 0.5 * value_loss
 
-                dist = torch.distributions.Categorical(logits=action_logits)
-                log_prob = dist.log_prob(actions)
-                entropy = dist.entropy()
-
-                policy_loss = -(log_prob * advantage.detach() * weights).mean()
-                entropy_bonus = 0.01 * entropy.mean()
-                loss = policy_loss + 0.5 * value_loss - entropy_bonus
-
-        # JEPA world-model loss (replaces legacy ICM)
+        # JEPA world-model loss
         if "next_fused" in batch and "action" in batch:
-            # If teacher has a LatentWorldModel, use JEPA curiosity;
-            # otherwise fall back to legacy ICM.
-            if hasattr(self.teacher, 'predictive') and hasattr(self.teacher.predictive, 'predict_next_latent'):
-                wm_out = self.teacher.predictive(
-                    outputs["core_state"], batch["next_fused"], batch["action"],
-                )
-                dynamics_loss = torch.clamp(wm_out["dynamics_loss"], max=10.0)
-                kl_loss = torch.clamp(wm_out["kl_loss"], max=10.0)
-                loss = loss + 0.1 * dynamics_loss + 0.01 * kl_loss
-            else:
-                # Legacy ICM fallback
-                icm_out = self.icm(batch["fused"], batch["next_fused"], batch["action"])
-                fwd_loss_clamped = torch.clamp(icm_out["forward_loss"], max=10.0)
-                inv_loss_clamped = torch.clamp(icm_out["inverse_loss"], max=10.0)
-                icm_loss = fwd_loss_clamped + inv_loss_clamped
-                loss = loss + 0.1 * icm_loss
+            wm_out = self.teacher.predictive(
+                outputs["core_state"], batch["next_fused"], batch["action"],
+            )
+            dynamics_loss = torch.clamp(wm_out["dynamics_loss"], max=10.0)
+            kl_loss = torch.clamp(wm_out["kl_loss"], max=10.0)
+            loss = loss + 0.1 * dynamics_loss + 0.01 * kl_loss
 
         # MoE load-balancing auxiliary loss (from Jamba temporal core)
         if hasattr(self.teacher, 'temporal') and hasattr(self.teacher.temporal, 'aux_loss'):

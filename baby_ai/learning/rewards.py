@@ -25,7 +25,7 @@ class RewardComposer:
     Composes multiple reward channels with configurable weights.
 
     Channels:
-    - intrinsic: curiosity (ICM prediction error) + learning progress
+    - intrinsic: curiosity (JEPA prediction error) + learning progress
     - communication: reward for useful communication
     - extrinsic: sparse task rewards (survival, etc.)
     - exploration: reward for reaching visually new areas

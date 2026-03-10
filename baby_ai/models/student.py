@@ -32,8 +32,7 @@ class StudentModel(BabyAgentBase):
             code_embed_dim=config.encoder.code_embed_dim,
             sensor_embed_dim=config.encoder.sensor_embed_dim,
             fused_dim=config.encoder.fused_dim,
-            gru_hidden=config.gru_hidden,
-            gru_layers=config.gru_layers,
+            hidden_dim=config.hidden_dim,
             policy_hidden=config.policy_hidden,
             action_dim=config.action_dim,
             comm_vocab_size=config.comm_vocab_size,
@@ -44,10 +43,8 @@ class StudentModel(BabyAgentBase):
             code_hidden_dim=config.encoder.code_embed_dim,
             code_num_layers=3,
             # Jamba temporal core (Top-1 MoE, 4 experts)
-            temporal_type=config.temporal_type,
             jamba_config=config.jamba,
             # Diffusion policy (continuous actions, 3-5 DDIM steps)
-            policy_type=config.policy_type,
             diffusion_config=config.diffusion,
         )
 

@@ -2,9 +2,9 @@
 Teacher → Student distillation engine.
 
 Performs knowledge distillation using:
-- KL divergence on action logits and communication logits
+- MSE on continuous action vectors
+- KL divergence on communication logits
 - Feature matching on fused embeddings
-- Prioritized sampling from replay buffer
 
 Supports atomic Student weight swaps to avoid blocking inference.
 """
@@ -152,7 +152,7 @@ class DistillationEngine:
         # Wrap in autocast so teacher outputs match the dtype that
         # autocast will produce for the student forward pass.
         # Acquire teacher lock to prevent concurrent forward on the
-        # same cuDNN GRU from the learner thread (reserve buffers
+        # same SSM temporal core from the learner thread (state buffers
         # are not thread-safe).
         with self._teacher_lock:
             with torch.no_grad():

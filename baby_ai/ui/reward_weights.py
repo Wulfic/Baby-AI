@@ -44,7 +44,7 @@ class WeightInfo:
 # Sub-weights MUST appear immediately after their parent.
 REWARD_WEIGHTS: List[WeightInfo] = [
     # ── Baseline ────────────────────────────────────────────────
-    WeightInfo("intrinsic",         "Intrinsic (ICM)",    "Baseline",     0.1,    0.0, 10.0,   0.1),
+    WeightInfo("intrinsic",         "Intrinsic (JEPA)",  "Baseline",     0.1,    0.0, 10.0,   0.1),
     WeightInfo("survival",          "Survival",           "Baseline",     1.0,    0.0,  5.0,   0.1),
     WeightInfo("visual_change",     "Visual Change",      "Baseline",     0.1,    0.0,  5.0,   0.1),
 

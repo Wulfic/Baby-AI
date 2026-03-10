@@ -46,7 +46,7 @@ class InferenceThread:
     Features:
     - Non-blocking: callers submit requests and wait on events
     - Latency tracking: measures per-step inference time
-    - Hidden state management: maintains GRU hidden per "session"
+    - Hidden state management: maintains Jamba hidden per "session"
     - Atomic model swap: accepts new weights without stopping
 
     Args:
@@ -72,7 +72,7 @@ class InferenceThread:
         self._queue: queue.Queue[Optional[InferenceRequest]] = queue.Queue(maxsize=queue_size)
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._hidden = None  # JambaState or torch.Tensor (GRU legacy)
+        self._hidden = None  # JambaState (Jamba temporal core)
         self._latency = LatencyTracker("inference")
         self._step = 0
         self._swap_lock = threading.Lock()
@@ -258,7 +258,7 @@ class InferenceThread:
             log.debug("Could not send pause command: %s", e)
 
     def reset_hidden(self) -> None:
-        """Reset the GRU hidden state (e.g., start of new episode)."""
+        """Reset the Jamba hidden state (e.g., start of new episode)."""
         self._hidden = None
 
     def swap_model(self, new_state_dict: dict) -> None:

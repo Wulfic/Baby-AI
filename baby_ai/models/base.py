@@ -1,8 +1,8 @@
 """
 Base agent model — shared architecture for Student and Teacher.
 
-Composes: modality encoders → multimodal fusion → temporal core →
-policy head + communication head + predictive head.
+Composes: modality encoders → multimodal fusion → Jamba core →
+diffusion policy head + communication head + latent world model.
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ from baby_ai.encoders.vision import VisionEncoder
 from baby_ai.encoders.audio import AudioEncoder
 from baby_ai.encoders.code import CodeEncoder
 from baby_ai.encoders.multimodal import MultimodalFusion
-from baby_ai.core.temporal import TemporalCore, JambaCore
-from baby_ai.core.policy import PolicyHead, DiffusionPolicyHead
+from baby_ai.core.temporal import JambaCore
+from baby_ai.core.policy import DiffusionPolicyHead
 from baby_ai.core.communication import CommunicationHead
-from baby_ai.core.predictive import LatentWorldModel, PredictiveHead
+from baby_ai.core.predictive import LatentWorldModel
 from baby_ai.config import JambaConfig, DiffusionPolicyConfig
 
 
@@ -36,10 +36,9 @@ class BabyAgentBase(nn.Module):
         code_embed_dim: Code encoder output dim.
         sensor_embed_dim: Sensor encoder output dim (simple linear).
         fused_dim: Multimodal fusion output dim.
-        gru_hidden: GRU hidden state dim.
-        gru_layers: Number of GRU layers.
+        hidden_dim: Jamba hidden state dim.
         policy_hidden: Policy MLP hidden dim.
-        action_dim: Number of discrete actions.
+        action_dim: Discrete action count (used only by env reward computer).
         comm_vocab_size: Communication vocabulary size.
         comm_max_len: Max utterance length.
         vision_width_mult: Width multiplier for vision encoder.
@@ -58,8 +57,7 @@ class BabyAgentBase(nn.Module):
         code_embed_dim: int = 128,
         sensor_embed_dim: int = 64,
         fused_dim: int = 256,
-        gru_hidden: int = 256,
-        gru_layers: int = 2,
+        hidden_dim: int = 256,
         policy_hidden: int = 256,
         action_dim: int = 64,
         comm_vocab_size: int = 4096,
@@ -71,9 +69,7 @@ class BabyAgentBase(nn.Module):
         n_mels: int = 64,
         code_node_feat_dim: int = 64,
         sensor_channels: int = 16,
-        temporal_type: str = "jamba",
         jamba_config: JambaConfig | None = None,
-        policy_type: str = "diffusion",
         diffusion_config: DiffusionPolicyConfig | None = None,
     ):
         super().__init__()
@@ -116,68 +112,53 @@ class BabyAgentBase(nn.Module):
         )
 
         # --- Temporal core ---
-        if temporal_type == "jamba":
-            if jamba_config is None:
-                jamba_config = JambaConfig()
-            self.temporal = JambaCore(
-                input_dim=fused_dim,
-                hidden_dim=gru_hidden,
-                num_layers=jamba_config.num_layers,
-                d_state=jamba_config.d_state,
-                d_conv=jamba_config.d_conv,
-                expand=jamba_config.expand,
-                dt_rank=jamba_config.dt_rank,
-                num_experts=jamba_config.num_experts,
-                top_k_routing=jamba_config.top_k_routing,
-                moe_every_n=jamba_config.moe_every_n,
-                ffn_mult=jamba_config.ffn_mult,
-                load_balance_weight=jamba_config.load_balance_weight,
-            )
-        else:
-            self.temporal = TemporalCore(
-                input_dim=fused_dim,
-                hidden_dim=gru_hidden,
-                num_layers=gru_layers,
-            )
+        if jamba_config is None:
+            jamba_config = JambaConfig()
+        self.temporal = JambaCore(
+            input_dim=fused_dim,
+            hidden_dim=hidden_dim,
+            num_layers=jamba_config.num_layers,
+            d_state=jamba_config.d_state,
+            d_conv=jamba_config.d_conv,
+            expand=jamba_config.expand,
+            dt_rank=jamba_config.dt_rank,
+            num_experts=jamba_config.num_experts,
+            top_k_routing=jamba_config.top_k_routing,
+            moe_every_n=jamba_config.moe_every_n,
+            ffn_mult=jamba_config.ffn_mult,
+            load_balance_weight=jamba_config.load_balance_weight,
+        )
 
         # --- Output heads ---
-        self.policy_type = policy_type
-        if policy_type == "diffusion":
-            if diffusion_config is None:
-                diffusion_config = DiffusionPolicyConfig()
-            self.policy = DiffusionPolicyHead(
-                input_dim=gru_hidden,
-                action_dim=diffusion_config.action_continuous_dim,
-                hidden_dim=policy_hidden,
-                num_train_steps=diffusion_config.num_train_steps,
-                num_infer_steps=diffusion_config.num_infer_steps,
-                time_embed_dim=diffusion_config.time_embed_dim,
-                beta_start=diffusion_config.beta_start,
-                beta_end=diffusion_config.beta_end,
-            )
-        else:
-            self.policy = PolicyHead(
-                input_dim=gru_hidden,
-                hidden_dim=policy_hidden,
-                action_dim=action_dim,
-            )
+        if diffusion_config is None:
+            diffusion_config = DiffusionPolicyConfig()
+        self.policy = DiffusionPolicyHead(
+            input_dim=hidden_dim,
+            action_dim=diffusion_config.action_continuous_dim,
+            hidden_dim=policy_hidden,
+            num_train_steps=diffusion_config.num_train_steps,
+            num_infer_steps=diffusion_config.num_infer_steps,
+            time_embed_dim=diffusion_config.time_embed_dim,
+            beta_start=diffusion_config.beta_start,
+            beta_end=diffusion_config.beta_end,
+        )
         self.communication = CommunicationHead(
-            input_dim=gru_hidden,
+            input_dim=hidden_dim,
             vocab_size=comm_vocab_size,
-            hidden_dim=gru_hidden,
+            hidden_dim=hidden_dim,
             max_len=comm_max_len,
         )
         self.predictive = LatentWorldModel(
-            state_dim=gru_hidden,      # core output dim (world model observes core state)
-            action_dim=diffusion_config.action_continuous_dim if diffusion_config else action_dim,
-            latent_dim=gru_hidden,
-            hidden_dim=gru_hidden,
+            state_dim=hidden_dim,      # core output dim (world model observes core state)
+            action_dim=diffusion_config.action_continuous_dim,
+            latent_dim=hidden_dim,
+            hidden_dim=hidden_dim,
             stochastic_dim=32,
         )
 
         # Store dims for external access
         self.fused_dim = fused_dim
-        self.gru_hidden = gru_hidden
+        self.hidden_dim = hidden_dim
         self.action_dim = action_dim
 
     def encode(
@@ -226,9 +207,8 @@ class BabyAgentBase(nn.Module):
         Full forward pass: encode → fuse → temporal → policy + comm.
 
         Returns dict with:
-            fused, core_state, hidden, value, comm_logits.
-            For discrete policy: action_logits (B, action_dim).
-            For diffusion policy: denoising_loss (scalar).
+            fused, core_state, hidden, value, comm_logits,
+            denoising_loss (scalar), action (B, action_dim).
         """
         fused = self.encode(
             vision=vision, audio=audio,
@@ -239,27 +219,21 @@ class BabyAgentBase(nn.Module):
         core_state, hidden = self.temporal(fused, hidden)
         comm_logits = self.communication.get_logits(core_state)
 
-        result = {
+        denoising_loss, value = self.policy(core_state, actions=actions)
+
+        # Generate action for distillation / evaluation (no grad noise)
+        with torch.no_grad():
+            action, _, _ = self.policy.act(core_state, deterministic=True)
+
+        return {
             "fused": fused,
             "core_state": core_state,
             "hidden": hidden,
             "comm_logits": comm_logits,
+            "denoising_loss": denoising_loss,
+            "value": value,
+            "action": action,
         }
-
-        if self.policy_type == "diffusion":
-            denoising_loss, value = self.policy(core_state, actions=actions)
-            result["denoising_loss"] = denoising_loss
-            result["value"] = value
-            # Provide a dummy for backward-compat code that reads action_logits
-            result["action_logits"] = torch.zeros(
-                core_state.size(0), self.policy.action_dim, device=core_state.device,
-            )
-        else:
-            action_logits, value = self.policy(core_state)
-            result["action_logits"] = action_logits
-            result["value"] = value
-
-        return result
 
     def act(
         self,

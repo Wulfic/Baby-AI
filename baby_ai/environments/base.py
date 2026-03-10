@@ -38,12 +38,12 @@ class GameEnvironment(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def step(self, action_id: int) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
+    def step(self, action_id) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
         """
         Execute an action and return (observation, reward, done, info).
 
         Args:
-            action_id: Index into the environment's discrete action space.
+            action_id: Action to execute (torch.Tensor continuous vector).
 
         Returns:
             observation: Dict with tensor inputs for the model.

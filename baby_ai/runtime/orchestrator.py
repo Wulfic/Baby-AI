@@ -76,7 +76,7 @@ class Orchestrator:
         )
 
         # --- Learning modules ---
-        self.icm = JEPACuriosity(
+        self.curiosity = JEPACuriosity(
             world_model=self.student.predictive,
             reward_scale=1.0,
             max_reward=5.0,
@@ -94,7 +94,7 @@ class Orchestrator:
 
         # --- Distillation ---
         # Lock to prevent concurrent forward/backward on the Teacher
-        # from the learner and distillation threads (cuDNN GRU is not
+        # from the learner and distillation threads (cuDNN/SSM is not
         # thread-safe — its internal reserve buffers get corrupted).
         self._teacher_lock = threading.Lock()
 
@@ -119,7 +119,7 @@ class Orchestrator:
         self.learner_thread = LearnerThread(
             teacher=self.teacher,
             replay=self.replay,
-            icm=self.icm,
+            curiosity=self.curiosity,
             consolidator=self.consolidator,
             config=self.config.training,
             device=device,
@@ -208,7 +208,7 @@ class Orchestrator:
         torch.save({
             "student_state_dict": self.student.state_dict(),
             "teacher_state_dict": self.teacher.state_dict(),
-            "icm_state_dict": self.icm.state_dict(),
+            "curiosity_state_dict": self.curiosity.state_dict(),
             "config": self.config,
             "learner_step": self.learner_thread.step_count,
             "distill_count": self.distill_thread.stats["distill_count"],
@@ -265,8 +265,10 @@ class Orchestrator:
 
         self.student.load_state_dict(ckpt["student_state_dict"])
         self.teacher.load_state_dict(ckpt["teacher_state_dict"])
-        if "icm_state_dict" in ckpt:
-            self.icm.load_state_dict(ckpt["icm_state_dict"])
+        # Load curiosity module (supports old "icm_state_dict" key)
+        curiosity_sd = ckpt.get("curiosity_state_dict") or ckpt.get("icm_state_dict")
+        if curiosity_sd is not None:
+            self.curiosity.load_state_dict(curiosity_sd)
         # Restore reward composer step counter so intrinsic weight
         # decay continues across sessions instead of resetting.
         if "reward_composer_step" in ckpt:

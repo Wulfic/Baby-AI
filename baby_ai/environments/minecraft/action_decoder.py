@@ -38,7 +38,7 @@ class ContinuousActionDecoder:
       - Keys, buttons, and look deltas for the InputController
       - Category flags (is_attack, is_movement, etc.) for reward shaping
       - A human-readable description for logging
-      - An approximate discrete action ID for backward compatibility
+      - An approximate discrete action ID for the reward computer
     """
 
     def __init__(self, threshold: float = PRESS_THRESHOLD):
@@ -212,7 +212,7 @@ class ContinuousActionDecoder:
         """
         Map continuous action to the closest discrete action ID (0-127).
 
-        This is a best-effort match for backward compatibility with
+        This is a best-effort match for compatibility with
         logging, reward_computer, and action_categories.
         """
         from baby_ai.environments.minecraft.actions import (

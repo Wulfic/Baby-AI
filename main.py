@@ -209,13 +209,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     1. Finds the Minecraft window (must be running in windowed mode).
     2. Captures screen frames as observations.
     3. Sends keyboard/mouse input via Win32 PostMessage.
-    4. Uses intrinsic curiosity (ICM) as the primary reward signal.
+    4. Uses JEPA curiosity as the primary intrinsic reward signal.
 
     The user's real keyboard and mouse are NOT affected — all input
     goes directly to the Minecraft window handle.
     """
     from baby_ai.environments.minecraft import MinecraftEnv
-    from baby_ai.environments.minecraft.actions import action_name, match_player_action
+    from baby_ai.environments.minecraft.actions import match_player_action
     from baby_ai.environments.minecraft.action_decoder import continuous_action_name
     from baby_ai.config import CHECKPOINT_DIR
 
@@ -274,8 +274,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
     orchestrator.start()
 
-    # ── ICM for intrinsic reward ────────────────────────────────
-    icm = orchestrator.icm
+    # ── JEPA curiosity for intrinsic reward ─────────────────────────────
+    curiosity = orchestrator.curiosity
 
     # ── UI Control Panel + Reward Toggles ───────────────────────
     from baby_ai.ui.control_panel import AIControlPanel, get_imitation_enabled
@@ -354,13 +354,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     prev_fused: torch.Tensor | None = None
     prev_action: torch.Tensor | None = None
     prev_obs: dict | None = None
-    raw_ir: float = 0.0        # raw ICM curiosity (before normalisation)
+    raw_ir: float = 0.0        # raw JEPA curiosity (before normalisation)
     intrinsic_r: float = 0.0   # normalised + clamped curiosity reward
     episode_reward = 0.0
     episode_steps = 0
     last_distill_count = 0  # track distillation rounds for reward reset
 
-    # Running RMS normalizer for intrinsic (ICM) reward.  Keeps the
+    # Running RMS normalizer for intrinsic (JEPA) reward.  Keeps the
     # curiosity signal bounded regardless of forward-model training
     # state.  EMA of squared values → divide by RMS → clamp [0, 5].
     _ir_ema_sq: float = 1.0   # EMA of intrinsic_r² (init 1.0 to avoid /0)
@@ -446,17 +446,17 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if prev_fused is not None and fused is not None:
                 with torch.no_grad():
                     # Ensure all inputs have a batch dimension (B=1)
-                    _icm_state = prev_fused.to(config.device)
-                    _icm_next  = fused.to(config.device)
-                    _icm_act   = prev_action.to(config.device)
-                    if _icm_state.dim() == 1:
-                        _icm_state = _icm_state.unsqueeze(0)
-                    if _icm_next.dim() == 1:
-                        _icm_next = _icm_next.unsqueeze(0)
-                    if _icm_act.dim() == 1:
-                        _icm_act = _icm_act.unsqueeze(0)  # (20,) → (1, 20)
-                    icm_out = icm(_icm_state, _icm_next, _icm_act)
-                raw_ir = icm_out["curiosity_reward"].mean().item()
+                    _cur_state = prev_fused.to(config.device)
+                    _cur_next  = fused.to(config.device)
+                    _cur_act   = prev_action.to(config.device)
+                    if _cur_state.dim() == 1:
+                        _cur_state = _cur_state.unsqueeze(0)
+                    if _cur_next.dim() == 1:
+                        _cur_next = _cur_next.unsqueeze(0)
+                    if _cur_act.dim() == 1:
+                        _cur_act = _cur_act.unsqueeze(0)  # (20,) → (1, 20)
+                    cur_out = curiosity(_cur_state, _cur_next, _cur_act)
+                raw_ir = cur_out["curiosity_reward"].mean().item()
                 # Running RMS normalisation — keeps magnitude stable
                 # even while the forward model is poorly trained.
                 _ir_ema_sq = (_IR_EMA_DECAY * _ir_ema_sq
@@ -480,7 +480,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 #   1. ALL channels are included (not just a subset)
                 #   2. Toggles take effect instantly
                 #   3. Weight slider changes are reflected live
-                #   4. ICM intrinsic is layered on top
+                #   4. JEPA intrinsic is layered on top
                 w = reward_weights.snapshot()
 
                 # Positive channels (reward)
@@ -624,19 +624,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
                 # Extra imitation mode info — show the player's actual action
                 if _imitation_active and prev_action is not None:
-                    if prev_action.numel() == 1:
-                        # Discrete action from imitation learning
-                        player_aid = prev_action.item()
-                        log.info(
-                            "  [IMITATION] player_action=%d (%s)",
-                            player_aid, action_name(player_aid),
-                        )
-                    else:
-                        # Continuous action tensor
-                        log.info(
-                            "  [IMITATION] player_action=%s",
-                            continuous_action_name(prev_action),
-                        )
+                    log.info(
+                        "  [IMITATION] player_action=%s",
+                        continuous_action_name(prev_action),
+                    )
 
             # ── Episode boundary ────────────────────────────────
             max_steps = mc.max_episode_steps

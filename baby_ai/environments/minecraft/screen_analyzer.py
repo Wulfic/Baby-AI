@@ -623,7 +623,7 @@ def _forward_region(frame: np.ndarray, frac: float = 0.25) -> np.ndarray:
 
 # ────────────────────────────────────────────────────────────────
 # Creative-workflow trackers (extracted to creative_tracking.py)
-# Re-exported here for backward compatibility.
+# Re-exported here for convenience.
 # ────────────────────────────────────────────────────────────────
 from baby_ai.environments.minecraft.creative_tracking import (  # noqa: E402
     BuildingStreakTracker,

@@ -32,8 +32,7 @@ class TeacherModel(BabyAgentBase):
             code_embed_dim=config.encoder.code_embed_dim,
             sensor_embed_dim=config.encoder.sensor_embed_dim,
             fused_dim=config.encoder.fused_dim,
-            gru_hidden=config.gru_hidden,
-            gru_layers=config.gru_layers,
+            hidden_dim=config.hidden_dim,
             policy_hidden=config.policy_hidden,
             action_dim=config.action_dim,
             comm_vocab_size=config.comm_vocab_size,
@@ -44,10 +43,8 @@ class TeacherModel(BabyAgentBase):
             code_hidden_dim=config.encoder.code_embed_dim * 2,
             code_num_layers=5,
             # Jamba temporal core (Top-2 MoE, 8 experts)
-            temporal_type=config.temporal_type,
             jamba_config=config.jamba,
             # Diffusion policy (continuous actions, 20 DDIM steps)
-            policy_type=config.policy_type,
             diffusion_config=config.diffusion,
         )
 
@@ -58,14 +55,14 @@ class TeacherModel(BabyAgentBase):
         """
         Generate soft targets for distillation.
 
-        Returns the Teacher's action logits, communication logits,
+        Returns the Teacher's continuous action, communication logits,
         and intermediate fused features for the Student to match.
         """
         self.eval()
         with torch.no_grad():
             outputs = self.forward(**kwargs)
         return {
-            "action_logits": outputs["action_logits"],
+            "action": outputs["action"],
             "comm_logits": outputs["comm_logits"],
             "fused_features": outputs["fused"],
             "core_state": outputs["core_state"],

@@ -94,7 +94,6 @@ class DiffusionPolicyConfig:
 class JambaConfig:
     """Jamba architecture hyperparameters (Mamba SSM + Mixture of Experts).
 
-    Controls the Jamba temporal core that replaces the legacy GRU.
     Interleaves Mamba-2 selective state-space blocks with sparse MoE FFNs
     for O(1) per-step inference with infinite context caching.
     """
@@ -124,20 +123,17 @@ class EncoderConfig:
 class StudentConfig:
     """Student model: 10-30M params, <200ms inference."""
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    gru_hidden: int = 512
-    gru_layers: int = 2
+    hidden_dim: int = 512        # Jamba hidden state dim
     policy_hidden: int = 512
     comm_vocab_size: int = 4096  # small vocabulary for utterances
     comm_max_len: int = 32
-    action_dim: int = 128  # discrete action space size
+    action_dim: int = 128        # discrete action count (used by env reward computer)
     total_target_params: str = "10-30M"
 
-    # Jamba temporal core (replaces GRU when temporal_type="jamba")
-    temporal_type: str = "jamba"  # "gru" (legacy) or "jamba"
+    # Jamba temporal core
     jamba: JambaConfig = field(default_factory=JambaConfig)
 
-    # Diffusion policy (replaces discrete PolicyHead when policy_type="diffusion")
-    policy_type: str = "diffusion"  # "discrete" (legacy) or "diffusion"
+    # Diffusion policy (20-dim continuous actions)
     diffusion: DiffusionPolicyConfig = field(default_factory=DiffusionPolicyConfig)
 
     # System 2 test-time search
@@ -154,16 +150,14 @@ class TeacherConfig:
         sensor_embed_dim=256,
         fused_dim=1024,
     ))
-    gru_hidden: int = 1024
-    gru_layers: int = 3
+    hidden_dim: int = 1024       # Jamba hidden state dim
     policy_hidden: int = 1024
     comm_vocab_size: int = 4096
     comm_max_len: int = 64
-    action_dim: int = 128
+    action_dim: int = 128        # discrete action count (used by env reward computer)
     total_target_params: str = "50-100M"
 
     # Jamba temporal core — scaled up for Teacher
-    temporal_type: str = "jamba"
     jamba: JambaConfig = field(default_factory=lambda: JambaConfig(
         num_layers=4,
         d_state=16,
@@ -174,7 +168,6 @@ class TeacherConfig:
     ))
 
     # Diffusion policy — Teacher uses more refinement steps
-    policy_type: str = "diffusion"
     diffusion: DiffusionPolicyConfig = field(default_factory=lambda: DiffusionPolicyConfig(
         num_infer_steps=20,
     ))
