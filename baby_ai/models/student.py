@@ -42,6 +42,7 @@ class StudentModel(BabyAgentBase):
             audio_width_mult=1.0,
             code_hidden_dim=config.encoder.code_embed_dim,
             code_num_layers=3,
+            sensor_channels=32,  # 32-dim game-state vector from SensorPacker
             # Jamba temporal core (Top-1 MoE, 4 experts)
             jamba_config=config.jamba,
             # Diffusion policy (continuous actions, 3-5 DDIM steps)

@@ -240,7 +240,7 @@ class CodeConfig:
 
 @dataclass
 class SensorConfig:
-    max_channels: int = 16
+    max_channels: int = 32
     frame_rate: int = 30  # fixed-rate normalised frames/sec
 
 

@@ -7,10 +7,14 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.entity.Entity;
+import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.LightType;
+import net.minecraft.world.biome.Biome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,11 +65,11 @@ public class BabyAiMod implements ModInitializer {
                 EventBridge.INSTANCE.onHeartbeat(tick);
             }
 
-            // ── Position update (every 20 ticks = 1 second) ────
+            // ── Position update (every 10 ticks = 0.5 seconds) ───
             // Sends player coordinates, camera angles, on_ground,
             // and light level so the Python agent can detect caves,
             // falls, and underground navigation.
-            if (tick % 20 == 0) {
+            if (tick % 10 == 0) {
                 for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                     BlockPos eyePos = BlockPos.ofFloored(
                         player.getX(), player.getEyeY(), player.getZ()
@@ -75,6 +79,46 @@ public class BabyAiMod implements ModInitializer {
                         player.getX(), player.getY(), player.getZ(),
                         player.getPitch(), player.getYaw(),
                         player.isOnGround(), light, tick
+                    );
+
+                    // ── Full player status snapshot ────────────
+                    // Rich telemetry for the sensor encoder: vitals,
+                    // movement state, world conditions, inventory.
+                    Vec3d vel = player.getVelocity();
+                    BlockPos feetPos = player.getBlockPos();
+                    RegistryEntry<Biome> biomeEntry = player.getWorld().getBiome(feetPos);
+                    String biomeId = biomeEntry.getKey()
+                            .map(k -> k.getValue().toString())
+                            .orElse("unknown");
+                    ItemStack mainHand = player.getMainHandStack();
+                    String heldItemId = mainHand.isEmpty()
+                            ? "minecraft:air"
+                            : Registries.ITEM.getId(mainHand.getItem()).toString();
+
+                    // Count non-empty inventory slots (main 36 slots)
+                    int usedSlots = 0;
+                    for (int i = 0; i < player.getInventory().main.size(); i++) {
+                        if (!player.getInventory().main.get(i).isEmpty()) {
+                            usedSlots++;
+                        }
+                    }
+
+                    EventBridge.INSTANCE.onPlayerStatus(
+                        player.getHealth(), player.getMaxHealth(),
+                        player.getHungerManager().getFoodLevel(),
+                        player.getHungerManager().getSaturationLevel(),
+                        player.getArmor(),
+                        player.experienceLevel, player.experienceProgress,
+                        player.getAir(), player.getMaxAir(),
+                        player.isSprinting(), player.isSwimming(),
+                        player.isSneaking(), player.isOnFire(),
+                        player.getWorld().getTime(),
+                        player.getWorld().getTimeOfDay(),
+                        player.getWorld().isRaining(),
+                        player.getWorld().isThundering(),
+                        biomeId, heldItemId,
+                        vel.x, vel.y, vel.z,
+                        usedSlots, tick
                     );
                 }
             }

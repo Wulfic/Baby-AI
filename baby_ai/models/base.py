@@ -69,7 +69,7 @@ class BabyAgentBase(nn.Module):
         code_num_layers: int = 3,
         n_mels: int = 64,
         code_node_feat_dim: int = 64,
-        sensor_channels: int = 16,
+        sensor_channels: int = 32,
         jamba_config: JambaConfig | None = None,
         diffusion_config: DiffusionPolicyConfig | None = None,
         goal_dim: int = 0,

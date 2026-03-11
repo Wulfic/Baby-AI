@@ -227,11 +227,11 @@ class RewardComputer:
         rewards["hotbar_spam_penalty"] = hotbar_spam_penalty
 
         # ── Mod events ──────────────────────────────────────────
-        mod_events = (
-            env._mod_bridge.drain_events()
-            if env._mod_bridge is not None and env._mod_bridge.connected
-            else []
-        )
+        # Events were already drained and fed to the sensor packer
+        # inside _observe() so all modalities share the same temporal
+        # snapshot.  Re-use the cached list here for reward signals.
+        mod_events = getattr(env, '_latest_mod_events', [])
+
         mod_blocks_broken = [e for e in mod_events if e.get("event") == "block_broken"]
         mod_blocks_placed = [e for e in mod_events if e.get("event") == "block_placed"]
         mod_items_crafted = [e for e in mod_events if e.get("event") == "item_crafted"]

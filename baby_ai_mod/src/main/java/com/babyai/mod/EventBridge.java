@@ -1,5 +1,6 @@
 package com.babyai.mod;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.server.MinecraftServer;
@@ -33,6 +34,11 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>{@code food_changed}   — old_food, new_food, delta, tick</li>
  *   <li>{@code xp_gained}      — amount, total_level, tick</li>
  *   <li>{@code position_update} — x, y, z, pitch, yaw, on_ground, light, tick</li>
+ *   <li>{@code player_status}  — health, max_health, food, saturation, armor,
+ *        xp_level, xp_progress, air, max_air, is_sprinting, is_swimming,
+ *        is_sneaking, is_on_fire, game_time, day_time, is_raining,
+ *        is_thundering, biome, held_item, velocity_x, velocity_y, velocity_z,
+ *        inventory_used_slots, tick</li>
  * </ul>
  */
 public class EventBridge {
@@ -271,6 +277,87 @@ public class EventBridge {
         j.addProperty("yaw", yaw);
         j.addProperty("on_ground", onGround);
         j.addProperty("light", light);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Rich periodic snapshot of the player's full status.
+     *
+     * <p>Sent every 10 ticks (~2 Hz) alongside position updates.
+     * Provides all the structured game-state data that the Python
+     * sensor encoder needs to build a complete observation: vitals,
+     * movement state, environment conditions, and inventory summary.
+     *
+     * @param health        Current health (0–20, half-hearts).
+     * @param maxHealth     Max health (usually 20).
+     * @param food          Hunger level (0–20).
+     * @param saturation    Saturation level (0–20).
+     * @param armor         Armor defense value (0–20).
+     * @param xpLevel       Experience level.
+     * @param xpProgress    Progress to next level (0.0–1.0).
+     * @param air           Remaining air ticks (300 = full, 0 = drowning).
+     * @param maxAir        Maximum air ticks.
+     * @param isSprinting   True if currently sprinting.
+     * @param isSwimming    True if currently swimming.
+     * @param isSneaking    True if currently sneaking.
+     * @param isOnFire      True if the player is burning.
+     * @param gameTime      Total world time in ticks (absolute).
+     * @param dayTime       Time of day in ticks (0–24000, 0=sunrise).
+     * @param isRaining     True if it's currently raining.
+     * @param isThundering  True if thunderstorm active.
+     * @param biome         Biome ID string (e.g. "minecraft:plains").
+     * @param heldItem      ID of item in main hand (e.g. "minecraft:diamond_pickaxe").
+     * @param velX          Player velocity X component.
+     * @param velY          Player velocity Y component.
+     * @param velZ          Player velocity Z component.
+     * @param invUsedSlots  Number of inventory slots with items (0–36).
+     * @param tick          Current server tick.
+     */
+    public void onPlayerStatus(
+            float health, float maxHealth, int food, float saturation,
+            int armor, int xpLevel, float xpProgress,
+            int air, int maxAir,
+            boolean isSprinting, boolean isSwimming,
+            boolean isSneaking, boolean isOnFire,
+            long gameTime, long dayTime,
+            boolean isRaining, boolean isThundering,
+            String biome, String heldItem,
+            double velX, double velY, double velZ,
+            int invUsedSlots, long tick
+    ) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "player_status");
+        // Vitals
+        j.addProperty("health", health);
+        j.addProperty("max_health", maxHealth);
+        j.addProperty("food", food);
+        j.addProperty("saturation", Math.round(saturation * 100.0f) / 100.0f);
+        j.addProperty("armor", armor);
+        j.addProperty("xp_level", xpLevel);
+        j.addProperty("xp_progress", Math.round(xpProgress * 1000.0f) / 1000.0f);
+        // Oxygen
+        j.addProperty("air", air);
+        j.addProperty("max_air", maxAir);
+        // Movement flags
+        j.addProperty("is_sprinting", isSprinting);
+        j.addProperty("is_swimming", isSwimming);
+        j.addProperty("is_sneaking", isSneaking);
+        j.addProperty("is_on_fire", isOnFire);
+        // World time
+        j.addProperty("game_time", gameTime);
+        j.addProperty("day_time", dayTime);
+        j.addProperty("is_raining", isRaining);
+        j.addProperty("is_thundering", isThundering);
+        // Environment
+        j.addProperty("biome", biome);
+        j.addProperty("held_item", heldItem);
+        // Velocity
+        j.addProperty("velocity_x", Math.round(velX * 1000.0) / 1000.0);
+        j.addProperty("velocity_y", Math.round(velY * 1000.0) / 1000.0);
+        j.addProperty("velocity_z", Math.round(velZ * 1000.0) / 1000.0);
+        // Inventory
+        j.addProperty("inventory_used_slots", invUsedSlots);
         j.addProperty("tick", tick);
         broadcast(j);
     }

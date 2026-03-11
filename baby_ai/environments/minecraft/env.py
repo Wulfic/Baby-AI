@@ -50,7 +50,9 @@ from baby_ai.environments.minecraft.screen_analyzer import (
     BuildingStreakTracker,
     CreativeSequenceTracker,
 )
+from baby_ai.environments.minecraft.audio_capture import AudioCapture
 from baby_ai.environments.minecraft.mod_bridge import ModBridge
+from baby_ai.environments.minecraft.sensor_packer import SensorPacker, NUM_SENSOR_CHANNELS
 from baby_ai.environments.minecraft.window import WindowManager
 from baby_ai.utils.logging import get_logger
 
@@ -96,7 +98,7 @@ class MinecraftEnv(GameEnvironment):
         input_mode: str = "background",
         resolution: Tuple[int, int] = (360, 640),
         step_delay_ms: float = 100.0,
-        sensor_channels: int = 16,
+        sensor_channels: int = 32,
         # ── Auto-launcher options ───────────────────────────────
         auto_launch: bool = False,
         mc_dir: str = "",
@@ -287,11 +289,35 @@ class MinecraftEnv(GameEnvironment):
         self._mod_bridge = ModBridge(port=mod_bridge_port)
         self._mod_bridge.start()
 
+        # ── Sensor packer (structured game state → tensor) ──────
+        self._sensor_packer = SensorPacker()
+
+        # Cached mod events from the most recent _observe() call.
+        # Reward computer reads these instead of draining separately,
+        # ensuring sensor tensor and reward signals use the same events.
+        self._latest_mod_events: list = []
+
+        # ── Live audio capture (WASAPI loopback → mel spectrogram) ──
+        self._audio_capture = AudioCapture(
+            sample_rate=16000,
+            n_mels=64,
+            hop_length=160,
+            win_length=400,
+            context_sec=1.0,
+        )
+
         log.info(
             "MinecraftEnv ready: window='%s' mode=%s resolution=%s guard=%s launcher=%s",
             self._window.title, input_mode, resolution,
             "ON" if self._guard else "OFF",
             "ON" if self._launcher else "OFF",
+        )
+        log.info(
+            "Sensory modalities: vision=RGB %dx%d@~%.0fHz  audio=%s  "
+            "sensors=%d-ch (mod bridge)",
+            resolution[1], resolution[0], 1000.0 / max(step_delay_ms, 1),
+            "LIVE (WASAPI)" if self._audio_capture.available else "SILENT (no device)",
+            NUM_SENSOR_CHANNELS,
         )
 
     # ── GameEnvironment interface ───────────────────────────────
@@ -699,6 +725,9 @@ class MinecraftEnv(GameEnvironment):
         """Release all held inputs, stop input guard, and stop Minecraft."""
         self._input.release_all()
 
+        if self._audio_capture is not None:
+            self._audio_capture.stop()
+
         if self._mod_bridge is not None:
             self._mod_bridge.stop()
             self._mod_bridge = None
@@ -831,23 +860,47 @@ class MinecraftEnv(GameEnvironment):
     # ── Internals ───────────────────────────────────────────────
 
     def _observe(self) -> Dict[str, torch.Tensor]:
-        """Capture a frame and package it as a model-ready observation dict."""
+        """Capture a frame and package it as a model-ready observation dict.
+
+        Returns a dict of tensors covering all active sensory modalities:
+          - **vision**: (1, 3, H, W) RGB frame from screen capture
+          - **audio**: (1, n_mels, T) log-mel spectrogram from WASAPI loopback
+          - **sensor**: (1, 32) normalised game-state vector from mod bridge
+
+        Events are drained from the mod bridge and fed to the sensor
+        packer HERE (before packing) so the sensor tensor is temporally
+        synchronised with the visual frame and audio snapshot.  The
+        drained events are cached in ``_latest_mod_events`` for the
+        reward computer to consume without a second drain.
+        """
+        # ── Drain mod events → update sensor state FIRST ────────
+        # This eliminates the one-step lag where sensors previously
+        # reflected the *previous* step's game state while vision
+        # and audio reflected the current moment.
+        self._latest_mod_events = []
+        if self._mod_bridge is not None and self._mod_bridge.connected:
+            self._latest_mod_events = self._mod_bridge.drain_events()
+            if self._latest_mod_events:
+                self._sensor_packer.update(
+                    self._latest_mod_events,
+                    home_x=self._home_x,
+                    home_z=self._home_z,
+                )
+
         raw_bgr, vision_tensor = self._capture.grab_both()
         self._last_frame = raw_bgr
         self._raw_frame = raw_bgr  # native window resolution for analysers
 
-        # Audio placeholder — zero mel spectrogram with correct shape:
-        # (B, n_mels, T) where n_mels=64, T≈100 for 1 sec at 16kHz/160 hop
-        audio_tensor = torch.zeros(1, 64, 100)
+        # ── Live audio from system output ───────────────────────
+        audio_tensor = self._audio_capture.get_mel_spectrogram()  # (1, n_mels, T)
 
-        # Sensor placeholder — could be populated with game-state
-        # extracted via OCR (health bar, hunger, position estimates)
-        sensor_tensor = torch.zeros(1, self._sensor_channels)
+        # ── Structured game state from mod bridge ───────────────
+        sensor_tensor = self._sensor_packer.pack()  # (1, 32)
 
         return {
             "vision": vision_tensor,    # (1, 3, H, W)
-            "audio": audio_tensor,      # (1, 1, T)
-            "sensor": sensor_tensor,    # (1, S)
+            "audio": audio_tensor,      # (1, n_mels, T)
+            "sensor": sensor_tensor,    # (1, 32)
         }
 
     # ── Diagnostics ─────────────────────────────────────────────
