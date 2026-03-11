@@ -121,6 +121,7 @@ class Orchestrator:
             system2_config=self.config.student.system2,
             system3_config=self.config.student.system3,
             swap_lock=self._model_swap_lock,
+            runtime_config=self.config.runtime,
         )
 
         self.learner_thread = LearnerThread(
@@ -131,6 +132,7 @@ class Orchestrator:
             config=self.config.training,
             device=device,
             teacher_lock=self._teacher_lock,
+            runtime_config=self.config.runtime,
         )
 
         self.distill_thread = DistillThread(

@@ -15,9 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from baby_ai.config import TrainingConfig, DEFAULT_CONFIG
+from baby_ai.config import TrainingConfig, RuntimeConfig, REBELConfig, DEFAULT_CONFIG
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
+from baby_ai.learning.rebel import REBELLoss
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
 
@@ -52,6 +53,7 @@ class LearnerThread:
         config: TrainingConfig | None = None,
         device: str = "cuda",
         teacher_lock: threading.Lock | None = None,
+        runtime_config: RuntimeConfig | None = None,
     ):
         self.teacher = teacher
         self.replay = replay
@@ -60,6 +62,18 @@ class LearnerThread:
         self.config = config or DEFAULT_CONFIG.training
         self.device = device
         self._teacher_lock = teacher_lock or threading.Lock()
+        self._runtime_config = runtime_config or RuntimeConfig()
+
+        # REBEL RL loss (Phase D)
+        rebel_cfg = getattr(teacher, '_rebel_config', None)
+        if rebel_cfg is None:
+            rebel_cfg = REBELConfig()
+        self._rebel_enabled = rebel_cfg.enabled
+        self._rebel_loss_fn = REBELLoss(
+            beta=rebel_cfg.beta,
+            reward_clip=rebel_cfg.reward_clip,
+        ).to(device) if rebel_cfg.enabled else None
+        self._rebel_value_loss_weight = rebel_cfg.value_loss_weight
 
         # Optimizer with parameter-group-specific learning rates
         encoder_params = []
@@ -117,6 +131,15 @@ class LearnerThread:
             return
         self._running = True
         self.teacher.to(self.device).train()
+
+        # Phase A: optional torch.compile for Teacher
+        if self._runtime_config.compile_teacher and hasattr(torch, 'compile'):
+            # Teacher uses 'default' mode to avoid CUDA graph conflicts with
+            # dynamic replay shapes.  Config compile_mode is used for Student;
+            # Teacher always gets 'default' for safety.
+            log.info("Compiling Teacher model with torch.compile(mode='default')...")
+            self.teacher = torch.compile(self.teacher, mode="default", fullgraph=False)
+
         self._thread = threading.Thread(target=self._loop, daemon=True, name="LearnerThread")
         self._thread.start()
         log.info("Learner thread started.")
@@ -279,19 +302,23 @@ class LearnerThread:
         if "action" in batch and "reward" in batch:
             actions = batch["action"]
             rewards = batch["reward"]
-            old_values = batch.get("value", torch.zeros_like(rewards))
 
-            advantage = rewards - old_values.squeeze(-1)
-            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-            advantage = torch.clamp(advantage, -3.0, 3.0)
-
-            # Value loss
+            # Value loss — always trained (needed for System 2 trajectory scoring)
             value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
 
-            # Diffusion policy: reward-weighted denoising loss
-            denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
-            policy_loss = torch.clamp(denoising_loss, max=10.0)
-            loss = policy_loss + 0.5 * value_loss
+            if self._rebel_enabled and self._rebel_loss_fn is not None:
+                # ── REBEL paired loss (Phase D) ──
+                rebel_loss = self._compute_rebel_loss(outputs, batch, weights)
+                loss = rebel_loss + self._rebel_value_loss_weight * value_loss
+            else:
+                # ── Legacy: reward-weighted denoising loss ──
+                old_values = batch.get("value", torch.zeros_like(rewards))
+                advantage = rewards - old_values.squeeze(-1)
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+                advantage = torch.clamp(advantage, -3.0, 3.0)
+                denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
+                policy_loss = torch.clamp(denoising_loss, max=10.0)
+                loss = policy_loss + 0.5 * value_loss
 
         # JEPA world-model loss
         if "next_fused" in batch and "action" in batch:
@@ -318,6 +345,48 @@ class LearnerThread:
         loss = loss + ewc_penalty
 
         return {"total": loss}
+
+    def _compute_rebel_loss(
+        self, outputs: dict, batch: dict, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute REBEL paired preference loss (Phase D).
+
+        Splits the batch into two halves and designates the higher-reward
+        action in each pair as the "winner".  Falls back to the flow-loss
+        from the forward pass if the batch is too small for pairing.
+        """
+        actions = batch["action"]
+        rewards = batch["reward"]
+        core_state = outputs["core_state"]
+        B = actions.size(0)
+
+        if B < 4:
+            # Batch too small for meaningful pairing — use forward flow loss
+            return outputs.get("denoising_loss", torch.tensor(0.0, device=actions.device))
+
+        half = B // 2
+        s1, s2 = core_state[:half], core_state[half:half * 2]
+        a1, a2 = actions[:half], actions[half:half * 2]
+        r1, r2 = rewards[:half], rewards[half:half * 2]
+
+        # Determine winner/loser per pair
+        w_mask = r1 >= r2  # True where first element is winner
+        state_pairs = s1  # Use first-half states as conditioning
+        action_w = torch.where(w_mask.unsqueeze(-1), a1, a2)
+        action_l = torch.where(w_mask.unsqueeze(-1), a2, a1)
+        reward_w = torch.where(w_mask, r1, r2)
+        reward_l = torch.where(w_mask, r2, r1)
+
+        rebel_loss = self._rebel_loss_fn(
+            state=state_pairs,
+            action_w=action_w,
+            action_l=action_l,
+            reward_w=reward_w,
+            reward_l=reward_l,
+            policy=self.teacher.policy,
+        )
+        return rebel_loss
 
     def _collate_transitions(self, transitions: list[dict]) -> dict:
         """Collate a list of transition dicts into batched tensors."""

@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from baby_ai.core.planner import LatentMCTS, UncertaintyEstimator
-from baby_ai.config import System2Config, System3Config
+from baby_ai.config import System2Config, System3Config, RuntimeConfig
 from baby_ai.core.goals import GoalProposer, SubgoalPlanner, GoalMonitor
 from baby_ai.utils.logging import get_logger, LatencyTracker
 
@@ -67,7 +67,10 @@ class InferenceThread:
         system3_config: System3Config | None = None,
         mod_bridge=None,
         swap_lock: threading.Lock | None = None,
+        runtime_config: RuntimeConfig | None = None,
     ):
+        self._runtime_config = runtime_config or RuntimeConfig()
+        self._original_student = student  # keep un-compiled reference
         self.student = student
         self.device = device
         self.target_latency_ms = target_latency_ms
@@ -145,7 +148,17 @@ class InferenceThread:
             return
         self._running = True
         self.student.to(self.device).eval()
-        # CUDA warmup — first forward pass compiles kernels
+
+        # ── Phase A: torch.compile() ──
+        if self._runtime_config.compile_student and hasattr(torch, 'compile'):
+            compile_mode = self._runtime_config.compile_mode
+            log.info("Compiling Student model with torch.compile(mode='%s')...", compile_mode)
+            self.student = torch.compile(
+                self.student, mode=compile_mode, fullgraph=False,
+            )
+            log.info("torch.compile wrapper applied.")
+
+        # CUDA warmup — first forward pass compiles kernels / triggers graph capture
         self._warmup()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="InferenceThread")
         self._thread.start()
@@ -578,7 +591,9 @@ class InferenceThread:
     def swap_model(self, new_state_dict: dict) -> None:
         """Atomically swap Student weights (called by distillation thread)."""
         with self._swap_lock:
-            self.student.load_state_dict(new_state_dict)
+            # If model is compiled, load into the original module
+            target = getattr(self.student, '_orig_mod', self.student)
+            target.load_state_dict(new_state_dict)
         log.info("Model weights swapped at inference step %d", self._step)
 
     @property

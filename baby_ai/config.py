@@ -134,6 +134,42 @@ class JambaConfig:
     moe_every_n: int = 2          # MoE every N blocks (others use dense FFN)
     ffn_mult: int = 2             # FFN hidden dimension multiplier
     load_balance_weight: float = 0.01  # auxiliary load-balancing loss weight
+    use_ssd: bool = True          # use Mamba-2 SSD chunked parallel scan (Phase B)
+    chunk_size: int = 64          # SSD chunk length for training
+    ssd_head_dim: int = 64        # per-head state dimension for SSD multi-head
+
+
+@dataclass
+class FlowMatchingConfig:
+    """Flow Matching policy hyperparameters (Phase C)."""
+    action_continuous_dim: int = 20   # same as diffusion
+    time_embed_dim: int = 64
+    num_infer_steps: int = 2          # Euler steps for inference (Student)
+    sigma_min: float = 1e-4           # minimum noise floor
+    ot_method: str = "linear"         # "linear" (OT displacement) or "cosine"
+
+
+@dataclass
+class REBELConfig:
+    """REBEL RL training hyperparameters (Phase D)."""
+    enabled: bool = True
+    beta: float = 0.1             # KL regularization weight
+    pair_sampling: str = "random" # "same_state" or "random"
+    reward_clip: float = 5.0      # clip relative rewards
+    value_loss_weight: float = 0.5  # keep training value head for System 2
+
+
+@dataclass
+class VQConfig:
+    """VQ-BeT action tokenizer hyperparameters (Phase E)."""
+    enabled: bool = False           # disabled by default until pre-trained
+    num_codes: int = 512            # codebook size (K)
+    code_dim: int = 64              # codebook embedding dimension
+    num_residual: int = 2           # hierarchical VQ levels (residual VQ)
+    commitment_weight: float = 0.25 # VQ commitment loss weight
+    action_chunk_size: int = 1      # predict N actions at once (1 = no chunking)
+    ema_update: bool = True         # EMA codebook updates (vs gradient)
+    ema_decay: float = 0.99         # codebook EMA decay rate
 
 
 @dataclass
@@ -157,11 +193,23 @@ class StudentConfig:
     action_dim: int = 128        # discrete action count (used by env reward computer)
     total_target_params: str = "10-30M"
 
+    # Policy type selector: "diffusion" or "flow_matching"
+    policy_type: str = "flow_matching"
+
     # Jamba temporal core
     jamba: JambaConfig = field(default_factory=JambaConfig)
 
     # Diffusion policy (20-dim continuous actions)
     diffusion: DiffusionPolicyConfig = field(default_factory=DiffusionPolicyConfig)
+
+    # Flow Matching policy (Phase C)
+    flow_matching: FlowMatchingConfig = field(default_factory=FlowMatchingConfig)
+
+    # REBEL RL (Phase D)
+    rebel: REBELConfig = field(default_factory=REBELConfig)
+
+    # VQ-BeT action tokenizer (Phase E)
+    vq: VQConfig = field(default_factory=VQConfig)
 
     # System 2 test-time search
     system2: System2Config = field(default_factory=System2Config)
@@ -187,6 +235,9 @@ class TeacherConfig:
     action_dim: int = 128        # discrete action count (used by env reward computer)
     total_target_params: str = "50-100M"
 
+    # Policy type selector: "diffusion" or "flow_matching"
+    policy_type: str = "flow_matching"
+
     # Jamba temporal core — scaled up for Teacher
     jamba: JambaConfig = field(default_factory=lambda: JambaConfig(
         num_layers=4,
@@ -201,6 +252,17 @@ class TeacherConfig:
     diffusion: DiffusionPolicyConfig = field(default_factory=lambda: DiffusionPolicyConfig(
         num_infer_steps=20,
     ))
+
+    # Flow Matching policy (Phase C) — Teacher uses more steps
+    flow_matching: FlowMatchingConfig = field(default_factory=lambda: FlowMatchingConfig(
+        num_infer_steps=4,
+    ))
+
+    # REBEL RL (Phase D)
+    rebel: REBELConfig = field(default_factory=REBELConfig)
+
+    # VQ-BeT action tokenizer (Phase E)
+    vq: VQConfig = field(default_factory=VQConfig)
 
     # System 2 — disabled for Teacher (Teacher trains, doesn't plan)
     system2: System2Config = field(default_factory=lambda: System2Config(enabled=False))
@@ -296,6 +358,9 @@ class RuntimeConfig:
     distill_sleep_ms: float = 50.0
     max_ram_gb: float = 32.0
     max_gpu_mem_gb: float = 11.0
+    compile_student: bool = True     # torch.compile Student for inference
+    compile_teacher: bool = False    # torch.compile Teacher for training (experimental)
+    compile_mode: str = "reduce-overhead"  # "default", "reduce-overhead", or "max-autotune"
 
 
 # ---------------------------------------------------------------------------

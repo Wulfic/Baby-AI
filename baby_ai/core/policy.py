@@ -397,3 +397,268 @@ class DiffusionPolicyHead(nn.Module):
 
         value = self.value_head(state)
         return log_prob, entropy, value
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Velocity prediction network (Flow Matching)
+# ────────────────────────────────────────────────────────────────────────────
+
+class VelocityPredictor(nn.Module):
+    """
+    MLP velocity-field predictor conditioned on state and time.
+
+    Input:  concat(x_t, time_embed, state)
+    Output: predicted velocity v(x_t, t) — same dim as action.
+
+    Architecture is identical to NoisePredictor — 3 residual blocks + SiLU.
+    The semantic difference is in how the output is used during training
+    (predicts velocity v = x_1 - x_0 instead of noise ε).
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        state_dim: int,
+        time_embed_dim: int = 64,
+        hidden_dim: int = 256,
+        num_blocks: int = 3,
+    ):
+        super().__init__()
+        self.time_embed = SinusoidalTimestepEmbedding(time_embed_dim)
+
+        input_dim = action_dim + time_embed_dim + state_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.blocks = nn.ModuleList(
+            [_ResidualBlock(hidden_dim) for _ in range(num_blocks)]
+        )
+        self.output_proj = nn.Linear(hidden_dim, action_dim)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_t:      (B, action_dim) interpolated sample at time t.
+            timestep: (B,) continuous time values in [0, 1].
+            state:    (B, state_dim) conditioning signal.
+
+        Returns:
+            (B, action_dim) predicted velocity field v(x_t, t).
+        """
+        t_emb = self.time_embed(timestep)
+        x = torch.cat([x_t, t_emb, state], dim=-1)
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.output_proj(x)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Flow Matching Policy Head
+# ────────────────────────────────────────────────────────────────────────────
+
+class FlowMatchingPolicyHead(nn.Module):
+    """
+    Flow Matching policy: generates actions via ODE integration
+    of a learned velocity field.
+
+    Training:
+        1. Sample t ~ Uniform(0, 1)
+        2. Construct x_t = (1 - t) * noise + t * action  (OT interpolation)
+        3. Target velocity: v_target = action - noise
+        4. Loss = MSE(v_predicted, v_target)
+
+    Inference:
+        1. Start from x_0 ~ N(0, I)
+        2. Euler integrate: x_{t+dt} = x_t + dt * v(x_t, t, state)
+        3. 1–2 steps suffice (straight OT paths!)
+
+    Args:
+        input_dim:       Core hidden state dimension.
+        action_dim:      Continuous action vector size.
+        hidden_dim:      MLP hidden dimension.
+        num_infer_steps: Euler ODE steps for inference.
+        time_embed_dim:  Sinusoidal timestep embedding dimension.
+        sigma_min:       Minimum noise floor for numerical stability.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        action_dim: int = 20,
+        hidden_dim: int = 256,
+        num_infer_steps: int = 2,
+        time_embed_dim: int = 64,
+        sigma_min: float = 1e-4,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_infer_steps = num_infer_steps
+        self.sigma_min = sigma_min
+
+        # ── Velocity predictor (same arch as NoisePredictor) ──
+        self.velocity_net = VelocityPredictor(
+            action_dim=action_dim,
+            state_dim=input_dim,
+            time_embed_dim=time_embed_dim,
+            hidden_dim=hidden_dim,
+            num_blocks=3,
+        )
+
+        # ── Value head (state → scalar, independent of flow matching) ──
+        self.value_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    # ── training forward ───────────────────────────────────────────────────
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Training forward pass — compute flow matching loss + value.
+
+        Args:
+            state:   (B, input_dim) from temporal core.
+            actions: (B, action_dim) ground-truth continuous actions.
+                     If None, returns zero loss + value.
+
+        Returns:
+            flow_loss: Scalar MSE velocity-field loss.
+            value:     (B, 1) state value.
+        """
+        value = self.value_head(state)
+
+        if actions is None:
+            return torch.tensor(0.0, device=state.device), value
+
+        # Guard: squeeze stale replay data stored with batch dim (B,1,D) → (B,D)
+        if actions.dim() == 3 and actions.size(1) == 1:
+            actions = actions.squeeze(1)
+
+        B = state.size(0)
+        device = state.device
+
+        # Sample random time t ∈ [0, 1]
+        t = torch.rand(B, device=device)
+
+        # Sample source noise x_0 ~ N(0, I)
+        x_0 = torch.randn_like(actions)
+
+        # OT interpolation: x_t = (1 - t) * x_0 + t * actions
+        t_expand = t.unsqueeze(-1)  # (B, 1)
+        x_t = (1 - t_expand) * x_0 + t_expand * actions
+
+        # Target velocity: v = actions - x_0  (straight line noise → data)
+        v_target = actions - x_0
+
+        # Predict velocity
+        v_pred = self.velocity_net(x_t, t, state)
+
+        # Loss: MSE on velocity field
+        flow_loss = F.mse_loss(v_pred, v_target)
+
+        return flow_loss, value
+
+    # ── inference (Euler ODE integration) ──────────────────────────────────
+
+    @torch.no_grad()
+    def act(
+        self,
+        state: torch.Tensor,
+        deterministic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generate continuous actions via Euler ODE integration.
+
+        Args:
+            state: (B, input_dim).
+            deterministic: If True, uses fixed seed noise (not yet implemented;
+                           flow matching is inherently stochastic via initial noise).
+
+        Returns:
+            action:   (B, action_dim) bounded continuous action vector.
+            log_prob: (B,) approximate log-probability.
+            value:    (B, 1) state value.
+        """
+        B = state.size(0)
+        device = state.device
+
+        # Start from pure noise x_0 ~ N(0, I)
+        x = torch.randn(B, self.action_dim, device=device)
+
+        # Euler integration with uniform time steps: t goes from 0 to 1
+        dt = 1.0 / self.num_infer_steps
+        for i in range(self.num_infer_steps):
+            t = torch.full((B,), i * dt, device=device)
+            v = self.velocity_net(x, t, state)
+            x = x + dt * v
+
+        # Bound the output
+        action = self._bound_action(x)
+
+        # Log-prob approximation: use velocity magnitude at final step
+        # Low velocity near t≈1 means the sample is near the data manifold
+        v_final = self.velocity_net(x, torch.ones(B, device=device), state)
+        log_prob = -(v_final.pow(2).sum(dim=-1))
+
+        value = self.value_head(state)
+        return action, log_prob, value
+
+    def _bound_action(self, raw: torch.Tensor) -> torch.Tensor:
+        """Apply action-space bounds: camera in [-1,1], discrete-like in [0,1]."""
+        action = raw.clone()
+        # Camera (first 2 dims): tanh to [-1, 1]
+        action[:, :2] = torch.tanh(action[:, :2])
+        # Everything else: sigmoid to [0, 1]
+        if action.size(-1) > 2:
+            action[:, 2:] = torch.sigmoid(action[:, 2:])
+        return action
+
+    # ── REBEL-compatible evaluation ────────────────────────────────────────
+
+    def evaluate(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Evaluate a given action for REBEL-style training.
+
+        For flow matching, log_prob is approximated by how well the velocity
+        network can reconstruct the velocity field pointing to this action.
+
+        Returns:
+            log_prob: (B,) approximate log probability.
+            entropy:  (B,) estimated entropy (placeholder).
+            value:    (B, 1) state value.
+        """
+        B = state.size(0)
+        device = state.device
+
+        # Reconstruct: how well can we predict velocity for this action?
+        t_eval = torch.full((B,), 0.5, device=device)
+        x_0 = torch.randn_like(action)
+        t_expand = t_eval.unsqueeze(-1)
+        x_t = (1 - t_expand) * x_0 + t_expand * action
+        v_target = action - x_0
+        v_pred = self.velocity_net(x_t, t_eval, state)
+
+        reconstruction_error = (v_pred - v_target).pow(2).mean(dim=-1)
+        log_prob = -reconstruction_error
+
+        # Entropy proxy: proportional to velocity field divergence
+        entropy = torch.ones(B, device=device) * 0.5
+
+        value = self.value_head(state)
+        return log_prob, entropy, value

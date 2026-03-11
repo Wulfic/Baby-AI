@@ -17,11 +17,12 @@ from baby_ai.encoders.audio import AudioEncoder
 from baby_ai.encoders.code import CodeEncoder
 from baby_ai.encoders.multimodal import MultimodalFusion
 from baby_ai.core.temporal import JambaCore
-from baby_ai.core.policy import DiffusionPolicyHead
+from baby_ai.core.policy import DiffusionPolicyHead, FlowMatchingPolicyHead
 from baby_ai.core.communication import CommunicationHead
 from baby_ai.core.predictive import LatentWorldModel
 from baby_ai.core.goals import GoalConditioner
-from baby_ai.config import JambaConfig, DiffusionPolicyConfig
+from baby_ai.core.action_tokenizer import ActionTokenizer
+from baby_ai.config import JambaConfig, DiffusionPolicyConfig, FlowMatchingConfig, VQConfig
 
 
 class BabyAgentBase(nn.Module):
@@ -72,6 +73,9 @@ class BabyAgentBase(nn.Module):
         sensor_channels: int = 32,
         jamba_config: JambaConfig | None = None,
         diffusion_config: DiffusionPolicyConfig | None = None,
+        flow_matching_config: FlowMatchingConfig | None = None,
+        vq_config: VQConfig | None = None,
+        policy_type: str = "flow_matching",
         goal_dim: int = 0,
     ):
         super().__init__()
@@ -129,30 +133,54 @@ class BabyAgentBase(nn.Module):
             moe_every_n=jamba_config.moe_every_n,
             ffn_mult=jamba_config.ffn_mult,
             load_balance_weight=jamba_config.load_balance_weight,
+            use_ssd=jamba_config.use_ssd,
+            chunk_size=jamba_config.chunk_size,
         )
 
         # --- Output heads ---
         if diffusion_config is None:
             diffusion_config = DiffusionPolicyConfig()
-        self.policy = DiffusionPolicyHead(
-            input_dim=hidden_dim,
-            action_dim=diffusion_config.action_continuous_dim,
-            hidden_dim=policy_hidden,
-            num_train_steps=diffusion_config.num_train_steps,
-            num_infer_steps=diffusion_config.num_infer_steps,
-            time_embed_dim=diffusion_config.time_embed_dim,
-            beta_start=diffusion_config.beta_start,
-            beta_end=diffusion_config.beta_end,
-        )
+        if flow_matching_config is None:
+            flow_matching_config = FlowMatchingConfig()
+
+        # Policy head: select based on policy_type
+        self.policy_type = policy_type
+        if policy_type == "flow_matching":
+            self.policy = FlowMatchingPolicyHead(
+                input_dim=hidden_dim,
+                action_dim=flow_matching_config.action_continuous_dim,
+                hidden_dim=policy_hidden,
+                num_infer_steps=flow_matching_config.num_infer_steps,
+                time_embed_dim=flow_matching_config.time_embed_dim,
+                sigma_min=flow_matching_config.sigma_min,
+            )
+        else:
+            self.policy = DiffusionPolicyHead(
+                input_dim=hidden_dim,
+                action_dim=diffusion_config.action_continuous_dim,
+                hidden_dim=policy_hidden,
+                num_train_steps=diffusion_config.num_train_steps,
+                num_infer_steps=diffusion_config.num_infer_steps,
+                time_embed_dim=diffusion_config.time_embed_dim,
+                beta_start=diffusion_config.beta_start,
+                beta_end=diffusion_config.beta_end,
+            )
         self.communication = CommunicationHead(
             input_dim=hidden_dim,
             vocab_size=comm_vocab_size,
             hidden_dim=hidden_dim,
             max_len=comm_max_len,
         )
+        # Determine the active action dimension based on policy type
+        active_action_dim = (
+            flow_matching_config.action_continuous_dim
+            if policy_type == "flow_matching"
+            else diffusion_config.action_continuous_dim
+        )
+
         self.predictive = LatentWorldModel(
             state_dim=hidden_dim,      # core output dim (world model observes core state)
-            action_dim=diffusion_config.action_continuous_dim,
+            action_dim=active_action_dim,
             latent_dim=hidden_dim,
             hidden_dim=hidden_dim,
             stochastic_dim=32,
@@ -167,6 +195,27 @@ class BabyAgentBase(nn.Module):
             )
         else:
             self.goal_conditioner = None
+
+        # --- VQ-BeT Action Tokenizer (Phase E) ---
+        if vq_config is None:
+            vq_config = VQConfig()
+        if vq_config.enabled:
+            action_dim_for_vq = (
+                flow_matching_config.action_continuous_dim
+                if policy_type == "flow_matching"
+                else diffusion_config.action_continuous_dim
+            )
+            self.action_tokenizer = ActionTokenizer(
+                action_dim=action_dim_for_vq,
+                code_dim=vq_config.code_dim,
+                num_codes=vq_config.num_codes,
+                num_residual=vq_config.num_residual,
+                commitment_weight=vq_config.commitment_weight,
+                ema_update=vq_config.ema_update,
+                ema_decay=vq_config.ema_decay,
+            )
+        else:
+            self.action_tokenizer = None
 
         # Store dims for external access
         self.fused_dim = fused_dim
@@ -237,21 +286,31 @@ class BabyAgentBase(nn.Module):
 
         comm_logits = self.communication.get_logits(core_state)
 
-        denoising_loss, value = self.policy(core_state, actions=actions)
+        policy_loss, value = self.policy(core_state, actions=actions)
 
         # Generate action for distillation / evaluation (no grad noise)
         with torch.no_grad():
             action, _, _ = self.policy.act(core_state, deterministic=True)
 
-        return {
+        result = {
             "fused": fused,
             "core_state": core_state,
             "hidden": hidden,
             "comm_logits": comm_logits,
-            "denoising_loss": denoising_loss,
+            "denoising_loss": policy_loss,  # keep key name for backward compat
             "value": value,
             "action": action,
         }
+
+        # VQ-BeT tokenization (Phase E)
+        if self.action_tokenizer is not None and actions is not None:
+            _, vq_indices, vq_loss = self.action_tokenizer.encode(
+                actions.squeeze(1) if actions.dim() == 3 and actions.size(1) == 1 else actions
+            )
+            result["vq_indices"] = vq_indices
+            result["vq_loss"] = vq_loss
+
+        return result
 
     def act(
         self,

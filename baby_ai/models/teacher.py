@@ -45,11 +45,19 @@ class TeacherModel(BabyAgentBase):
             sensor_channels=32,  # 32-dim game-state vector from SensorPacker
             # Jamba temporal core (Top-2 MoE, 8 experts)
             jamba_config=config.jamba,
-            # Diffusion policy (continuous actions, 20 DDIM steps)
+            # Diffusion policy (fallback)
             diffusion_config=config.diffusion,
+            # Flow Matching policy (Phase C)
+            flow_matching_config=config.flow_matching,
+            # VQ-BeT action tokenizer (Phase E)
+            vq_config=config.vq,
+            # Policy type selector
+            policy_type=config.policy_type,
             # Teacher doesn't use goal conditioning
             goal_dim=config.system3.goal_dim if config.system3.enabled else 0,
         )
+        # Stash REBEL config so the LearnerThread can read it
+        self._rebel_config = config.rebel
 
     def get_distillation_targets(
         self,

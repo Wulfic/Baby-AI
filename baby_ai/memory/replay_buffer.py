@@ -442,6 +442,47 @@ class PrioritizedReplayBuffer:
                 self.tree.update(idx, p)
                 self.max_priority = max(self.max_priority, p)
 
+    def sample_pairs(
+        self,
+        batch_size: int,
+        device: str = "cpu",
+    ) -> Tuple[List[Tuple[Dict, Dict, float, float]], np.ndarray, List[int]]:
+        """
+        Sample pairs of transitions for REBEL training (Phase D).
+
+        Samples 2 * batch_size transitions, pairs them up, and designates
+        the higher-reward transition as "winner" in each pair.
+
+        Args:
+            batch_size: Number of pairs to return.
+            device:     Device for transition tensors.
+
+        Returns:
+            pairs:   List of (winner_trans, loser_trans, r_winner, r_loser) tuples.
+            weights: (batch_size,) importance-sampling weights.
+            indices: List of tree indices (first-half only, for priority updates).
+        """
+        transitions, weights, indices = self.sample(batch_size * 2, device)
+
+        # Split into two halves and pair them
+        t1 = transitions[:batch_size]
+        t2 = transitions[batch_size:]
+
+        pairs = []
+        for a, b in zip(t1, t2):
+            r_a = a.get("reward", 0.0)
+            r_b = b.get("reward", 0.0)
+            if isinstance(r_a, torch.Tensor):
+                r_a = r_a.item()
+            if isinstance(r_b, torch.Tensor):
+                r_b = r_b.item()
+            if r_a >= r_b:
+                pairs.append((a, b, r_a, r_b))
+            else:
+                pairs.append((b, a, r_b, r_a))
+
+        return pairs, weights[:batch_size], indices[:batch_size]
+
     def _prune_oldest_chunks(self) -> None:
         """Remove the oldest chunk files and zero their SumTree priorities."""
         chunk_files = sorted(

@@ -154,13 +154,19 @@ class DistillationEngine:
 
         # Move batch to device
         inputs = {}
-        valid_keys = {"vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor", "hidden"}
+        valid_keys = {"vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor", "hidden", "actions"}
         for k, v in batch.items():
             if k in valid_keys:
                 if isinstance(v, torch.Tensor):
                     inputs[k] = v.to(device)
                 else:
                     inputs[k] = v
+            # Map 'action' key from replay to 'actions' key expected by model.forward()
+            elif k == "action":
+                if isinstance(v, torch.Tensor):
+                    inputs["actions"] = v.to(device)
+                else:
+                    inputs["actions"] = v
 
         # Pass goal_embedding for goal-conditioned distillation
         if "goal_embedding" in batch:
@@ -239,6 +245,36 @@ class DistillationEngine:
             self.kl_weight * (action_loss + comm_kl)
             + self.feature_weight * feat_loss
         )
+
+        # VQ codebook index distillation (Phase E)
+        # If both Student and Teacher have action tokenizers,
+        # add cross-entropy loss on level-0 (coarse behavior mode) indices.
+        if (
+            "vq_indices" in teacher_out
+            and "vq_indices" in student_out
+        ):
+            # Level-0 indices capture coarse behavior modes
+            teacher_idx_0 = teacher_out["vq_indices"][0].detach()  # (B,) long
+            # We need soft logits from the student's VQ encoder, not hard argmax.
+            # Approximate: use the student's encoder output distances as logits.
+            if (
+                hasattr(self._staging_student, "action_tokenizer")
+                and self._staging_student.action_tokenizer is not None
+            ):
+                s_z = self._staging_student.action_tokenizer.encoder(
+                    student_out["action"]
+                )
+                s_dists = -torch.cdist(
+                    s_z.unsqueeze(0),
+                    self._staging_student.action_tokenizer.rvq.levels[0]
+                    .embedding.weight.unsqueeze(0),
+                ).squeeze(0)  # (B, K) negative distances → logits
+                codebook_distill_loss = F.cross_entropy(s_dists, teacher_idx_0)
+                total = total + 0.1 * codebook_distill_loss
+
+        # VQ loss pass-through (auxiliary — keeps tokenizer codebook accurate)
+        if "vq_loss" in student_out:
+            total = total + 0.05 * student_out["vq_loss"]
 
         return {
             "total": total,
