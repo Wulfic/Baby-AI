@@ -112,6 +112,8 @@ class MinecraftEnv(GameEnvironment):
         block_user_input: bool = False,
         # ── Mod bridge ──────────────────────────────────────────
         mod_bridge_port: int = 5556,
+        # ── Camera smoothing ────────────────────────────────────
+        camera_smooth_steps: int = 8,
     ):
         # ── Auto-launch Minecraft if requested ──────────────────
         self._launcher: Optional[MinecraftLauncher] = None
@@ -161,6 +163,8 @@ class MinecraftEnv(GameEnvironment):
         self._resolution = resolution
         self._step_delay = step_delay_ms / 1000.0
         self._sensor_channels = sensor_channels
+        self._camera_smooth_steps = max(1, camera_smooth_steps)
+        self._smooth_look_time: float = 0.0  # time consumed by last smooth look
 
         # ── Episode state ───────────────────────────────────────
         self._step_count = 0
@@ -425,6 +429,8 @@ class MinecraftEnv(GameEnvironment):
             reward_info = self._reward_computer.compute(
                 obs, disc_action_id, _reward_weights, self._step_count,
                 observation_only=True,
+                hotbar_slot=decoded.get("hotbar_slot"),
+                is_block_interaction=decoded.get("is_attack", False) or decoded.get("is_use", False),
             )
             reward = reward_info["total"]
 
@@ -511,9 +517,14 @@ class MinecraftEnv(GameEnvironment):
                             dy = int(dy * scale)
 
                     if dx != 0 or dy != 0:
-                        self._input.mouse_look(dx, dy)
+                        self._smooth_look_time = self._smooth_mouse_look(dx, dy)
+                    else:
+                        self._smooth_look_time = 0.0
+                else:
+                    self._smooth_look_time = 0.0
 
             # ── Pacing ──────────────────────────────────────────
+            # Subtract time already spent on smooth camera interpolation
             elapsed = time.perf_counter() - self._last_step_time
             remaining = self._step_delay - elapsed
             if remaining > 0:
@@ -529,6 +540,8 @@ class MinecraftEnv(GameEnvironment):
         # ── Reward heuristics ───────────────────────────────────
         reward_info = self._reward_computer.compute(
             obs, disc_action_id, _reward_weights, self._step_count,
+            hotbar_slot=decoded.get("hotbar_slot"),
+            is_block_interaction=is_attack or decoded.get("is_use", False),
         )
         reward = reward_info["total"]
 
@@ -548,6 +561,69 @@ class MinecraftEnv(GameEnvironment):
         self._prev_action_id = disc_action_id
 
         return obs, reward, done, info
+
+    # ── Smooth camera interpolation ─────────────────────────────
+
+    def _smooth_mouse_look(self, dx: int, dy: int) -> float:
+        """
+        Apply a look delta over multiple sub-steps with smoothstep easing.
+
+        Instead of a single instant cursor warp, the movement is split
+        into ``_camera_smooth_steps`` micro-moves distributed across
+        the remaining step delay.  A cubic *smoothstep* curve
+        (``3t² − 2t³``) gives natural acceleration → cruise →
+        deceleration, mimicking human mouse movement.
+
+        Tiny deltas (|dx| + |dy| ≤ 3) are sent in one shot since
+        interpolation would be invisible.
+
+        Returns:
+            Wall-clock seconds consumed by the interpolation (to be
+            subtracted from the pacing sleep).
+        """
+        n = self._camera_smooth_steps
+        total_mag = abs(dx) + abs(dy)
+
+        if n <= 1 or total_mag <= 3:
+            # Not enough movement to bother smoothing
+            self._input.mouse_look(dx, dy)
+            return 0.0
+
+        # Use whatever step delay budget remains for interpolation
+        elapsed_so_far = time.perf_counter() - self._last_step_time
+        budget = max(0.0, self._step_delay - elapsed_so_far)
+        interval = budget / n  # seconds between sub-steps
+
+        cumulative_dx = 0
+        cumulative_dy = 0
+        t0 = time.perf_counter()
+
+        for i in range(n):
+            # Progress fraction [0, 1] at end of this sub-step
+            t = (i + 1) / n
+
+            # Smoothstep easing: 3t² − 2t³
+            # Starts slow, speeds up mid-range, decelerates at end
+            eased = t * t * (3.0 - 2.0 * t)
+
+            # Target cumulative pixels at this fraction of progress
+            target_dx = int(round(dx * eased))
+            target_dy = int(round(dy * eased))
+
+            # Delta for this individual sub-step
+            sub_dx = target_dx - cumulative_dx
+            sub_dy = target_dy - cumulative_dy
+            cumulative_dx = target_dx
+            cumulative_dy = target_dy
+
+            if sub_dx != 0 or sub_dy != 0:
+                self._input.mouse_look(sub_dx, sub_dy)
+
+            # Sleep between sub-steps (skip after the last one)
+            if i < n - 1 and interval > 0.001:
+                time.sleep(interval)
+
+        return time.perf_counter() - t0
 
     # ── Long-break helper ───────────────────────────────────────
 

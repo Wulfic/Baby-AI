@@ -74,11 +74,14 @@ class System2Config:
     uncertainty_threshold: float = 0.5   # trigger planning when uncertainty > this
     num_trajectories: int = 8            # parallel trajectories to evaluate
     planning_horizon: int = 5            # latent rollout steps per trajectory
-    planning_budget_ms: float = 150.0    # max time for a single planning episode
+    planning_budget_ms: float = 150.0    # max time for a single MCTS pass
     discount: float = 0.99              # discount factor for trajectory scoring
     pause_game: bool = True             # send pause command to MC mod during planning
-    warmup_steps: int = 100             # min inference steps before System 2 can trigger
+    warmup_steps: int = 0             # min inference steps before System 2 can trigger
     cooldown_steps: int = 20            # min steps between consecutive triggers
+    deliberation_rounds: int = 3         # number of MCTS passes (keep best across rounds)
+    min_deliberation_ms: float = 300.0   # minimum pause duration (ms) so game visibly freezes
+    pause_settle_ms: float = 50.0        # delay after sending pause before thinking (let mod process)
 
 
 @dataclass
@@ -96,8 +99,11 @@ class System3Config:
     min_replan_interval: int = 50      # cooldown between replans
     replan_on_death: bool = True       # full replan after player death
     pause_game_on_replan: bool = True  # freeze MC during full System 3 replan
-    warmup_steps: int = 200            # min inference steps before System 3 activates
+    warmup_steps: int = 0            # min inference steps before System 3 activates
     propose_every_n: int = 50          # when no goal active, propose one every N steps
+    deliberation_rounds: int = 5       # iterative refinement passes during replan
+    min_deliberation_ms: float = 500.0 # minimum pause duration (ms) so game visibly freezes
+    pause_settle_ms: float = 50.0      # delay after sending pause before thinking (let mod process)
 
 
 @dataclass
@@ -306,6 +312,7 @@ class MinecraftConfig:
     step_delay_ms: float = 100.0            # minimum ms between consecutive actions
     look_pixels_small: int = 40             # small camera rotation (pixels per step)
     look_pixels_large: int = 160            # large camera rotation
+    camera_smooth_steps: int = 8            # sub-steps for mouse interpolation (1 = disabled)
     max_episode_steps: int = 0              # 0 = unlimited
     initial_pause_sec: float = 3.0          # pause before starting to let user alt-tab
 

@@ -273,8 +273,8 @@ class InferenceThread:
                     self._trigger_system3(core_state, reason="stuck")
                     s3_replanned = True
             elif self._s3_step >= self._s3_config.warmup_steps:
-                # No active goal: propose one periodically
-                if self._s3_step % self._s3_config.propose_every_n == 0:
+                # No active goal: propose one right away or periodically
+                if self._subgoal_idx == 0 or self._s3_step % self._s3_config.propose_every_n == 0:
                     log.info("System 3: no active goal — proposing new plan")
                     self._trigger_system3(core_state, reason="no_goal")
                     s3_replanned = True
@@ -293,38 +293,75 @@ class InferenceThread:
             if self._uncertainty.should_plan:
                 used_planning = True
                 self._s2_trigger_count += 1
+                s2_t_start = time.perf_counter()
                 log.info(
                     "System 2 triggered at step %d (uncertainty=%.3f > %.3f)",
                     self._step, u, self._s2_config.uncertainty_threshold,
                 )
 
                 # Request game pause via mod bridge (if available)
+                s2_paused_game = False
                 if self._s2_config.pause_game and self._mod_bridge is not None:
                     self._send_pause(True)
+                    s2_paused_game = True
+                    # Let the mod actually process the tick-freeze command
+                    settle_s = self._s2_config.pause_settle_ms / 1000.0
+                    if settle_s > 0:
+                        time.sleep(settle_s)
 
-                # Run latent MCTS planning (pass active goal for biased scoring)
-                plan_result = self._planner.plan(
-                    core_state=result["core_state"],
-                    goal=self._active_goal.to(self.device) if self._active_goal is not None else None,
+                # ── Multi-round MCTS deliberation ──
+                n_rounds = max(1, self._s2_config.deliberation_rounds)
+                best_ev = float('-inf')
+                best_plan: dict | None = None
+
+                goal_for_plan = (
+                    self._active_goal.to(self.device)
+                    if self._active_goal is not None else None
                 )
 
-                # Override the System 1 action with the planned action
-                result["action"] = plan_result["best_action"].squeeze(0)
-                result["planning_ms"] = plan_result["planning_ms"]
+                for r in range(n_rounds):
+                    plan_result = self._planner.plan(
+                        core_state=result["core_state"],
+                        goal=goal_for_plan,
+                    )
+                    ev = plan_result["expected_value"].item()
+                    log.debug(
+                        "  System 2 round %d/%d: expected_v=%.3f, %.1f ms",
+                        r + 1, n_rounds, ev, plan_result["planning_ms"],
+                    )
+                    if ev > best_ev:
+                        best_ev = ev
+                        best_plan = plan_result
+
+                # Override the System 1 action with the best planned action
+                result["action"] = best_plan["best_action"].squeeze(0)
+                result["planning_ms"] = best_plan["planning_ms"]
                 result["system2_triggered"] = True
 
+                s2_elapsed_ms = (time.perf_counter() - s2_t_start) * 1000
+
+                # ── Enforce minimum deliberation floor ──
+                s2_min_ms = self._s2_config.min_deliberation_ms
+                if s2_elapsed_ms < s2_min_ms:
+                    remaining_s = (s2_min_ms - s2_elapsed_ms) / 1000.0
+                    log.info(
+                        "  System 2 deliberated in %.1f ms, holding pause for "
+                        "%.0f ms more (min_deliberation_ms=%.0f)",
+                        s2_elapsed_ms, remaining_s * 1000, s2_min_ms,
+                    )
+                    time.sleep(remaining_s)
+                    s2_elapsed_ms = (time.perf_counter() - s2_t_start) * 1000
+
                 log.info(
-                    "  Planning: %.1f ms, %d trajectories, expected_v=%.3f",
-                    plan_result["planning_ms"],
-                    plan_result["num_trajectories"],
-                    plan_result["expected_value"].item(),
+                    "  System 2 done: %d rounds, %.1f ms total, best expected_v=%.3f",
+                    n_rounds, s2_elapsed_ms, best_ev,
                 )
 
                 # Mark triggered so cooldown starts
                 self._uncertainty.mark_triggered()
 
                 # Resume game
-                if self._s2_config.pause_game and self._mod_bridge is not None:
+                if s2_paused_game:
                     self._send_pause(False)
 
         # Move results back to CPU for downstream use
@@ -365,6 +402,10 @@ class InferenceThread:
         The game is PAUSED for the entire duration — System 3 is
         allowed to take as long as it needs.  This is the whole point
         of the pause: thoughtful, unhurried deliberation.
+
+        Iterative refinement: runs multiple rounds of goal proposal
+        and subgoal planning, keeping the best plan across rounds.
+        A minimum deliberation floor ensures the game visibly pauses.
         """
         if self._goal_proposer is None or self._subgoal_planner is None:
             return
@@ -372,33 +413,67 @@ class InferenceThread:
         self._s3_trigger_count += 1
         t_start = time.perf_counter()
 
-        # Pause game so the world freezes while we think
+        # ─ Pause game so the world freezes while we think ─
+        paused_game = False
         if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
             self._send_pause_s3(True)
+            paused_game = True
+            # Let the mod actually process the tick-freeze command
+            # before we start deliberating (TCP is async)
+            settle_s = self._s3_config.pause_settle_ms / 1000.0
+            if settle_s > 0:
+                time.sleep(settle_s)
 
         device = core_state.device
         state = core_state.detach()  # (1, state_dim)
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        # ─ 1. Propose candidate goals ─
-        proposal = self._goal_proposer(state)
-        goals = proposal["goals"]    # (1, K, goal_dim)
-        scores = proposal["scores"]  # (1, K)
+        # ── Iterative refinement: run multiple rounds, keep best plan ──
+        n_rounds = max(1, self._s3_config.deliberation_rounds)
+        best_score = float('-inf')
+        best_goal = None
+        best_subgoals = None
+        best_done_probs = None
+        best_round_info = (0, 0, 0.0)  # (round, best_idx, score)
 
-        # Pick the highest-scoring goal
-        best_idx = scores[0].argmax()
-        chosen_goal = goals[0, best_idx].unsqueeze(0)  # (1, goal_dim)
+        for r in range(n_rounds):
+            # ─ 1. Propose candidate goals ─
+            proposal = self._goal_proposer(state)
+            goals = proposal["goals"]    # (1, K, goal_dim)
+            scores = proposal["scores"]  # (1, K)
+
+            # Pick the highest-scoring goal this round
+            round_best_idx = scores[0].argmax()
+            round_score = scores[0, round_best_idx].item()
+            round_goal = goals[0, round_best_idx].unsqueeze(0)  # (1, goal_dim)
+
+            # ─ 2. Decompose into subgoal sequence ─
+            plan_out = self._subgoal_planner(state, round_goal)
+
+            log.debug(
+                "System 3 deliberation round %d/%d: chose goal #%d (score=%.3f)",
+                r + 1, n_rounds, round_best_idx.item(), round_score,
+            )
+
+            # Keep this plan if it beats the previous best
+            if round_score > best_score:
+                best_score = round_score
+                best_goal = round_goal
+                best_subgoals = plan_out["subgoals"]
+                best_done_probs = plan_out["done_probs"]
+                best_round_info = (r + 1, round_best_idx.item(), round_score)
 
         log.info(
-            "System 3 [%s]: proposed %d goals, chose #%d (score=%.3f)",
-            reason, scores.size(1), best_idx.item(), scores[0, best_idx].item(),
+            "System 3 [%s]: %d deliberation rounds, best plan from round %d "
+            "(goal #%d, score=%.3f)",
+            reason, n_rounds, best_round_info[0],
+            best_round_info[1], best_round_info[2],
         )
 
-        # ─ 2. Decompose into subgoal sequence ─
-        plan_out = self._subgoal_planner(state, chosen_goal)
-        subgoals = plan_out["subgoals"]    # (1, T, goal_dim)
-        done_probs = plan_out["done_probs"]  # (1, T)
+        # ── Build final subgoal queue from best plan ──
+        subgoals = best_subgoals    # (1, T, goal_dim)
+        done_probs = best_done_probs  # (1, T)
 
         # Trim at the first step where done_prob > 0.5, or keep all
         done_mask = done_probs[0] > 0.5
@@ -421,13 +496,29 @@ class InferenceThread:
             self._goal_monitor.reset_full()
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000
+
+        # ── Enforce minimum deliberation floor ──
+        # If the neural net rounds completed too quickly, hold the
+        # pause so the game visibly freezes and the agent is clearly
+        # "thinking".  The remaining budget is genuine idle wait.
+        min_ms = self._s3_config.min_deliberation_ms
+        if elapsed_ms < min_ms:
+            remaining_s = (min_ms - elapsed_ms) / 1000.0
+            log.info(
+                "System 3 deliberated in %.1f ms, holding pause for %.0f ms more "
+                "(min_deliberation_ms=%.0f)",
+                elapsed_ms, remaining_s * 1000, min_ms,
+            )
+            time.sleep(remaining_s)
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+
         log.info(
-            "System 3 replanned: %d subgoals, %.1f ms (no budget — game frozen)",
-            len(self._subgoal_queue), elapsed_ms,
+            "System 3 replanned: %d subgoals, %.1f ms total (%d rounds, game frozen)",
+            len(self._subgoal_queue), elapsed_ms, n_rounds,
         )
 
         # Resume game — thinking is done
-        if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
+        if paused_game:
             self._send_pause_s3(False)
 
     def _advance_subgoal(self, core_state: torch.Tensor) -> None:

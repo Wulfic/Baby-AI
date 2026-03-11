@@ -90,6 +90,8 @@ class RewardComputer:
         reward_weights: Any,
         step_count: int,
         observation_only: bool = False,
+        hotbar_slot: int | None = None,
+        is_block_interaction: bool = False,
     ) -> Dict[str, float]:
         """Compute multi-channel extrinsic reward from frame analysis and action.
 
@@ -221,7 +223,7 @@ class RewardComputer:
             hotbar_spam_penalty = 0.0
             self.hotbar_streak = 0
         else:
-            hotbar_spam_penalty = self._compute_hotbar_spam(action_id)
+            hotbar_spam_penalty = self._compute_hotbar_spam(hotbar_slot)
         rewards["hotbar_spam_penalty"] = hotbar_spam_penalty
 
         # ── Mod events ──────────────────────────────────────────
@@ -350,7 +352,7 @@ class RewardComputer:
         rewards["height_penalty"] = height_penalty
 
         # ── 11e-2. Extreme pitch penalty ────────────────────────
-        pitch_penalty = self._compute_pitch_penalty(env)
+        pitch_penalty = self._compute_pitch_penalty(env, is_block_interaction)
         rewards["pitch_penalty"] = pitch_penalty
 
         # ── 11f. Home proximity bonus / distance penalty ────────
@@ -563,15 +565,25 @@ class RewardComputer:
             return min(0.02 * over, 0.6)
         return 0.0
 
-    def _compute_hotbar_spam(self, action_id: int) -> float:
+    def _compute_hotbar_spam(self, hotbar_slot: int | None) -> float:
+        """Detect hotbar spam from keyboard 0-9 presses.
+
+        Uses the decoded ``hotbar_slot`` (1-9 or None) directly from
+        the continuous action decoder, instead of relying on fuzzy
+        discrete action-id matching.  This correctly catches every
+        number-key press regardless of what other keys are held.
+        """
         hotbar_spam_penalty = 0.0
-        if action_id in HOTBAR_ACTIONS:
+        is_hotbar = hotbar_slot is not None
+
+        if is_hotbar:
             self.hotbar_streak += 1
             if self.hotbar_streak >= 2:
                 hotbar_spam_penalty = min(0.1 * self.hotbar_streak, 0.6)
         else:
             self.hotbar_streak = max(0, self.hotbar_streak - 1)
 
+        # Also check recent history for excessive hotbar usage
         if len(self.action_history) >= 10:
             last_10 = list(self.action_history)[-10:]
             hotbar_count = sum(1 for a in last_10 if a in HOTBAR_ACTIONS)
@@ -683,35 +695,44 @@ class RewardComputer:
         return height_penalty
 
     @staticmethod
-    def _compute_pitch_penalty(env: Any) -> float:
-        """Penalise extreme camera pitch, with a steeper curve for looking UP.
+    def _compute_pitch_penalty(env: Any, is_block_interaction: bool = False) -> float:
+        """Penalise extreme camera pitch (>45° up or down).
 
-        Looking up (negative pitch) is almost never useful in Minecraft
-        and the AI tends to get stuck staring at the sky.  The penalty
-        ramps faster and higher for upward pitch than for downward.
+        Rules:
+        - Threshold is **45°** (not 60°).  Looking up is penalised
+          more steeply than looking down.
+        - **Exempt when interacting with a block** (attack / use):
+          mining straight down or placing high are legitimate.
+        - **3-second grace period** (~30 steps at 10 steps/s):
+          only activates after the camera has been stuck at an
+          extreme angle for 30+ consecutive steps.
         """
+        _GRACE_STEPS = 30  # ~3 seconds at 100ms step delay
+
         pitch_penalty = 0.0
         if env._player_pitch is not None:
             pitch = env._player_pitch          # negative = up, positive = down
             abs_pitch = abs(pitch)
             looking_up = pitch < 0
 
-            if abs_pitch > 60:
+            # No penalty while actively interacting with a block
+            if is_block_interaction:
+                # Slowly decay the counter so brief interactions
+                # don't permanently reset a long stare.
+                env._extreme_pitch_steps = max(0, env._extreme_pitch_steps - 2)
+                return 0.0
+
+            if abs_pitch > 45:
                 env._extreme_pitch_steps += 1
-                if looking_up:
-                    # Steeper ramp for sky-staring: base 0.25 + 0.04/step
-                    pitch_penalty = 0.25 + 0.04 * min(env._extreme_pitch_steps, 30)
-                else:
-                    # Original curve for looking down
-                    pitch_penalty = 0.15 + 0.02 * min(env._extreme_pitch_steps, 30)
-            elif abs_pitch > 40:
-                env._extreme_pitch_steps += 1
-                overshoot = (abs_pitch - 40) / 20.0
-                if looking_up:
-                    # ~2.5× steeper for upward tilt in the mild zone
-                    pitch_penalty = 0.08 * overshoot
-                else:
-                    pitch_penalty = 0.03 * overshoot
+                # Only penalise after the grace period
+                if env._extreme_pitch_steps > _GRACE_STEPS:
+                    over = env._extreme_pitch_steps - _GRACE_STEPS
+                    if looking_up:
+                        # Steeper ramp for sky-staring
+                        pitch_penalty = 0.15 + 0.03 * min(over, 40)
+                    else:
+                        # Gentler ramp for looking down
+                        pitch_penalty = 0.08 + 0.015 * min(over, 40)
             else:
                 env._extreme_pitch_steps = max(0, env._extreme_pitch_steps - 3)
         return pitch_penalty

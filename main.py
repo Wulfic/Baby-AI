@@ -258,6 +258,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         launch_timeout_sec=mc.launch_timeout_sec,
         block_user_input=mc.block_user_input,
         mod_bridge_port=mc.mod_bridge_port,
+        camera_smooth_steps=mc.camera_smooth_steps,
     )
 
     # ── Orchestrator (Student + Teacher + Learner + Distill) ────
@@ -640,6 +641,20 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 )
                 # Reset accumulators after logging
                 _acc = {k: 0.0 for k in _acc_keys}
+
+                # System 2/3 status
+                _inf_stats = orchestrator.inference_thread.stats
+                if _inf_stats.get("system2_trigger_count", 0) > 0 or _inf_stats.get("system3_trigger_count", 0) > 0:
+                    log.info(
+                        "  [THINKING] S2 triggers=%d | S3 triggers=%d | uncertainty=%.3f"
+                        " | active_goal=%s | subgoals=%d (idx=%d)",
+                        _inf_stats.get("system2_trigger_count", 0),
+                        _inf_stats.get("system3_trigger_count", 0),
+                        _inf_stats.get("uncertainty", 0.0),
+                        _inf_stats.get("active_goal", False),
+                        _inf_stats.get("subgoal_queue_len", 0),
+                        _inf_stats.get("subgoal_idx", 0),
+                    )
 
                 # Extra imitation mode info — show the player's actual action
                 if _imitation_active and prev_action is not None:
