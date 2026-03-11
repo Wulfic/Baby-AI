@@ -58,6 +58,14 @@ class RewardComputer:
         self.baseline_frame_step: int = 0
         self.hotbar_streak: int = 0
 
+        # Chunk-linger tracking: penalise staying in the same
+        # area for too long.  ``chunk_linger_steps`` ticks up
+        # every step and only resets after 3 *distinct new*
+        # chunks have been visited.
+        self.chunk_linger_steps: int = 0
+        self.new_chunks_since_linger: int = 0
+        self._linger_known_chunks: set[tuple[int, int]] = set()
+
     def reset(self) -> None:
         """Clear per-episode accumulators."""
         self.frame_history.clear()
@@ -67,6 +75,9 @@ class RewardComputer:
         self.baseline_frame = None
         self.baseline_frame_step = 0
         self.hotbar_streak = 0
+        self.chunk_linger_steps = 0
+        self.new_chunks_since_linger = 0
+        self._linger_known_chunks.clear()
 
     # ────────────────────────────────────────────────────────────
     #  Main entry point
@@ -168,13 +179,19 @@ class RewardComputer:
 
         # ── 6. Movement bonus ───────────────────────────────────
         movement_bonus = 0.0
-        if not observation_only:
+        if observation_only:
+            # In imitation mode, reward movement from actual position
+            # changes (mod bridge) rather than action_id matching.
+            movement_bonus = self._compute_movement_from_position(
+                visual_change, _sw, env
+            )
+        else:
             movement_bonus = self._compute_movement(
                 action_id, visual_change, _sw, env
             )
-            # Chunk-based movement decay
-            chunk_decay = max(0.1, 1.0 - env._steps_in_chunk * 0.02)
-            movement_bonus *= chunk_decay
+        # Chunk-based movement decay
+        chunk_decay = max(0.1, 1.0 - env._steps_in_chunk * 0.02)
+        movement_bonus *= chunk_decay
         rewards["movement"] = movement_bonus
 
         # ── 6b. New chunk exploration bonus ─────────────────────
@@ -190,11 +207,13 @@ class RewardComputer:
 
         # ── 7. Idle penalty ─────────────────────────────────────
         if observation_only:
-            idle_penalty = 0.0
-            # Reset streak so it doesn't explode when switching back
+            # Action-level idle tracking doesn't apply in imitation,
+            # but chunk-linger still ticks so the agent learns that
+            # the human also needs to explore.
+            idle_penalty = self._compute_chunk_linger_penalty(env)
             self.idle_streak = 0
         else:
-            idle_penalty = self._compute_idle_penalty(action_id)
+            idle_penalty = self._compute_idle_penalty(action_id, env)
         rewards["idle_penalty"] = idle_penalty
 
         # ── 7b. Hotbar spam penalty ───────────────────────────
@@ -365,10 +384,15 @@ class RewardComputer:
         rewards["creative_sequence"] = seq_info["stage_reward"] + seq_info["cycle_bonus"]
 
         # ── 16. Stagnation penalty ──────────────────────────────
-        stagnation_penalty = self._compute_stagnation(
-            block_break_reward, craft_score, block_place_score,
-            item_pickup, step_count, env,
-        )
+        if observation_only:
+            # Freeze the stagnation timer during imitation — the
+            # player controls whether blocks are broken/crafted.
+            stagnation_penalty = 0.0
+        else:
+            stagnation_penalty = self._compute_stagnation(
+                block_break_reward, craft_score, block_place_score,
+                item_pickup, step_count, env,
+            )
         rewards["stagnation_penalty"] = stagnation_penalty
 
         # ── Diagnostic logging ──────────────────────────────────
@@ -443,8 +467,53 @@ class RewardComputer:
 
         return movement_bonus
 
-    def _compute_idle_penalty(self, action_id: int) -> float:
+    @staticmethod
+    def _compute_movement_from_position(
+        visual_change: float,
+        _sw: dict,
+        env: Any,
+    ) -> float:
+        """Compute movement reward from actual position changes.
+
+        Used in imitation (observation_only) mode where the AI doesn't
+        choose the action, so ``action_id``-based gating is wrong.
+        Instead, reward is based purely on whether the player actually
+        moved (from mod-bridge position updates).
+        """
+        _mv_forward = _sw.get("mv_forward", 3.0)
+        _mv_look = _sw.get("mv_look", 0.02)
+
+        if (
+            env._player_x is None
+            or env._prev_player_x is None
+            or env._player_z is None
+            or env._prev_player_z is None
+        ):
+            return 0.0
+
+        dx = env._player_x - env._prev_player_x
+        dz = env._player_z - env._prev_player_z
+        horiz_dist = (dx * dx + dz * dz) ** 0.5
+
+        bonus = 0.0
+        if horiz_dist > 0.1 and visual_change > 0.02:
+            # Treat all imitation movement like forward movement
+            bonus = visual_change * 0.3 * _mv_forward
+
+        # Camera look component — reward looking around while moving
+        if env._player_yaw is not None and env._prev_player_yaw is not None:
+            dyaw = abs(env._player_yaw - env._prev_player_yaw)
+            if dyaw > 180:
+                dyaw = 360 - dyaw  # shortest arc
+            if dyaw > 2.0:
+                bonus += _mv_look
+
+        return bonus
+
+    def _compute_idle_penalty(self, action_id: int, env: Any) -> float:
         idle_penalty = 0.0
+
+        # ── Action-level noop streak ────────────────────────────
         if action_id == 0:
             self.idle_streak += 1
             if self.idle_streak > 3:
@@ -456,7 +525,43 @@ class RewardComputer:
             last_10 = list(self.action_history)[-10:]
             if len(set(last_10)) == 1:
                 idle_penalty += 0.15
+
+        # ── Chunk-linger penalty ────────────────────────────────
+        idle_penalty += self._compute_chunk_linger_penalty(env)
+
         return idle_penalty
+
+    def _compute_chunk_linger_penalty(self, env: Any) -> float:
+        """Progressive penalty for staying in the same area too long.
+
+        Ticks up every step. Only resets after 3 distinct NEW chunks
+        have been visited (re-entering already-known chunks doesn't
+        count). This encourages continuous exploration.
+
+        Returns:
+            float penalty value (0.0 during grace period, ramps to 0.6).
+        """
+        self.chunk_linger_steps += 1
+
+        # Track new chunk arrivals toward the 3-chunk reset
+        current = env._current_chunk
+        if current is not None and current not in self._linger_known_chunks:
+            self._linger_known_chunks.add(current)
+            self.new_chunks_since_linger += 1
+
+        if self.new_chunks_since_linger >= 3:
+            # Reset — agent has explored enough
+            self.chunk_linger_steps = 0
+            self.new_chunks_since_linger = 0
+            self._linger_known_chunks.clear()
+
+        # Grace period of 30 steps, then progressive ramp
+        _LINGER_GRACE = 30
+        if self.chunk_linger_steps > _LINGER_GRACE:
+            over = self.chunk_linger_steps - _LINGER_GRACE
+            # Ramps: 0.02 at step 31, 0.10 at step 35, caps at 0.6
+            return min(0.02 * over, 0.6)
+        return 0.0
 
     def _compute_hotbar_spam(self, action_id: int) -> float:
         hotbar_spam_penalty = 0.0
@@ -482,6 +587,7 @@ class RewardComputer:
         env._prev_player_y = env._player_y
         env._prev_player_x = env._player_x
         env._prev_player_z = env._player_z
+        env._prev_player_yaw = env._player_yaw
         env._player_y = latest_pos.get("y", env._player_y)
         env._player_x = latest_pos.get("x", env._player_x)
         env._player_z = latest_pos.get("z", env._player_z)
@@ -620,8 +726,11 @@ class RewardComputer:
             if dist <= env._home_radius:
                 home_bonus = 0.02
             else:
+                # Logarithmic penalty so it grows slowly at extreme
+                # distance instead of instantly capping at -0.5.
+                import math
                 overshoot = (dist - env._home_radius) / env._home_radius
-                home_bonus = -min(0.03 * overshoot, 0.5)
+                home_bonus = -min(0.02 * math.log1p(overshoot), 0.15)
         return home_bonus
 
     @staticmethod

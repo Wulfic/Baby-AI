@@ -77,6 +77,27 @@ class System2Config:
     planning_budget_ms: float = 150.0    # max time for a single planning episode
     discount: float = 0.99              # discount factor for trajectory scoring
     pause_game: bool = True             # send pause command to MC mod during planning
+    warmup_steps: int = 100             # min inference steps before System 2 can trigger
+    cooldown_steps: int = 20            # min steps between consecutive triggers
+
+
+@dataclass
+class System3Config:
+    """System 3 hierarchical long-horizon planning via latent goals."""
+    enabled: bool = True               # enable goal-conditioned hierarchy
+    goal_dim: int = 64                 # latent goal embedding size
+    num_goal_candidates: int = 8       # GoalProposer outputs K candidates
+    max_subgoals: int = 12             # max subgoal sequence length
+    planner_layers: int = 2            # SubgoalPlanner transformer layers
+    planner_heads: int = 4             # attention heads
+    proposer_hidden_dim: int = 256     # GoalProposer MLP width
+    achieve_threshold: float = 0.85    # cosine sim to mark subgoal done
+    patience_steps: int = 200          # steps before stuck → replan
+    min_replan_interval: int = 50      # cooldown between replans
+    replan_on_death: bool = True       # full replan after player death
+    pause_game_on_replan: bool = True  # freeze MC during full System 3 replan
+    warmup_steps: int = 200            # min inference steps before System 3 activates
+    propose_every_n: int = 50          # when no goal active, propose one every N steps
 
 
 @dataclass
@@ -139,6 +160,9 @@ class StudentConfig:
     # System 2 test-time search
     system2: System2Config = field(default_factory=System2Config)
 
+    # System 3 hierarchical goal planning
+    system3: System3Config = field(default_factory=System3Config)
+
 
 @dataclass
 class TeacherConfig:
@@ -174,6 +198,9 @@ class TeacherConfig:
 
     # System 2 — disabled for Teacher (Teacher trains, doesn't plan)
     system2: System2Config = field(default_factory=lambda: System2Config(enabled=False))
+
+    # System 3 — disabled for Teacher
+    system3: System3Config = field(default_factory=lambda: System3Config(enabled=False))
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +356,10 @@ class BabyAIConfig:
         def _to_dict(obj):
             if dataclasses.is_dataclass(obj):
                 return {k: _to_dict(v) for k, v in dataclasses.asdict(obj).items()}
+            if isinstance(obj, dict):
+                return {k: _to_dict(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_dict(v) for v in obj]
             return obj
 
         with open(path, "w") as f:
@@ -336,17 +367,26 @@ class BabyAIConfig:
 
     @classmethod
     def load(cls, path: Path | str) -> "BabyAIConfig":
-        """Load config from YAML (flat dict merge)."""
+        """Load config from YAML, recursively merging nested dataclass fields."""
+        import dataclasses
         with open(path) as f:
             data = yaml.safe_load(f)
         cfg = cls()
-        # Simple overlay — only handles top-level sub-config keys
-        for section_name, section_data in data.items():
-            if hasattr(cfg, section_name) and isinstance(section_data, dict):
-                sub = getattr(cfg, section_name)
-                for k, v in section_data.items():
-                    if hasattr(sub, k):
-                        setattr(sub, k, v)
+
+        def _merge(target, overlay: dict):
+            """Recursively merge a dict overlay into a dataclass instance."""
+            for k, v in overlay.items():
+                if not hasattr(target, k):
+                    continue
+                current = getattr(target, k)
+                if isinstance(v, dict) and dataclasses.is_dataclass(current):
+                    # Recursively merge into the nested dataclass
+                    _merge(current, v)
+                else:
+                    setattr(target, k, v)
+
+        if isinstance(data, dict):
+            _merge(cfg, data)
         return cfg
 
 

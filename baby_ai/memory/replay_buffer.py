@@ -15,6 +15,7 @@ import os
 import random
 import struct
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,8 +121,8 @@ class _ChunkStore:
 
         # In-memory blob cache — keeps the most recently used blobs
         # so repeated reads of the same transition don't hit disk.
-        # Maps data_idx → compressed bytes.
-        self._blob_cache: Dict[int, bytes] = {}
+        # OrderedDict gives us O(1) LRU eviction via move_to_end().
+        self._blob_cache: OrderedDict[int, bytes] = OrderedDict()
         self._CACHE_MAX = 256
 
         # Scan existing files to get disk usage
@@ -210,12 +211,11 @@ class _ChunkStore:
                 f.write(blob)
             self._disk_bytes += len(blob)
 
-        # Update cache
+        # Update cache (LRU: most recent access at the end)
         self._blob_cache[data_idx] = blob
+        self._blob_cache.move_to_end(data_idx)
         if len(self._blob_cache) > self._CACHE_MAX:
-            # Evict oldest entry
-            oldest = next(iter(self._blob_cache))
-            del self._blob_cache[oldest]
+            self._blob_cache.popitem(last=False)  # evict least-recently-used
 
     def read(self, data_idx: int) -> Optional[bytes]:
         """Read a compressed transition blob, or None if missing."""
@@ -240,11 +240,11 @@ class _ChunkStore:
             f.seek(header_sz + off)
             blob = f.read(ln)
 
-        # Populate cache
+        # Populate cache (LRU: most recent access at the end)
         self._blob_cache[data_idx] = blob
+        self._blob_cache.move_to_end(data_idx)
         if len(self._blob_cache) > self._CACHE_MAX:
-            oldest = next(iter(self._blob_cache))
-            del self._blob_cache[oldest]
+            self._blob_cache.popitem(last=False)
 
         return blob
 
@@ -443,7 +443,7 @@ class PrioritizedReplayBuffer:
                 self.max_priority = max(self.max_priority, p)
 
     def _prune_oldest_chunks(self) -> None:
-        """Remove the oldest chunk files to stay under disk cap."""
+        """Remove the oldest chunk files and zero their SumTree priorities."""
         chunk_files = sorted(
             self._store._dir.glob("chunk_*.bin"),
             key=lambda f: f.stat().st_mtime,
@@ -453,12 +453,29 @@ class PrioritizedReplayBuffer:
         for f in chunk_files:
             if self._store.disk_bytes <= target:
                 break
+            # Extract chunk_id from filename (chunk_0042.bin → 42)
+            try:
+                chunk_id = int(f.stem.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            # Zero out SumTree priorities for every slot in this chunk
+            # so the sampler never draws a stale, deleted transition.
+            start_idx = chunk_id * CHUNK_SIZE
+            for slot in range(CHUNK_SIZE):
+                data_idx = start_idx + slot
+                if data_idx < self.capacity:
+                    tree_idx = data_idx + self.tree.capacity
+                    self.tree.update(tree_idx, 0.0)
+                    self._meta[data_idx] = None
             sz = f.stat().st_size
             f.unlink()
             self._store._disk_bytes -= sz
+            # Evict cache entries for this chunk
+            for idx in range(start_idx, start_idx + CHUNK_SIZE):
+                self._store._blob_cache.pop(idx, None)
             removed += 1
         if removed:
-            log.info("Pruned %d chunk files to fit disk cap.", removed)
+            log.info("Pruned %d chunk files (zeroed SumTree priorities).", removed)
 
     def stats(self) -> dict:
         return {

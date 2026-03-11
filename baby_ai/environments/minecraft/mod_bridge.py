@@ -72,6 +72,7 @@ class ModBridge:
         self._connected = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._write_lock = threading.Lock()  # guards socket writes from any thread
 
         # Heartbeat tracking — lets us tell "pipeline broken"
         # from "no game events happened".
@@ -139,6 +140,33 @@ class ModBridge:
             except IndexError:
                 break
         return events
+
+    def send_command(self, cmd: Dict[str, Any]) -> bool:
+        """Send a JSON command to the Fabric mod over the TCP socket.
+
+        The command is serialised as a single JSON line (``\\n``-delimited).
+        Thread-safe — uses an internal write lock so the inference
+        thread can call this concurrently with the reader thread.
+
+        Args:
+            cmd: Dict with at least a ``"command"`` key.
+                 e.g. ``{"command": "pause", "reason": "system2_planning"}``
+
+        Returns:
+            True if the command was sent successfully, False otherwise.
+        """
+        if not self._connected or self._socket is None:
+            log.debug("send_command: not connected, dropping %s", cmd)
+            return False
+        try:
+            payload = (json.dumps(cmd) + "\n").encode("utf-8")
+            with self._write_lock:
+                self._socket.sendall(payload)
+            log.debug("Sent command to mod: %s", cmd)
+            return True
+        except (OSError, BrokenPipeError) as exc:
+            log.warning("send_command failed: %s", exc)
+            return False
 
     # ── Internal ────────────────────────────────────────────────
 

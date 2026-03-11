@@ -46,6 +46,8 @@ class TeacherModel(BabyAgentBase):
             jamba_config=config.jamba,
             # Diffusion policy (continuous actions, 20 DDIM steps)
             diffusion_config=config.diffusion,
+            # Teacher doesn't use goal conditioning
+            goal_dim=config.system3.goal_dim if config.system3.enabled else 0,
         )
 
     def get_distillation_targets(

@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from baby_ai.config import TrainingConfig, DEFAULT_CONFIG
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
-from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
 
@@ -86,15 +85,25 @@ class LearnerThread:
         # AMP scaler
         self.scaler = torch.amp.GradScaler("cuda") if self.config.use_amp else None
 
-        # Reward composer
-        self.reward_composer = RewardComposer(
-            intrinsic_weight_start=self.config.intrinsic_weight_start,
-            intrinsic_weight_end=self.config.intrinsic_weight_end,
-            intrinsic_decay_steps=self.config.intrinsic_decay_steps,
-        )
-
         # Learning progress tracker
         self.lp_estimator = LearningProgressEstimator()
+
+        # Projection: Student fused (512-d) → Teacher fused (1024-d).
+        # Replay stores fused/next_fused from the Student model, but the
+        # Teacher's world-model target_encoder expects Teacher-sized inputs.
+        student_dim = DEFAULT_CONFIG.student.hidden_dim   # 512
+        teacher_dim = DEFAULT_CONFIG.teacher.hidden_dim   # 1024
+        if student_dim != teacher_dim:
+            self._fused_proj = nn.Linear(student_dim, teacher_dim).to(device)
+        else:
+            self._fused_proj = None
+
+        # Add _fused_proj parameters to optimizer so they actually train
+        if self._fused_proj is not None:
+            self.optimizer.add_param_group({
+                "params": list(self._fused_proj.parameters()),
+                "lr": self.config.core_lr,
+            })
 
         # Thread control
         self._thread: Optional[threading.Thread] = None
@@ -251,6 +260,10 @@ class LearnerThread:
         if "action" in batch:
             forward_kwargs["actions"] = batch["action"]
 
+        # Pass goal_embedding from replay for goal-conditioned training
+        if "goal_embedding" in batch:
+            forward_kwargs["goal"] = batch["goal_embedding"]
+
         outputs = self.teacher(**forward_kwargs)
 
         value = outputs["value"]
@@ -282,8 +295,12 @@ class LearnerThread:
 
         # JEPA world-model loss
         if "next_fused" in batch and "action" in batch:
+            # Project Student-dim fused → Teacher-dim before world model
+            next_fused = batch["next_fused"]
+            if self._fused_proj is not None:
+                next_fused = self._fused_proj(next_fused)
             wm_out = self.teacher.predictive(
-                outputs["core_state"], batch["next_fused"], batch["action"],
+                outputs["core_state"], next_fused, batch["action"],
             )
             dynamics_loss = torch.clamp(wm_out["dynamics_loss"], max=10.0)
             kl_loss = torch.clamp(wm_out["kl_loss"], max=10.0)

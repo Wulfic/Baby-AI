@@ -1,6 +1,8 @@
 package com.babyai.mod;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.math.BlockPos;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +13,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Lightweight TCP server that broadcasts game events as JSON lines
@@ -44,6 +47,19 @@ public class EventBridge {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread acceptThread;
 
+    /** Reference to the integrated server — set once the server starts. */
+    private final AtomicReference<MinecraftServer> serverRef = new AtomicReference<>(null);
+
+    // ── Server reference ───────────────────────────────────────
+
+    /**
+     * Store the {@link MinecraftServer} so command handlers can
+     * freeze/resume ticks during System 2 planning.
+     */
+    public void setServer(MinecraftServer server) {
+        serverRef.set(server);
+    }
+
     // ── Lifecycle ──────────────────────────────────────────────
 
     public void start() {
@@ -72,6 +88,18 @@ public class EventBridge {
                     clients.add(writer);
                     LOGGER.info("Baby-AI client connected from {}",
                                 client.getRemoteSocketAddress());
+
+                    // Spawn a reader thread that listens for JSON
+                    // commands from this client (e.g. pause/resume).
+                    BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(client.getInputStream(), "UTF-8")
+                    );
+                    Thread readerThread = new Thread(
+                        () -> readCommands(reader, writer),
+                        "baby-ai-cmd-reader"
+                    );
+                    readerThread.setDaemon(true);
+                    readerThread.start();
                 } catch (IOException e) {
                     if (running.get()) {
                         LOGGER.warn("Accept failed: {}", e.getMessage());
@@ -268,5 +296,73 @@ public class EventBridge {
         j.addProperty("z", z);
         j.addProperty("tick", tick);
         broadcast(j);
+    }
+
+    // ── Command reader (Python → Mod) ──────────────────────────
+
+    /**
+     * Reads newline-delimited JSON commands from a connected client.
+     * Runs on a dedicated daemon thread per client.  When the client
+     * disconnects the writer is removed from the broadcast list.
+     */
+    private void readCommands(BufferedReader reader, PrintWriter writer) {
+        try {
+            String line;
+            while (running.get() && (line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                try {
+                    JsonObject cmd = JsonParser.parseString(line).getAsJsonObject();
+                    handleCommand(cmd);
+                } catch (Exception e) {
+                    LOGGER.warn("Bad command JSON: {}", line);
+                }
+            }
+        } catch (IOException e) {
+            if (running.get()) {
+                LOGGER.debug("Command reader disconnected: {}", e.getMessage());
+            }
+        } finally {
+            clients.remove(writer);
+        }
+    }
+
+    /**
+     * Dispatch a command received from the Python agent.
+     *
+     * <p>Supported commands:
+     * <ul>
+     *   <li>{@code {"command":"pause"}}   — freeze game ticks (System 2 thinking)</li>
+     *   <li>{@code {"command":"resume"}}  — resume game ticks</li>
+     * </ul>
+     */
+    private void handleCommand(JsonObject cmd) {
+        String action = cmd.has("command") ? cmd.get("command").getAsString() : "";
+        LOGGER.info("[Baby-AI] Received command: {}", action);
+        switch (action) {
+            case "pause" -> {
+                MinecraftServer server = serverRef.get();
+                if (server != null) {
+                    server.execute(() -> {
+                        server.getTickManager().setFrozen(true);
+                        LOGGER.info("[Baby-AI] Game FROZEN (System 2 planning)");
+                    });
+                } else {
+                    LOGGER.warn("[Baby-AI] Cannot pause — serverRef is null (server not started?)");
+                }
+            }
+            case "resume" -> {
+                MinecraftServer server = serverRef.get();
+                if (server != null) {
+                    server.execute(() -> {
+                        server.getTickManager().setFrozen(false);
+                        LOGGER.info("[Baby-AI] Game RESUMED");
+                    });
+                } else {
+                    LOGGER.warn("[Baby-AI] Cannot resume — serverRef is null");
+                }
+            }
+            default -> LOGGER.warn("[Baby-AI] Unknown command: {}", action);
+        }
     }
 }

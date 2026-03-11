@@ -20,6 +20,7 @@ from baby_ai.core.temporal import JambaCore
 from baby_ai.core.policy import DiffusionPolicyHead
 from baby_ai.core.communication import CommunicationHead
 from baby_ai.core.predictive import LatentWorldModel
+from baby_ai.core.goals import GoalConditioner
 from baby_ai.config import JambaConfig, DiffusionPolicyConfig
 
 
@@ -71,6 +72,7 @@ class BabyAgentBase(nn.Module):
         sensor_channels: int = 16,
         jamba_config: JambaConfig | None = None,
         diffusion_config: DiffusionPolicyConfig | None = None,
+        goal_dim: int = 0,
     ):
         super().__init__()
 
@@ -156,6 +158,16 @@ class BabyAgentBase(nn.Module):
             stochastic_dim=32,
         )
 
+        # --- Goal conditioning (System 3) ---
+        self.goal_dim = goal_dim
+        if goal_dim > 0:
+            self.goal_conditioner = GoalConditioner(
+                state_dim=hidden_dim,
+                goal_dim=goal_dim,
+            )
+        else:
+            self.goal_conditioner = None
+
         # Store dims for external access
         self.fused_dim = fused_dim
         self.hidden_dim = hidden_dim
@@ -202,6 +214,7 @@ class BabyAgentBase(nn.Module):
         sensor: Optional[torch.Tensor] = None,
         hidden: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
+        goal: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Full forward pass: encode → fuse → temporal → policy + comm.
@@ -217,6 +230,11 @@ class BabyAgentBase(nn.Module):
         )
 
         core_state, hidden = self.temporal(fused, hidden)
+
+        # Apply goal conditioning (System 3) — FiLM modulation
+        if self.goal_conditioner is not None:
+            core_state = self.goal_conditioner(core_state, goal)
+
         comm_logits = self.communication.get_logits(core_state)
 
         denoising_loss, value = self.policy(core_state, actions=actions)
@@ -245,6 +263,7 @@ class BabyAgentBase(nn.Module):
         sensor: Optional[torch.Tensor] = None,
         hidden: Optional[torch.Tensor] = None,
         deterministic: bool = False,
+        goal: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Single inference step for the agent.
@@ -257,6 +276,10 @@ class BabyAgentBase(nn.Module):
             sensor=sensor,
         )
         core_state, hidden = self.temporal(fused, hidden)
+
+        # Apply goal conditioning (System 3) — FiLM modulation
+        if self.goal_conditioner is not None:
+            core_state = self.goal_conditioner(core_state, goal)
 
         action, log_prob, value = self.policy.act(core_state, deterministic=deterministic)
         utterance = self.communication(core_state)  # autoregressive generation

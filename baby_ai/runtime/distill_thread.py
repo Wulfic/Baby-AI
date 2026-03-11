@@ -74,15 +74,6 @@ class DistillThread:
 
     def _loop(self) -> None:
         while self._running:
-            # Check if imitation learning is enabled in the GUI.
-            try:
-                from baby_ai.ui.control_panel import get_imitation_enabled
-                if not get_imitation_enabled():
-                    time.sleep(1.0)
-                    continue
-            except ImportError:
-                pass  # UI module not available — run unconditionally
-
             learner_step = self.learner_step_fn()
 
             # Check if it's time to distill

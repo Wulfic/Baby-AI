@@ -98,6 +98,10 @@ class Orchestrator:
         # thread-safe — its internal reserve buffers get corrupted).
         self._teacher_lock = threading.Lock()
 
+        # Lock shared between inference and distillation so that
+        # swap_to_live() doesn't write weights while _infer() reads.
+        self._model_swap_lock = threading.Lock()
+
         self.distill_engine = DistillationEngine(
             student=self.student,
             teacher=self.teacher,
@@ -106,6 +110,7 @@ class Orchestrator:
             feature_weight=self.config.training.distill_feature_weight,
             use_amp=self.config.training.use_amp,
             teacher_lock=self._teacher_lock,
+            swap_lock=self._model_swap_lock,
         )
 
         # --- Runtime threads ---
@@ -114,6 +119,8 @@ class Orchestrator:
             device=device,
             target_latency_ms=self.config.runtime.inference_target_ms,
             system2_config=self.config.student.system2,
+            system3_config=self.config.student.system3,
+            swap_lock=self._model_swap_lock,
         )
 
         self.learner_thread = LearnerThread(
@@ -209,6 +216,7 @@ class Orchestrator:
             "student_state_dict": self.student.state_dict(),
             "teacher_state_dict": self.teacher.state_dict(),
             "curiosity_state_dict": self.curiosity.state_dict(),
+            "system3_state_dict": self.inference_thread.system3_state_dict(),
             "config": self.config,
             "learner_step": self.learner_thread.step_count,
             "distill_count": self.distill_thread.stats["distill_count"],
@@ -269,6 +277,10 @@ class Orchestrator:
         curiosity_sd = ckpt.get("curiosity_state_dict") or ckpt.get("icm_state_dict")
         if curiosity_sd is not None:
             self.curiosity.load_state_dict(curiosity_sd)
+        # Load System 3 module weights (GoalProposer, SubgoalPlanner)
+        s3_sd = ckpt.get("system3_state_dict")
+        if s3_sd:
+            self.inference_thread.load_system3_state_dict(s3_sd)
         # Restore reward composer step counter so intrinsic weight
         # decay continues across sessions instead of resetting.
         if "reward_composer_step" in ckpt:

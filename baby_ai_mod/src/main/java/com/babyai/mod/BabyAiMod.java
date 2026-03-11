@@ -43,6 +43,12 @@ public class BabyAiMod implements ModInitializer {
         // Start the TCP event bridge (accepts Python connections)
         EventBridge.INSTANCE.start();
 
+        // ── Server started — store reference for command handling ──
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+            EventBridge.INSTANCE.setServer(server);
+            LOGGER.info("[Baby-AI] Server reference stored for tick control");
+        });
+
         // ── Heartbeat tick (every 100 ticks = 5 seconds) ─────
         // Lets the Python client verify the event pipeline works
         // even when no game events are happening.
@@ -186,6 +192,7 @@ public class BabyAiMod implements ModInitializer {
         // ── Shutdown cleanup ─────────────────────────────────
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             LOGGER.info("[Baby-AI] Server stopping — shutting down bridge");
+            EventBridge.INSTANCE.setServer(null);
             EventBridge.INSTANCE.stop();
         });
 

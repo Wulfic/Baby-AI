@@ -46,6 +46,8 @@ class StudentModel(BabyAgentBase):
             jamba_config=config.jamba,
             # Diffusion policy (continuous actions, 3-5 DDIM steps)
             diffusion_config=config.diffusion,
+            # System 3 goal conditioning
+            goal_dim=config.system3.goal_dim if config.system3.enabled else 0,
         )
 
     @torch.no_grad()

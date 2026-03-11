@@ -215,7 +215,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     goes directly to the Minecraft window handle.
     """
     from baby_ai.environments.minecraft import MinecraftEnv
-    from baby_ai.environments.minecraft.actions import match_player_action
+    from baby_ai.environments.minecraft.actions import player_input_to_continuous
     from baby_ai.environments.minecraft.action_decoder import continuous_action_name
     from baby_ai.config import CHECKPOINT_DIR
 
@@ -273,6 +273,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             orchestrator.load_checkpoint(latest)
 
     orchestrator.start()
+
+    # ── Wire mod bridge into inference thread for System 2 pause ─
+    # The env creates the ModBridge, but InferenceThread is built
+    # before the env.  Now that both exist, connect them so that
+    # System 2 planning can freeze/resume game ticks.
+    if env._mod_bridge is not None:
+        orchestrator.inference_thread.set_mod_bridge(env._mod_bridge)
 
     # ── JEPA curiosity for intrinsic reward ─────────────────────────────
     curiosity = orchestrator.curiosity
@@ -525,14 +532,26 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 for _k in _acc_keys:
                     _acc[_k] += rb.get(_k, 0.0)
 
+                # Include next_fused so the JEPA world model gets a
+                # training signal from replay (dynamics + KL loss).
+                _cur_fused = prev_fused.squeeze(0) if prev_fused.dim() > 1 else prev_fused
+                _next_fused = fused.squeeze(0) if fused.dim() > 1 else fused
+                _action = prev_action.squeeze(0) if prev_action.dim() > 1 else prev_action
                 transition = {
                     "vision": prev_obs["vision"].squeeze(0),
                     "audio": prev_obs["audio"].squeeze(0),
                     "sensor": prev_obs["sensor"].squeeze(0),
-                    "action": prev_action,
+                    "action": _action,
                     "reward": torch.tensor(total_r),
-                    "fused": prev_fused.squeeze(0) if prev_fused.dim() > 1 else prev_fused,
+                    "fused": _cur_fused,
+                    "next_fused": _next_fused.detach(),
                 }
+                # System 3: attach active goal embedding for hindsight training
+                _goal_emb = result.get("goal_embedding")
+                if _goal_emb is not None:
+                    transition["goal_embedding"] = (
+                        _goal_emb.squeeze(0) if _goal_emb.dim() > 1 else _goal_emb
+                    )
                 priority = abs(intrinsic_r) + 0.01
                 orchestrator.add_experience(transition, priority=priority)
                 episode_reward += total_r
@@ -643,6 +662,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     log.info("Minecraft window lost — exiting.")
                     break
                 orchestrator.inference_thread.reset_hidden()
+                orchestrator.inference_thread.reset_system3()
                 obs = env.reset()
                 prev_fused, prev_action, prev_obs = None, None, None
                 episode_reward = 0.0
@@ -662,10 +682,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if _imitation_active and env._guard is not None:
                 held_keys, held_buttons = env._guard.snapshot_player_input()
                 dyaw, dpitch = env.get_look_delta()
-                player_action_id = match_player_action(
+                # Build a 20-dim continuous vector from the player's
+                # physical input so curiosity / replay stay consistent.
+                prev_action = player_input_to_continuous(
                     held_keys, held_buttons, dyaw, dpitch,
                 )
-                prev_action = torch.tensor(player_action_id, dtype=torch.long)
             else:
                 prev_action = action_tensor
             prev_obs = obs

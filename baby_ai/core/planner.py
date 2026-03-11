@@ -20,6 +20,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class LatentMCTS(nn.Module):
@@ -60,12 +61,16 @@ class LatentMCTS(nn.Module):
     def plan(
         self,
         core_state: torch.Tensor,
+        goal: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Run batched latent planning from the current state.
 
         Args:
             core_state: (1, state_dim) current temporal core output.
+            goal:       (1, goal_dim) optional System 3 goal embedding.
+                        When provided, a cosine proximity bonus biases
+                        trajectory scoring toward the active subgoal.
 
         Returns:
             dict with:
@@ -81,6 +86,12 @@ class LatentMCTS(nn.Module):
 
         # Replicate current state for N parallel trajectories
         state = core_state.expand(N, -1).contiguous()  # (N, state_dim)
+
+        # Pre-expand goal for cosine bonus if provided
+        goal_expanded = None
+        if goal is not None:
+            goal_dim = goal.size(-1)
+            goal_expanded = goal.expand(N, -1).contiguous()  # (N, goal_dim)
 
         # Storage for first actions and cumulative returns
         first_actions: torch.Tensor | None = None
@@ -104,6 +115,15 @@ class LatentMCTS(nn.Module):
 
             # Score the new state via value head
             step_value = self.policy.value_head(next_latent).squeeze(-1)  # (N,)
+
+            # Goal proximity bonus (System 3) — bias toward trajectories
+            # that move latent state closer to the active subgoal.
+            if goal_expanded is not None:
+                # Compare the first goal_dim dims of next_latent to goal
+                latent_prefix = next_latent[:, :goal_dim]  # (N, goal_dim)
+                cos_sim = F.cosine_similarity(latent_prefix, goal_expanded, dim=-1)  # (N,)
+                step_value = step_value + 0.5 * cos_sim
+
             returns += (self.discount ** t) * step_value
 
             # Advance state (use predicted latent as next state for planning)
@@ -145,16 +165,35 @@ class UncertaintyEstimator:
     its current situation. When uncertainty exceeds a threshold,
     the inference thread should invoke the LatentMCTS planner.
 
+    Includes cooldown and warmup logic to prevent constant triggering
+    on an untrained model where all signals saturate at maximum.
+
     Uncertainty signals:
       1. Diffusion denoising variance across action samples.
       2. World model prediction error spike.
       3. Value prediction spread across imagined trajectories.
     """
 
-    def __init__(self, threshold: float = 0.5, ema_alpha: float = 0.1):
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        ema_alpha: float = 0.1,
+        warmup_steps: int = 100,
+        cooldown_steps: int = 20,
+    ):
         self.threshold = threshold
         self._ema_alpha = ema_alpha
+        self._warmup_steps = warmup_steps
+        self._cooldown_steps = cooldown_steps
         self._running_uncertainty: float = 0.0
+        self._step: int = 0
+        self._last_trigger_step: int = -999  # last step System 2 fired
+
+        # Running statistics for adaptive normalisation.
+        # Without these, the raw signals saturate and
+        # should_plan is always True on an untrained model.
+        self._lp_ema: float = 0.0   # EMA of raw log_prob signal
+        self._lp_sq_ema: float = 1.0  # EMA of squared log_prob signal
 
     def update(
         self,
@@ -164,6 +203,9 @@ class UncertaintyEstimator:
         """
         Update uncertainty estimate from the latest inference result.
 
+        Uses z-score normalisation against a running mean/variance
+        so signals don't saturate on an early-stage untrained model.
+
         Args:
             value:    (B, 1) state value — low absolute value = uncertain.
             log_prob: (B,) log probability — low = uncertain.
@@ -171,19 +213,31 @@ class UncertaintyEstimator:
         Returns:
             Current uncertainty estimate (0 = certain, higher = uncertain).
         """
+        self._step += 1
         u = 0.0
+        n_signals = 0
 
-        # Low log_prob means the policy is uncertain about which action to take
         if log_prob is not None:
-            # Negate and normalise: large negative log_prob → high uncertainty
-            u += torch.clamp(-log_prob.mean(), 0.0, 5.0).item() / 5.0
+            raw_lp = -log_prob.mean().item()  # positive = more uncertain
+            # Adaptive z-score normalisation
+            self._lp_ema = 0.99 * self._lp_ema + 0.01 * raw_lp
+            self._lp_sq_ema = 0.99 * self._lp_sq_ema + 0.01 * (raw_lp ** 2)
+            lp_std = max((self._lp_sq_ema - self._lp_ema ** 2) ** 0.5, 1e-4)
+            # z-score: how many stdev above mean?
+            z = (raw_lp - self._lp_ema) / lp_std
+            # Map z to [0, 1]: z=0 → 0.5, z=+2 → ~0.88
+            u += max(0.0, min(1.0, 0.5 + 0.25 * z))
+            n_signals += 1
 
-        # Low absolute value means the model can't distinguish good/bad states
         if value is not None:
-            # Small |value| = uncertain about state quality
-            u += torch.clamp(1.0 - value.abs().mean(), 0.0, 1.0).item()
+            # Low |value| means the model can't distinguish good/bad states.
+            # Sigmoid-scale so large absolute values → low uncertainty.
+            val_mag = value.abs().mean().item()
+            u += 1.0 / (1.0 + val_mag)  # asymptotes to 0 as |v| grows
+            n_signals += 1
 
-        u = u / 2.0  # average the signals, range [0, 1]
+        if n_signals > 0:
+            u = u / n_signals
 
         # EMA smoothing
         self._running_uncertainty = (
@@ -194,8 +248,20 @@ class UncertaintyEstimator:
 
     @property
     def should_plan(self) -> bool:
-        """Whether current uncertainty exceeds the threshold."""
+        """Whether current uncertainty exceeds the threshold.
+
+        Respects warmup (model needs N steps before planning makes
+        sense) and cooldown (don't plan two steps in a row).
+        """
+        if self._step < self._warmup_steps:
+            return False
+        if (self._step - self._last_trigger_step) < self._cooldown_steps:
+            return False
         return self._running_uncertainty > self.threshold
+
+    def mark_triggered(self) -> None:
+        """Call this after System 2 actually fires to start cooldown."""
+        self._last_trigger_step = self._step
 
     @property
     def current(self) -> float:

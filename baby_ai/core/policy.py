@@ -264,6 +264,10 @@ class DiffusionPolicyHead(nn.Module):
         if actions is None:
             return torch.tensor(0.0, device=state.device), value
 
+        # Guard: squeeze stale replay data stored with batch dim (B,1,D) → (B,D)
+        if actions.dim() == 3 and actions.size(1) == 1:
+            actions = actions.squeeze(1)
+
         B = state.size(0)
         device = state.device
 

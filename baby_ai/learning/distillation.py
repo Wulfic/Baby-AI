@@ -54,6 +54,7 @@ class DistillationEngine:
         temperature: float = 2.0,
         use_amp: bool = True,
         teacher_lock: threading.Lock | None = None,
+        swap_lock: threading.Lock | None = None,
     ):
         self.student = student
         self.teacher = teacher
@@ -64,8 +65,21 @@ class DistillationEngine:
         self.use_amp = use_amp
         self._teacher_lock = teacher_lock or threading.Lock()
 
-        # Create a staging copy of Student for offline updates
-        self._staging_student = copy.deepcopy(student)
+        # Create a staging copy of Student for offline updates.
+        # Avoid copy.deepcopy — it fails if the model has been used
+        # for inference (non-leaf tensors cached in the graph).  Instead
+        # construct a fresh instance from the class + load weights.
+        self._staging_student = type(student).__new__(type(student))
+        nn.Module.__init__(self._staging_student)
+        # Re-initialise using the same class constructor
+        try:
+            self._staging_student.__init__()  # StudentModel() uses DEFAULT_CONFIG
+        except Exception:
+            # Fallback: deepcopy under no_grad (works if no forward ran)
+            with torch.no_grad():
+                self._staging_student = copy.deepcopy(student)
+        # Load the live weights into the staging copy
+        self._staging_student.load_state_dict(student.state_dict())
         self._optimizer = torch.optim.Adam(
             self._staging_student.parameters(), lr=lr
         )
@@ -76,7 +90,7 @@ class DistillationEngine:
         )
         
         self._scaler = torch.amp.GradScaler("cuda") if use_amp else None
-        self._swap_lock = threading.Lock()
+        self._swap_lock = swap_lock or threading.Lock()
         self._step = 0
 
     def _kl_loss(
@@ -147,6 +161,11 @@ class DistillationEngine:
                     inputs[k] = v.to(device)
                 else:
                     inputs[k] = v
+
+        # Pass goal_embedding for goal-conditioned distillation
+        if "goal_embedding" in batch:
+            ge = batch["goal_embedding"]
+            inputs["goal"] = ge.to(device) if isinstance(ge, torch.Tensor) else ge
 
         # Get Teacher targets (no grad)
         # Wrap in autocast so teacher outputs match the dtype that
@@ -232,7 +251,8 @@ class DistillationEngine:
         """
         Atomic weight swap: copy staging Student weights → live Student.
 
-        Uses a lock to ensure inference thread doesn't read partial state.
+        Uses the swap lock to ensure the inference thread doesn't
+        read partial state mid-update.
         """
         with self._swap_lock:
             live_sd = self._staging_student.state_dict()

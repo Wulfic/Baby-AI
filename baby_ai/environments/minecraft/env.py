@@ -238,6 +238,7 @@ class MinecraftEnv(GameEnvironment):
         # and get stuck staring at the sky (or feet).
         self._player_pitch: Optional[float] = None   # degrees
         self._player_yaw: Optional[float] = None     # degrees
+        self._prev_player_yaw: Optional[float] = None
         self._PITCH_LIMIT_UP: float = -55.0          # max upward pitch (degrees)
         self._PITCH_LIMIT_DOWN: float = 70.0         # max downward pitch (degrees)
         # Track how long the camera has been at extreme pitch
@@ -334,6 +335,7 @@ class MinecraftEnv(GameEnvironment):
         self._surface_y_calibrated = False
         self._player_pitch = None
         self._player_yaw = None
+        self._prev_player_yaw = None
         self._extreme_pitch_steps = 0
         self._prev_yaw = None
         self._prev_pitch = None

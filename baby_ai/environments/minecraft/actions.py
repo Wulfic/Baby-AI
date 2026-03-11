@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import FrozenSet, List, Optional, Tuple
 
+import torch
+
 from baby_ai.environments.minecraft.input_controller import VK
 
 # ── Look delta magnitudes (pixels per step) ─────────────────────
@@ -398,3 +400,73 @@ def match_player_action(
             best_id = idx
     
     return best_id
+
+
+# ── Inverse mapping: player input → 20-dim continuous vector ────
+# Keeps the same layout as ContinuousActionDecoder:
+#   [0:2]   camera (yaw, pitch) in [-1, 1]
+#   [2:6]   movement (fwd, back, left, right) in {0, 1}
+#   [6:11]  actions (attack, use, jump, sneak, sprint) in {0, 1}
+#   [11:20] hotbar (9 slots, one-hot) in {0, 1}
+
+# VK codes we care about for channel mapping
+_VK_W     = VK["W"]
+_VK_S     = VK["S"]
+_VK_A     = VK["A"]
+_VK_D     = VK["D"]
+_VK_SPACE = VK["SPACE"]
+_VK_SHIFT = VK["LSHIFT"]
+_VK_CTRL  = VK["LCTRL"]
+_VK_SLOTS = [VK[str(i)] for i in range(1, 10)]  # 1-9
+
+# Camera scale must match action_decoder.py so [-1,1] round-trips
+_CAM_SCALE_X = 160.0
+_CAM_SCALE_Y = 120.0
+
+
+def player_input_to_continuous(
+    held_keys: FrozenSet[int],
+    held_buttons: FrozenSet[str],
+    dyaw: float = 0.0,
+    dpitch: float = 0.0,
+) -> torch.Tensor:
+    """Convert raw player input into a 20-dim continuous action tensor.
+
+    This is the inverse of ``ContinuousActionDecoder.decode`` — it takes
+    the same inputs that ``match_player_action`` receives and produces a
+    float32 vector the curiosity module and replay buffer expect.
+
+    Args:
+        held_keys:    frozenset of VK codes the player is holding.
+        held_buttons: frozenset of mouse button names ("left"/"right"/"middle").
+        dyaw:         degrees of yaw change (>0 = right).
+        dpitch:       degrees of pitch change (>0 = down).
+
+    Returns:
+        (20,) float32 tensor with values in [-1, 1] (camera) or [0, 1].
+    """
+    v = torch.zeros(20, dtype=torch.float32)
+
+    # [0:2] camera  — clamp to [-1, 1]
+    v[0] = max(-1.0, min(1.0, dyaw / _CAM_SCALE_X))
+    v[1] = max(-1.0, min(1.0, dpitch / _CAM_SCALE_Y))
+
+    # [2:6] movement
+    v[2] = 1.0 if _VK_W in held_keys else 0.0
+    v[3] = 1.0 if _VK_S in held_keys else 0.0
+    v[4] = 1.0 if _VK_A in held_keys else 0.0
+    v[5] = 1.0 if _VK_D in held_keys else 0.0
+
+    # [6:11] actions
+    v[6]  = 1.0 if "left" in held_buttons else 0.0    # attack
+    v[7]  = 1.0 if "right" in held_buttons else 0.0   # use
+    v[8]  = 1.0 if _VK_SPACE in held_keys else 0.0    # jump
+    v[9]  = 1.0 if _VK_SHIFT in held_keys else 0.0    # sneak
+    v[10] = 1.0 if _VK_CTRL in held_keys else 0.0     # sprint
+
+    # [11:20] hotbar — one-hot for the active slot key (if any)
+    for i, vk in enumerate(_VK_SLOTS):
+        if vk in held_keys:
+            v[11 + i] = 1.0
+
+    return v

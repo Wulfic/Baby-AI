@@ -20,7 +20,8 @@ from typing import Any, Dict, Optional
 import torch
 
 from baby_ai.core.planner import LatentMCTS, UncertaintyEstimator
-from baby_ai.config import System2Config
+from baby_ai.config import System2Config, System3Config
+from baby_ai.core.goals import GoalProposer, SubgoalPlanner, GoalMonitor
 from baby_ai.utils.logging import get_logger, LatencyTracker
 
 log = get_logger("inference", log_file="inference.log")
@@ -63,7 +64,9 @@ class InferenceThread:
         target_latency_ms: float = 200.0,
         queue_size: int = 64,
         system2_config: System2Config | None = None,
+        system3_config: System3Config | None = None,
         mod_bridge=None,
+        swap_lock: threading.Lock | None = None,
     ):
         self.student = student
         self.device = device
@@ -75,12 +78,14 @@ class InferenceThread:
         self._hidden = None  # JambaState (Jamba temporal core)
         self._latency = LatencyTracker("inference")
         self._step = 0
-        self._swap_lock = threading.Lock()
+        self._swap_lock = swap_lock or threading.Lock()
 
         # ── System 2: test-time planning ──
         self._s2_config = system2_config or System2Config()
         self._uncertainty = UncertaintyEstimator(
             threshold=self._s2_config.uncertainty_threshold,
+            warmup_steps=self._s2_config.warmup_steps,
+            cooldown_steps=self._s2_config.cooldown_steps,
         )
         self._planner: LatentMCTS | None = None
         self._mod_bridge = mod_bridge
@@ -95,6 +100,43 @@ class InferenceThread:
                 horizon=self._s2_config.planning_horizon,
                 discount=self._s2_config.discount,
                 budget_ms=self._s2_config.planning_budget_ms,
+            )
+
+        # ── System 3: hierarchical goal planning ──
+        self._s3_config = system3_config or System3Config(enabled=False)
+        self._active_goal: torch.Tensor | None = None      # (1, goal_dim) current subgoal
+        self._subgoal_queue: list[torch.Tensor] = []        # remaining subgoals
+        self._subgoal_idx: int = 0                          # index in current plan
+        self._s3_trigger_count: int = 0
+        self._s3_step: int = 0                              # steps since system 3 active
+        self._goal_monitor: GoalMonitor | None = None
+        self._goal_proposer: GoalProposer | None = None
+        self._subgoal_planner: SubgoalPlanner | None = None
+
+        if self._s3_config.enabled:
+            state_dim = getattr(student, 'hidden_dim', 512)
+            goal_dim = self._s3_config.goal_dim
+            self._goal_proposer = GoalProposer(
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+                num_candidates=self._s3_config.num_goal_candidates,
+                hidden_dim=self._s3_config.proposer_hidden_dim,
+            ).to(device).eval()
+            self._subgoal_planner = SubgoalPlanner(
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+                max_subgoals=self._s3_config.max_subgoals,
+                num_layers=self._s3_config.planner_layers,
+                num_heads=self._s3_config.planner_heads,
+            ).to(device).eval()
+            self._goal_monitor = GoalMonitor(
+                achieve_threshold=self._s3_config.achieve_threshold,
+                patience_steps=self._s3_config.patience_steps,
+                min_replan_interval=self._s3_config.min_replan_interval,
+            )
+            log.info(
+                "System 3 initialised: goal_dim=%d, num_candidates=%d, max_subgoals=%d",
+                goal_dim, self._s3_config.num_goal_candidates, self._s3_config.max_subgoals,
             )
 
     def start(self) -> None:
@@ -176,7 +218,7 @@ class InferenceThread:
 
     @torch.no_grad()
     def _infer(self, observation: Dict[str, Any]) -> Dict[str, Any]:
-        """Run Student inference, potentially triggering System 2 planning."""
+        """Run Student inference, potentially triggering System 2/3 planning."""
         # Move tensors to device
         inputs = {}
         for k, v in observation.items():
@@ -185,11 +227,57 @@ class InferenceThread:
             else:
                 inputs[k] = v
 
+        # ── System 3: manage active goal ──
+        goal_for_model = None
+        if self._s3_config.enabled and self._active_goal is not None:
+            goal_for_model = self._active_goal.to(self.device)
+
         with self._swap_lock:
-            result = self.student.act(hidden=self._hidden, **inputs)
+            result = self.student.act(hidden=self._hidden, goal=goal_for_model, **inputs)
 
         # Update hidden state
         self._hidden = result["hidden"].detach()
+
+        # ── System 3: goal monitoring and planning ──
+        s3_replanned = False
+        if (
+            self._s3_config.enabled
+            and self._goal_monitor is not None
+        ):
+            self._s3_step += 1
+            core_state = result["core_state"]
+
+            # Check if player died (trigger full replan)
+            player_died = observation.get("player_died", False)
+            if player_died and self._s3_config.replan_on_death:
+                log.info("System 3: player died — full replan")
+                self._trigger_system3(core_state, reason="death")
+                s3_replanned = True
+            elif self._active_goal is not None:
+                # Monitor progress toward current subgoal
+                # Pass goal_proj so the monitor can project core_state
+                # into goal space for meaningful cosine similarity.
+                _gp = self._goal_proposer.goal_proj if self._goal_proposer is not None else None
+                status = self._goal_monitor.step(core_state, self._active_goal, goal_proj=_gp)
+                if status == "advance":
+                    log.info(
+                        "System 3: subgoal %d/%d achieved, advancing",
+                        self._subgoal_idx, len(self._subgoal_queue) + self._subgoal_idx,
+                    )
+                    self._advance_subgoal(core_state)
+                elif status == "replan":
+                    log.info(
+                        "System 3: stuck on subgoal %d — replanning",
+                        self._subgoal_idx,
+                    )
+                    self._trigger_system3(core_state, reason="stuck")
+                    s3_replanned = True
+            elif self._s3_step >= self._s3_config.warmup_steps:
+                # No active goal: propose one periodically
+                if self._s3_step % self._s3_config.propose_every_n == 0:
+                    log.info("System 3: no active goal — proposing new plan")
+                    self._trigger_system3(core_state, reason="no_goal")
+                    s3_replanned = True
 
         # ── System 2 uncertainty check ──
         used_planning = False
@@ -214,9 +302,10 @@ class InferenceThread:
                 if self._s2_config.pause_game and self._mod_bridge is not None:
                     self._send_pause(True)
 
-                # Run latent MCTS planning
+                # Run latent MCTS planning (pass active goal for biased scoring)
                 plan_result = self._planner.plan(
                     core_state=result["core_state"],
+                    goal=self._active_goal.to(self.device) if self._active_goal is not None else None,
                 )
 
                 # Override the System 1 action with the planned action
@@ -230,6 +319,9 @@ class InferenceThread:
                     plan_result["num_trajectories"],
                     plan_result["expected_value"].item(),
                 )
+
+                # Mark triggered so cooldown starts
+                self._uncertainty.mark_triggered()
 
                 # Resume game
                 if self._s2_config.pause_game and self._mod_bridge is not None:
@@ -245,21 +337,152 @@ class InferenceThread:
 
         cpu_result["latency_ms"] = self._latency.last_ms
         cpu_result["system2_triggered"] = used_planning
+        cpu_result["system3_replanned"] = s3_replanned
         cpu_result["uncertainty"] = self._uncertainty.current
+        # Expose the active goal to the main loop for transitions
+        if self._active_goal is not None:
+            cpu_result["goal_embedding"] = self._active_goal.cpu()
         return cpu_result
 
     def _send_pause(self, paused: bool) -> None:
         """Send pause/resume command to the Minecraft mod bridge."""
         try:
-            if hasattr(self._mod_bridge, 'send_command'):
+            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_command'):
                 cmd = "pause" if paused else "resume"
                 self._mod_bridge.send_command({"command": cmd, "reason": "system2_planning"})
+                log.info("System 2 %s sent to mod bridge", cmd)
         except Exception as e:
-            log.debug("Could not send pause command: %s", e)
+            log.warning("Could not send pause command: %s", e)
+
+    # ── System 3: goal planning ──────────────────────────────
+
+    @torch.no_grad()
+    def _trigger_system3(self, core_state: torch.Tensor, reason: str = "unknown") -> None:
+        """
+        Full System 3 replan: propose a high-level goal, decompose
+        into subgoals, and populate the subgoal queue.
+
+        The game is PAUSED for the entire duration — System 3 is
+        allowed to take as long as it needs.  This is the whole point
+        of the pause: thoughtful, unhurried deliberation.
+        """
+        if self._goal_proposer is None or self._subgoal_planner is None:
+            return
+
+        self._s3_trigger_count += 1
+        t_start = time.perf_counter()
+
+        # Pause game so the world freezes while we think
+        if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
+            self._send_pause_s3(True)
+
+        device = core_state.device
+        state = core_state.detach()  # (1, state_dim)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        # ─ 1. Propose candidate goals ─
+        proposal = self._goal_proposer(state)
+        goals = proposal["goals"]    # (1, K, goal_dim)
+        scores = proposal["scores"]  # (1, K)
+
+        # Pick the highest-scoring goal
+        best_idx = scores[0].argmax()
+        chosen_goal = goals[0, best_idx].unsqueeze(0)  # (1, goal_dim)
+
+        log.info(
+            "System 3 [%s]: proposed %d goals, chose #%d (score=%.3f)",
+            reason, scores.size(1), best_idx.item(), scores[0, best_idx].item(),
+        )
+
+        # ─ 2. Decompose into subgoal sequence ─
+        plan_out = self._subgoal_planner(state, chosen_goal)
+        subgoals = plan_out["subgoals"]    # (1, T, goal_dim)
+        done_probs = plan_out["done_probs"]  # (1, T)
+
+        # Trim at the first step where done_prob > 0.5, or keep all
+        done_mask = done_probs[0] > 0.5
+        if done_mask.any():
+            T_end = done_mask.nonzero(as_tuple=True)[0][0].item() + 1
+        else:
+            T_end = subgoals.size(1)
+        T_end = max(T_end, 1)  # at least one subgoal
+
+        # Build the subgoal queue
+        self._subgoal_queue = [
+            subgoals[0, t].unsqueeze(0)  # (1, goal_dim)
+            for t in range(T_end)
+        ]
+        self._subgoal_idx = 0
+        self._active_goal = self._subgoal_queue[0]
+
+        # Reset the monitor for the fresh plan
+        if self._goal_monitor is not None:
+            self._goal_monitor.reset_full()
+
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        log.info(
+            "System 3 replanned: %d subgoals, %.1f ms (no budget — game frozen)",
+            len(self._subgoal_queue), elapsed_ms,
+        )
+
+        # Resume game — thinking is done
+        if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
+            self._send_pause_s3(False)
+
+    def _advance_subgoal(self, core_state: torch.Tensor) -> None:
+        """Move to the next subgoal, or trigger full replan if done."""
+        self._subgoal_idx += 1
+        if self._subgoal_idx < len(self._subgoal_queue):
+            self._active_goal = self._subgoal_queue[self._subgoal_idx]
+            if self._goal_monitor is not None:
+                self._goal_monitor.reset()  # reset patience for new subgoal
+            log.info(
+                "System 3: advanced to subgoal %d/%d",
+                self._subgoal_idx, len(self._subgoal_queue),
+            )
+        else:
+            # All subgoals completed — celebrate then replan
+            log.info(
+                "System 3: all %d subgoals completed — replanning",
+                len(self._subgoal_queue),
+            )
+            self._trigger_system3(core_state, reason="plan_complete")
+
+    def _send_pause_s3(self, paused: bool) -> None:
+        """Send pause/resume for System 3 replanning."""
+        try:
+            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_command'):
+                cmd = "pause" if paused else "resume"
+                self._mod_bridge.send_command({"command": cmd, "reason": "system3_planning"})
+                log.info("System 3 %s sent to mod bridge", cmd)
+        except Exception as e:
+            log.warning("Could not send System 3 pause command: %s", e)
+
+    def set_mod_bridge(self, mod_bridge) -> None:
+        """Attach the mod bridge after construction.
+
+        The env creates the ModBridge, but the InferenceThread is
+        built before the env exists.  Call this once the env is ready
+        so System 2 planning can freeze/resume the game.
+        """
+        self._mod_bridge = mod_bridge
+        log.info("ModBridge attached to InferenceThread (pause_game=%s)",
+                 self._s2_config.pause_game)
 
     def reset_hidden(self) -> None:
         """Reset the Jamba hidden state (e.g., start of new episode)."""
         self._hidden = None
+
+    def reset_system3(self) -> None:
+        """Reset all System 3 goal state (e.g., start of new episode)."""
+        self._active_goal = None
+        self._subgoal_queue = []
+        self._subgoal_idx = 0
+        self._s3_step = 0
+        if self._goal_monitor is not None:
+            self._goal_monitor.reset_full()
+        log.info("System 3 state reset (episode boundary)")
 
     def swap_model(self, new_state_dict: dict) -> None:
         """Atomically swap Student weights (called by distillation thread)."""
@@ -275,5 +498,27 @@ class InferenceThread:
             "queue_size": self._queue.qsize(),
             "running": self._running,
             "system2_trigger_count": self._s2_trigger_count,
+            "system3_trigger_count": self._s3_trigger_count,
             "uncertainty": self._uncertainty.current,
+            "active_goal": self._active_goal is not None,
+            "subgoal_queue_len": len(self._subgoal_queue),
+            "subgoal_idx": self._subgoal_idx,
         }
+
+    def system3_state_dict(self) -> dict:
+        """Return state dicts for System 3 modules (for checkpointing)."""
+        sd = {}
+        if self._goal_proposer is not None:
+            sd["goal_proposer"] = self._goal_proposer.state_dict()
+        if self._subgoal_planner is not None:
+            sd["subgoal_planner"] = self._subgoal_planner.state_dict()
+        return sd
+
+    def load_system3_state_dict(self, sd: dict) -> None:
+        """Load System 3 module weights from a checkpoint."""
+        if self._goal_proposer is not None and "goal_proposer" in sd:
+            self._goal_proposer.load_state_dict(sd["goal_proposer"])
+            log.info("System 3 GoalProposer weights loaded")
+        if self._subgoal_planner is not None and "subgoal_planner" in sd:
+            self._subgoal_planner.load_state_dict(sd["subgoal_planner"])
+            log.info("System 3 SubgoalPlanner weights loaded")
