@@ -8,7 +8,6 @@ replay buffer, computing losses, and taking gradient steps.
 from __future__ import annotations
 
 import threading
-import time
 from typing import Any, Dict, Optional
 
 import torch
@@ -54,6 +53,7 @@ class LearnerThread:
         device: str = "cuda",
         teacher_lock: threading.Lock | None = None,
         runtime_config: RuntimeConfig | None = None,
+        distill_ready_callback=None,
     ):
         self.teacher = teacher
         self.replay = replay
@@ -63,6 +63,9 @@ class LearnerThread:
         self.device = device
         self._teacher_lock = teacher_lock or threading.Lock()
         self._runtime_config = runtime_config or RuntimeConfig()
+        self._distill_ready_callback = distill_ready_callback
+        self._last_distill_signal_at = 0
+        self._distill_engine = None  # set by orchestrator for cache version bumps
 
         # REBEL RL loss (Phase D)
         rebel_cfg = getattr(teacher, '_rebel_config', None)
@@ -125,11 +128,18 @@ class LearnerThread:
         self._step = 0
         self._accum_count = 0
 
+        # Event-driven coordination: the main loop or the distill thread
+        # can signal that new data is available or a threshold is crossed,
+        # eliminating fixed-interval sleep polling.
+        self._data_ready = threading.Event()
+        self._stop_event = threading.Event()
+
     def start(self) -> None:
         """Start the learner thread."""
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         self.teacher.to(self.device).train()
 
         # Phase A: optional torch.compile for Teacher
@@ -147,26 +157,39 @@ class LearnerThread:
     def stop(self) -> None:
         """Stop the learner thread."""
         self._running = False
+        self._stop_event.set()      # wake the loop immediately
+        self._data_ready.set()      # unblock any wait
         if self._thread is not None:
             self._thread.join(timeout=10.0)
         log.info("Learner thread stopped after %d steps.", self._step)
 
+    def notify_data_ready(self) -> None:
+        """Signal that new transitions are available in the replay buffer.
+
+        Called by the main loop after adding experience.  Wakes the
+        learner thread immediately instead of waiting for the next
+        sleep-poll cycle.
+        """
+        self._data_ready.set()
+
     def _loop(self) -> None:
-        """Main training loop."""
+        """Main training loop (event-driven)."""
         while self._running:
             # Wait until we have enough transitions
             if self.replay.size < self.config.micro_batch_size * 2:
-                time.sleep(0.5)
+                # Block until signalled (with timeout so we can check _running)
+                self._data_ready.wait(timeout=1.0)
+                self._data_ready.clear()
                 continue
 
             try:
                 self._train_step()
             except Exception as e:
                 log.error("Learner error at step %d: %s", self._step, e, exc_info=True)
-                time.sleep(1.0)
+                self._stop_event.wait(timeout=1.0)
 
-            # Yield to other threads
-            time.sleep(self.config.micro_batch_size * 0.001)
+            # Yield to other threads (short, bounded sleep)
+            self._stop_event.wait(timeout=max(self.config.micro_batch_size * 0.001, 0.001))
 
     def _train_step(self) -> None:
         """Perform a single training step."""
@@ -244,6 +267,11 @@ class LearnerThread:
             if hasattr(self.teacher, 'predictive') and hasattr(self.teacher.predictive, 'update_target_encoder'):
                 self.teacher.predictive.update_target_encoder()
 
+            # Bump teacher version so the distill engine's soft-label
+            # cache knows that cached outputs are now stale.
+            if self._distill_engine is not None:
+                self._distill_engine.bump_teacher_version()
+
         # Update replay priorities
         new_priorities = [
             max(loss_dict.get("per_sample_loss", [0.1])[i] if i < len(loss_dict.get("per_sample_loss", [])) else 0.1, 1e-6)
@@ -251,8 +279,21 @@ class LearnerThread:
         ]
         self.replay.update_priorities(indices, new_priorities)
 
-        # Periodic consolidation
+        # Periodic consolidation — recompute Fisher then apply EWC penalty
         if self._step > 0 and self._step % self.config.consolidation_every_n_steps == 0:
+            # Recompute Fisher Information from recent replay data so the
+            # EWC penalty actually protects important weights.  Previously
+            # compute_fisher was never called, making EWC a no-op.
+            try:
+                fisher_loader = self._make_fisher_loader(num_samples=200)
+                self.consolidator.update_fisher(
+                    self.teacher, fisher_loader,
+                    num_samples=200, device=self.device,
+                )
+                log.info("Fisher Information recomputed at step %d.", self._step)
+            except Exception as e:
+                log.warning("Fisher computation failed at step %d: %s", self._step, e)
+
             ewc_loss = self.consolidator.consolidation_loss(self.teacher)
             if ewc_loss.item() > 0:
                 ewc_loss.backward()
@@ -261,6 +302,29 @@ class LearnerThread:
             log.info("Consolidation at step %d, EWC loss: %.4f", self._step, ewc_loss.item())
 
         self._step += 1
+
+        # ── Signal distill thread when step threshold crossed ────
+        distill_interval = getattr(self.config, 'distill_every_n_steps', 100)
+        if (self._distill_ready_callback is not None
+                and self._step - self._last_distill_signal_at >= distill_interval):
+            self._distill_ready_callback()
+            self._last_distill_signal_at = self._step
+
+        # ── Interleave n-step sequence training every 4 steps ────
+        # This supplements the single-transition loss with GAE-based
+        # multi-step value targets, giving the value head temporal
+        # credit assignment without slowing down normal training.
+        if self._step % 4 == 0 and self.replay.size >= self.config.micro_batch_size:
+            try:
+                sequences, seq_weights, seq_indices = self.replay.sample_sequence(
+                    batch_size=max(self.config.micro_batch_size // 4, 2),
+                    seq_len=8,
+                    device=self.device,
+                )
+                for seq, w in zip(sequences, seq_weights):
+                    self.train_on_sequence(seq, weight=float(w))
+            except Exception as e:
+                log.debug("N-step sequence training skipped: %s", e)
 
         # Log periodically
         if self._step % 100 == 0:
@@ -410,6 +474,164 @@ class LearnerThread:
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)
 
         return batch
+
+    def _make_fisher_loader(self, num_samples: int = 200):
+        """Create an iterable of batched dicts from replay for Fisher estimation.
+
+        Yields small batches (size = micro_batch_size) of collated transitions
+        until *num_samples* total transitions have been yielded.  The Teacher's
+        ``compute_fisher`` consumes these to estimate the diagonal Fisher
+        Information matrix.
+        """
+        bs = self.config.micro_batch_size
+        yielded = 0
+        while yielded < num_samples:
+            if self.replay.size < bs:
+                break
+            transitions, _w, _idx = self.replay.sample(bs, device=self.device)
+            batch = self._collate_transitions(transitions)
+            yield batch
+            yielded += bs
+
+    # ── N-step return helpers ────────────────────────────────────────
+
+    @staticmethod
+    def compute_nstep_returns(
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+    ) -> torch.Tensor:
+        """Compute GAE-style n-step returns for a sequence of transitions.
+
+        Uses Generalized Advantage Estimation (Schulman et al., 2016)
+        for variance-reduced temporal difference targets:
+
+        .. math::
+
+            \\hat{A}_t = \\sum_{l=0}^{T-t-1} (\\gamma\\lambda)^l \\delta_{t+l}
+
+        where :math:`\\delta_t = r_t + \\gamma V(s_{t+1}) - V(s_t)`.
+
+        The returned tensor is the **target value**, not the advantage:
+        ``target_t = V(s_t) + A_t``.
+
+        Args:
+            rewards: (T,) reward at each timestep.
+            values:  (T+1,) value estimates.  ``values[-1]`` is the
+                     bootstrap value at the end of the sequence.
+            gamma:   Discount factor.
+            lam:     GAE lambda (1.0 = Monte-Carlo, 0.0 = 1-step TD).
+
+        Returns:
+            (T,) target values.
+        """
+        T = rewards.shape[0]
+        advantages = torch.zeros(T, device=rewards.device, dtype=rewards.dtype)
+        gae = 0.0
+        for t in reversed(range(T)):
+            delta = rewards[t] + gamma * values[t + 1] - values[t]
+            gae = delta + gamma * lam * gae
+            advantages[t] = gae
+        return values[:T] + advantages
+
+    def train_on_sequence(
+        self,
+        sequence: list[dict],
+        weight: float = 1.0,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+    ) -> Optional[dict]:
+        """Train the Teacher on a contiguous sub-sequence with n-step returns.
+
+        Unlike :meth:`_train_step` which treats each transition
+        independently, this method:
+        1. Runs the Teacher forward on each transition in order
+        2. Collects value predictions
+        3. Computes GAE targets from the reward sequence
+        4. Uses the n-step targets as the value regression target
+           (replacing the single-step reward)
+
+        This gives the value head **temporal credit assignment** —
+        credit for a reward can propagate back through up to
+        ``seq_len`` steps, drastically improving value estimation.
+
+        Args:
+            sequence: List of transition dicts (length >= 2).
+            weight: Importance-sampling weight for this sequence.
+            gamma: Discount factor for n-step returns.
+            lam: GAE lambda.
+
+        Returns:
+            Loss dict, or None if the sequence is too short.
+        """
+        if len(sequence) < 2:
+            return None
+
+        # Collate the full sequence
+        batch = self._collate_transitions(sequence)
+        if "reward" not in batch or "action" not in batch:
+            return None
+
+        T = len(sequence)
+        rewards = batch["reward"]  # (T,)
+
+        # Forward pass to get value predictions for each step
+        with self._teacher_lock:
+            forward_kwargs = {
+                k: v for k, v in batch.items()
+                if k in ("vision", "audio", "code_x", "code_edge_index",
+                         "code_batch", "sensor")
+            }
+            forward_kwargs["actions"] = batch["action"]
+            if "goal_embedding" in batch:
+                forward_kwargs["goal"] = batch["goal_embedding"]
+
+            if self.config.use_amp:
+                with torch.amp.autocast("cuda"):
+                    outputs = self.teacher(**forward_kwargs)
+            else:
+                outputs = self.teacher(**forward_kwargs)
+
+            values_pred = outputs["value"].squeeze(-1)  # (T,)
+
+            # Bootstrap: use the last value prediction as V(s_{T})
+            # (terminal bootstrap — we don't have the next observation)
+            bootstrap = values_pred[-1].detach()
+            values_extended = torch.cat(
+                [values_pred.detach(), bootstrap.unsqueeze(0)]
+            )  # (T+1,)
+
+            # Compute GAE targets
+            nstep_targets = self.compute_nstep_returns(
+                rewards, values_extended, gamma, lam,
+            )  # (T,)
+
+            # Value loss with n-step targets
+            value_loss = F.smooth_l1_loss(values_pred, nstep_targets.detach())
+
+            # Policy loss (flow denoising) — unchanged
+            denoising_loss = outputs.get(
+                "denoising_loss", torch.tensor(0.0, device=self.device),
+            )
+            policy_loss = torch.clamp(denoising_loss, max=10.0)
+
+            # Total loss (weighted)
+            loss = policy_loss + 0.5 * value_loss
+            loss = loss * weight
+
+            if loss.grad_fn is None and not loss.requires_grad:
+                return None
+
+            # Backward
+            if self.scaler is not None:
+                self.scaler.scale(
+                    loss / self.config.gradient_accumulation_steps
+                ).backward()
+            else:
+                (loss / self.config.gradient_accumulation_steps).backward()
+
+        return {"total": loss.item(), "value_loss": value_loss.item()}
 
     @property
     def step_count(self) -> int:

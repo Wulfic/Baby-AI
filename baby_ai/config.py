@@ -330,6 +330,16 @@ class TrainingConfig:
     distill_every_n_steps: int = 100
     distill_kl_weight: float = 1.0
     distill_feature_weight: float = 0.5
+    distill_min_steps: int = 5            # minimum steps per distill round
+    distill_max_steps: int = 40           # maximum steps per distill round
+    distill_plateau_patience: int = 4     # early-stop after N steps without improvement
+    distill_plateau_threshold: float = 0.01  # relative improvement threshold
+    distill_augment: bool = True          # asymmetric augmentation during distill
+    demo_priority_boost: float = 5.0      # priority multiplier for human demos
+
+    # Progressive distillation curriculum
+    distill_feature_warmup_steps: int = 2000   # steps to ramp feature_weight 0 -> full
+    distill_kl_warmup_steps: int = 1000        # steps to ramp kl_weight 0.2 -> full
 
     # Intrinsic reward
     intrinsic_weight_start: float = 0.5

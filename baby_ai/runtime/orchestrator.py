@@ -76,8 +76,12 @@ class Orchestrator:
         )
 
         # --- Learning modules ---
+        # Use the Teacher's world model for curiosity so the intrinsic
+        # signal reflects the best dynamics model, not the lagging Student.
+        # Previously this used student.predictive, causing a bootstrap
+        # problem where curiosity quality depended on distillation lag.
         self.curiosity = JEPACuriosity(
-            world_model=self.student.predictive,
+            world_model=self.teacher.predictive,
             reward_scale=1.0,
             max_reward=5.0,
         ).to(device)
@@ -113,6 +117,16 @@ class Orchestrator:
             swap_lock=self._model_swap_lock,
         )
 
+        # Enable asymmetric augmentation for distillation
+        if getattr(self.config.training, "distill_augment", True):
+            self.distill_engine.enable_augmentation()
+
+        # Configure progressive curriculum for loss weights
+        self.distill_engine.configure_curriculum(
+            kl_warmup_steps=getattr(self.config.training, "distill_kl_warmup_steps", 1000),
+            feat_warmup_steps=getattr(self.config.training, "distill_feature_warmup_steps", 2000),
+        )
+
         # --- Runtime threads ---
         self.inference_thread = InferenceThread(
             student=self.student,
@@ -142,6 +156,13 @@ class Orchestrator:
             config=self.config.training,
             device=device,
         )
+
+        # Wire event-driven coordination: learner → distill
+        self.learner_thread._distill_ready_callback = (
+            self.distill_thread.notify_distill_ready
+        )
+        # Wire teacher version bumps for soft-label cache coherence
+        self.learner_thread._distill_engine = self.distill_engine
 
         self._started = False
 
@@ -208,6 +229,19 @@ class Orchestrator:
             priority: Optional priority (higher = more important).
         """
         self.replay.add(transition, priority=priority)
+        # Signal the learner thread that new data is available so
+        # it doesn't have to wait for the next poll-timeout cycle.
+        if hasattr(self, 'learner_thread') and hasattr(self.learner_thread, 'notify_data_ready'):
+            self.learner_thread.notify_data_ready()
+
+    def mark_episode_boundary(self) -> None:
+        """Notify the replay buffer that the current episode has ended.
+
+        Must be called on every env.reset() so that
+        :meth:`PrioritizedReplayBuffer.sample_sequence` respects
+        episode boundaries and avoids cross-episode sequences.
+        """
+        self.replay.mark_episode_boundary()
 
     def save_checkpoint(self, tag: str = "latest") -> Path:
         """Save model weights, optimizer state, and replay metadata."""
@@ -333,6 +367,11 @@ class Orchestrator:
                 + ("..." if len(new_keys) > 10 else ""),
             )
         module.load_state_dict(filtered, strict=False)
+
+    @property
+    def lp_estimator(self) -> "LearningProgressEstimator":
+        """Expose learner thread's LearningProgressEstimator for priority computation."""
+        return self.learner_thread.lp_estimator
 
     def system_stats(self) -> dict:
         """Get a full system status report."""

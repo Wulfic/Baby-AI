@@ -306,3 +306,74 @@ class RewardComposer:
             "intrinsic_weight": self.intrinsic_weight,
             "monitor": self._monitor.summary(),
         }
+
+    # ── Penalty channels: values that should be subtracted, not added ──
+    _PENALTY_CHANNELS: frozenset[str] = frozenset({
+        "death_penalty", "safety_penalty", "idle_penalty",
+        "stagnation_penalty", "item_drop_penalty", "damage_taken",
+        "hotbar_spam_penalty", "height_penalty", "pitch_penalty",
+    })
+
+    # Channels that skip z-score normalization (applied raw).
+    _RAW_CHANNELS: frozenset[str] = frozenset({
+        "death_penalty", "safety_penalty", "idle_penalty",
+        "stagnation_penalty", "item_drop_penalty", "damage_taken",
+        "hotbar_spam_penalty", "height_penalty", "pitch_penalty",
+    })
+
+    def compose_dynamic(
+        self,
+        channel_values: dict[str, float],
+        weight_overrides: dict[str, float] | None = None,
+    ) -> float:
+        """Compose reward from arbitrary channels with optional weight overrides.
+
+        This is the preferred entry-point for the Minecraft loop.  It
+        accepts the raw per-channel values from the environment together
+        with the live GUI weight overrides and produces a single scalar
+        reward with full z-score normalization and intrinsic weight
+        annealing.
+
+        Args:
+            channel_values: Mapping of channel_name → raw float value.
+                           Must include 'intrinsic' for curiosity.
+            weight_overrides: Optional mapping of channel_name → weight
+                             from the GUI reward-weight sliders.  When a
+                             channel is absent from this dict the built-in
+                             default weight (1.0) is used.
+
+        Returns:
+            Composed, clamped scalar reward in [-5, 5].
+        """
+        w = weight_overrides or {}
+        reward = 0.0
+
+        for channel, raw_value in channel_values.items():
+            if raw_value == 0.0:
+                continue
+
+            # Look up weight — special-case 'intrinsic' to use annealed weight
+            if channel == "intrinsic":
+                weight = self.intrinsic_weight * w.get("intrinsic", 1.0)
+            else:
+                weight = w.get(channel, 1.0)
+
+            # Normalize (skip for penalty channels — apply raw)
+            if channel in self._RAW_CHANNELS:
+                normed = raw_value
+            else:
+                normed = self._normalize_channel(channel, raw_value)
+
+            # Penalty channels are subtracted
+            if channel in self._PENALTY_CHANNELS:
+                reward -= weight * normed
+            else:
+                reward += weight * normed
+
+            # Monitor
+            self._monitor.record(channel, raw_value)
+
+        reward = float(np.clip(reward, -5.0, 5.0))
+        self._monitor.record("total", reward)
+        self._step += 1
+        return reward

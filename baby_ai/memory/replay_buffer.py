@@ -323,6 +323,11 @@ class PrioritizedReplayBuffer:
         # In-memory metadata index
         self._meta: list[Optional[dict]] = [None] * capacity
 
+        # Episode boundary tracking — stores the episode_id for each slot.
+        # Used by sample_sequence() to avoid crossing episode boundaries.
+        self._episode_ids: list[int] = [-1] * capacity
+        self._current_episode_id: int = 0
+
         # Thread safety
         self._lock = threading.Lock()
         self._step = 0
@@ -367,12 +372,23 @@ class PrioritizedReplayBuffer:
             self._store.write(data_idx, blob)
 
             self._meta[data_idx] = metadata or {}
+            self._episode_ids[data_idx] = self._current_episode_id
             self.max_priority = max(self.max_priority, priority)
             self._step += 1
 
         # Check disk cap
         if self._store.disk_bytes > self.disk_cap_gb * 1e9:
             self._prune_oldest_chunks()
+
+    def mark_episode_boundary(self) -> None:
+        """Signal that the current episode has ended.
+
+        Call this when the environment resets.  Subsequent calls to
+        :meth:`add` will tag transitions with a new episode id so
+        :meth:`sample_sequence` never crosses episode boundaries.
+        """
+        with self._lock:
+            self._current_episode_id += 1
 
     def sample(
         self,
@@ -527,4 +543,178 @@ class PrioritizedReplayBuffer:
             "total_priority": float(self.tree.total),
             "step": self._step,
             "chunk_files": self._store._num_chunks,
+            "episode_id": self._current_episode_id,
         }
+
+    def rebuild_from_disk(self, default_priority: float = 1.0) -> int:
+        """Rebuild the SumTree and metadata from existing chunk files.
+
+        Scans every chunk file on disk, reads slot headers, and inserts
+        a uniform priority for each non-empty slot.  This makes the
+        buffer usable for offline training without first collecting new
+        data.
+
+        Call this **once** after construction when you want to re-use
+        replay data from a previous session (e.g. ``--offline`` mode).
+
+        Args:
+            default_priority: Priority assigned to every recovered
+                transition (uniform sampling is usually fine for
+                offline epochs).
+
+        Returns:
+            Number of transitions recovered.
+        """
+        recovered = 0
+        alpha_priority = max(default_priority, self.min_priority) ** self.alpha
+
+        with self._lock:
+            for data_idx in range(self.capacity):
+                blob = self._store.read(data_idx)
+                if blob is None or len(blob) == 0:
+                    continue
+
+                tree_idx = data_idx + self.tree.capacity
+                self.tree.update(tree_idx, alpha_priority)
+                self.tree.n_entries = min(
+                    self.tree.n_entries + 1, self.capacity,
+                )
+                # Track the data pointer so new add() calls don't
+                # overwrite recovered transitions prematurely.
+                self.tree.data_pointer = max(
+                    self.tree.data_pointer, data_idx + 1,
+                )
+                if self.tree.data_pointer >= self.capacity:
+                    self.tree.data_pointer = 0
+
+                self._meta[data_idx] = {}
+                # Assign sequential episode ids (conservative:
+                # every transition gets its own episode so
+                # sample_sequence still works, just short seqs).
+                self._episode_ids[data_idx] = data_idx
+                recovered += 1
+
+            # Assign contiguous episode ids in index order so that
+            # neighbouring slots are likely from the same episode.
+            # We mark a boundary every time there is a gap (empty slot)
+            # in the index sequence.
+            if recovered > 0:
+                ep_id = 0
+                prev_was_populated = False
+                for data_idx in range(self.capacity):
+                    if self._episode_ids[data_idx] >= 0 and self._meta[data_idx] is not None:
+                        if not prev_was_populated:
+                            ep_id += 1
+                        self._episode_ids[data_idx] = ep_id
+                        prev_was_populated = True
+                    else:
+                        prev_was_populated = False
+                self._current_episode_id = ep_id + 1
+
+        log.info(
+            "Rebuilt replay buffer from disk: %d transitions recovered "
+            "(%.1f MB on disk).",
+            recovered, self._store.disk_bytes / (1024 ** 2),
+        )
+        return recovered
+
+    # ── Sequence sampling ────────────────────────────────────────
+
+    def sample_sequence(
+        self,
+        batch_size: int,
+        seq_len: int = 8,
+        device: str = "cpu",
+    ) -> Tuple[List[List[Dict[str, Any]]], np.ndarray, List[int]]:
+        """Sample contiguous sub-sequences from the replay buffer.
+
+        Each returned item is a **list** of ``seq_len`` consecutive
+        transitions belonging to the **same episode**.  This enables
+        n-step return computation and temporal-credit assignment.
+
+        Sampling strategy:
+        1. Draw ``batch_size`` anchor indices via the same prioritized
+           sampling as :meth:`sample`.
+        2. For each anchor, extend forward up to ``seq_len`` steps,
+           stopping if an episode boundary is crossed or the slot is
+           empty.
+        3. Sequences shorter than 2 are discarded and re-sampled (up
+           to 3 retries).
+
+        Args:
+            batch_size: Number of sequences to return.
+            seq_len: Maximum length of each sub-sequence.
+            device: Device for decompressed tensors.
+
+        Returns:
+            sequences:  List[List[dict]] — each inner list has up to
+                        ``seq_len`` consecutive transition dicts.
+            weights:    (batch_size,) importance-sampling weights
+                        (based on the anchor transition).
+            indices:    Tree indices of the anchor transitions.
+        """
+        if self.size < batch_size:
+            raise ValueError(f"Buffer has {self.size} items, need {batch_size}")
+
+        segment = self.tree.total / batch_size
+        beta = self.beta
+
+        sequences: List[List[Dict[str, Any]]] = []
+        weights: List[float] = []
+        indices: List[int] = []
+
+        max_retries = 3
+
+        with self._lock:
+            for i in range(batch_size):
+                for _retry in range(max_retries):
+                    lo = segment * i + segment * _retry * 0.01  # slight jitter on retry
+                    hi = segment * (i + 1)
+                    s = random.uniform(lo, hi)
+                    tree_idx, priority, data_idx = self.tree.get(s)
+
+                    anchor_ep = self._episode_ids[data_idx]
+                    if anchor_ep < 0:
+                        continue  # empty slot
+
+                    seq: List[Dict[str, Any]] = []
+                    for offset in range(seq_len):
+                        idx = (data_idx + offset) % self.capacity
+                        # Stop at episode boundary
+                        if self._episode_ids[idx] != anchor_ep:
+                            break
+                        blob = self._store.read(idx)
+                        if blob is None:
+                            break
+                        trans = decompress_transition(
+                            blob, method=self.compression, device=device,
+                        )
+                        seq.append(trans)
+
+                    if len(seq) >= 2:
+                        sequences.append(seq)
+                        prob = priority / max(self.tree.total, 1e-8)
+                        w = (prob * self.size) ** (-beta)
+                        weights.append(w)
+                        indices.append(tree_idx)
+                        break
+                else:
+                    # All retries exhausted — fall back to single-step
+                    s = random.uniform(0, self.tree.total)
+                    tree_idx, priority, data_idx = self.tree.get(s)
+                    blob = self._store.read(data_idx)
+                    if blob is not None:
+                        trans = decompress_transition(
+                            blob, method=self.compression, device=device,
+                        )
+                        sequences.append([trans])
+                        prob = priority / max(self.tree.total, 1e-8)
+                        w = (prob * self.size) ** (-beta)
+                        weights.append(w)
+                        indices.append(tree_idx)
+
+        w_arr = np.array(weights, dtype=np.float32)
+        if w_arr.size > 0:
+            w_arr /= w_arr.max()
+
+        return sequences, w_arr, indices

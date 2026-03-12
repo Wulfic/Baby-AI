@@ -13,15 +13,85 @@ from __future__ import annotations
 
 import copy
 import threading
+from collections import OrderedDict
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from baby_ai.learning.augmentations import DistillAugmentor
 from baby_ai.utils.logging import get_logger
 
 log = get_logger("distillation", log_file="distill.log")
+
+
+class _TeacherLabelCache:
+    """Thread-safe LRU cache for Teacher forward-pass outputs.
+
+    Keyed by (replay_index, teacher_version).  When the Teacher updates
+    (version bump), stale entries are naturally evicted because new
+    lookups use the new version and old entries are LRU-oldest.
+
+    Motivation:
+        During a single distillation round, the same replay indices
+        are often re-sampled (especially high-priority transitions).
+        A Teacher forward pass is ~3× more expensive than a Student
+        pass, so caching saves significant GPU time.
+
+    The cache stores *detached* CPU tensors to avoid holding GPU memory.
+    """
+
+    def __init__(self, max_size: int = 5000):
+        self._max_size = max_size
+        self._cache: OrderedDict[tuple[int, int], dict[str, torch.Tensor]] = OrderedDict()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, idx: int, version: int) -> Optional[dict[str, torch.Tensor]]:
+        """Lookup cached teacher outputs.  Returns None on miss."""
+        key = (idx, version)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
+
+    def put(self, idx: int, version: int, outputs: dict[str, torch.Tensor]) -> None:
+        """Store teacher outputs (detached, on CPU)."""
+        key = (idx, version)
+        # Detach and move to CPU to avoid GPU memory leak
+        cpu_out: dict[str, torch.Tensor] = {}
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor):
+                cpu_out[k] = v.detach().cpu()
+        with self._lock:
+            self._cache[key] = cpu_out
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
+    def invalidate(self) -> None:
+        """Clear the entire cache (e.g. after Teacher weight update)."""
+        with self._lock:
+            self._cache.clear()
+
+    @property
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / max(total, 1)
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "size": len(self._cache),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": f"{self.hit_rate:.1%}",
+        }
 
 
 class DistillationEngine:
@@ -93,6 +163,70 @@ class DistillationEngine:
         self._swap_lock = swap_lock or threading.Lock()
         self._step = 0
 
+        # Teacher soft-label LRU cache.  Eliminates redundant teacher
+        # forward passes when the same high-priority replay transitions
+        # are re-sampled within a distillation round.
+        self._label_cache = _TeacherLabelCache(max_size=5000)
+        self._teacher_version = 0  # bumped when teacher weights change
+
+        # Asymmetric augmentation: Student sees augmented vision,
+        # Teacher sees clean.  Initialised lazily from config.
+        self._augmentor: DistillAugmentor | None = None
+
+        # Progressive curriculum ramp parameters — set by caller
+        # via configure_curriculum().
+        self._kl_warmup_steps: int = 1000
+        self._feat_warmup_steps: int = 2000
+        self._kl_weight_final: float = kl_weight
+        self._feat_weight_final: float = feature_weight
+
+    # ── Configuration helpers ───────────────────────────────────────────
+
+    def enable_augmentation(
+        self,
+        crop_ratio: float = 0.85,
+        jitter_strength: float = 0.15,
+        noise_std: float = 0.02,
+    ) -> None:
+        """Enable asymmetric vision augmentation for the Student."""
+        self._augmentor = DistillAugmentor(
+            crop_ratio=crop_ratio,
+            jitter_strength=jitter_strength,
+            noise_std=noise_std,
+        )
+        log.info("Distillation augmentation enabled (crop=%.2f, jitter=%.2f, noise=%.3f).",
+                 crop_ratio, jitter_strength, noise_std)
+
+    def configure_curriculum(
+        self,
+        kl_warmup_steps: int = 1000,
+        feat_warmup_steps: int = 2000,
+    ) -> None:
+        """Configure progressive loss weight warmup.
+
+        During early distillation the Student's representations are
+        random, so feature matching noise would dominate.  We ramp:
+           - kl_weight:      0.2 → full over kl_warmup_steps
+           - feature_weight:  0  → full over feat_warmup_steps
+        """
+        self._kl_warmup_steps = max(kl_warmup_steps, 1)
+        self._feat_warmup_steps = max(feat_warmup_steps, 1)
+        log.info("Distillation curriculum: kl warmup=%d steps, feat warmup=%d steps.",
+                 kl_warmup_steps, feat_warmup_steps)
+
+    @property
+    def effective_kl_weight(self) -> float:
+        """Current KL weight after curriculum warmup."""
+        frac = min(1.0, self._step / self._kl_warmup_steps)
+        # Ramp from 20% → 100% of the configured weight
+        return self._kl_weight_final * (0.2 + 0.8 * frac)
+
+    @property
+    def effective_feature_weight(self) -> float:
+        """Current feature-matching weight after curriculum warmup."""
+        frac = min(1.0, self._step / self._feat_warmup_steps)
+        return self._feat_weight_final * frac
+
     def _kl_loss(
         self,
         student_logits: torch.Tensor,
@@ -135,6 +269,7 @@ class DistillationEngine:
         self,
         batch: dict,
         device: str = "cuda",
+        replay_indices: list[int] | None = None,
     ) -> dict:
         """
         Perform one distillation step on a minibatch.
@@ -142,6 +277,9 @@ class DistillationEngine:
         Args:
             batch: Dict with input tensors (vision, audio, etc.)
                    ready to be passed to model.forward().
+            replay_indices: Optional replay buffer indices for cache lookups.
+                            When provided, cached Teacher outputs are reused
+                            for transitions that were already forward-passed.
 
         Returns:
             dict with loss components and total loss.
@@ -173,27 +311,27 @@ class DistillationEngine:
             ge = batch["goal_embedding"]
             inputs["goal"] = ge.to(device) if isinstance(ge, torch.Tensor) else ge
 
-        # Get Teacher targets (no grad)
-        # Wrap in autocast so teacher outputs match the dtype that
-        # autocast will produce for the student forward pass.
-        # Acquire teacher lock to prevent concurrent forward on the
-        # same SSM temporal core from the learner thread (state buffers
-        # are not thread-safe).
-        with self._teacher_lock:
-            with torch.no_grad():
-                if self.use_amp:
-                    with torch.amp.autocast("cuda"):
-                        teacher_out = self.teacher(**inputs)
-                else:
-                    teacher_out = self.teacher(**inputs)
+        # Get Teacher targets (no grad, clean inputs)
+        # Use soft-label cache when replay_indices are provided.
+        # For each sample in the batch, check the cache first; only run
+        # the full Teacher forward for cache-miss samples, then stitch
+        # the results together.
+        teacher_out = self._get_teacher_outputs(
+            inputs, device, replay_indices,
+        )
+
+        # ── Asymmetric augmentation: Student sees augmented vision ──
+        student_inputs = dict(inputs)
+        if self._augmentor is not None and "vision" in student_inputs:
+            student_inputs["vision"] = self._augmentor(student_inputs["vision"])
 
         # Get Student outputs
         if self.use_amp:
             with torch.amp.autocast("cuda"):
-                student_out = self._staging_student(**inputs)
+                student_out = self._staging_student(**student_inputs)
                 loss = self._compute_loss(student_out, teacher_out)
         else:
-            student_out = self._staging_student(**inputs)
+            student_out = self._staging_student(**student_inputs)
             loss = self._compute_loss(student_out, teacher_out)
 
         # Backward
@@ -241,9 +379,13 @@ class DistillationEngine:
             teacher_out["fused"],
         )
 
+        # Use curriculum-ramped weights instead of fixed values
+        kl_w = self.effective_kl_weight
+        feat_w = self.effective_feature_weight
+
         total = (
-            self.kl_weight * (action_loss + comm_kl)
-            + self.feature_weight * feat_loss
+            kl_w * (action_loss + comm_kl)
+            + feat_w * feat_loss
         )
 
         # VQ codebook index distillation (Phase E)
@@ -299,6 +441,119 @@ class DistillationEngine:
         """Sync staging Student from live (e.g., after external updates)."""
         with self._swap_lock:
             self._staging_student.load_state_dict(self.student.state_dict())
+
+    def bump_teacher_version(self) -> None:
+        """Notify the engine that Teacher weights have been updated.
+
+        Called by the learner thread after an optimizer step.
+        Increments the version counter so that stale cache entries
+        are no longer matched.
+        """
+        self._teacher_version += 1
+
+    def _get_teacher_outputs(
+        self,
+        inputs: dict,
+        device: str,
+        replay_indices: list[int] | None,
+    ) -> dict[str, torch.Tensor]:
+        """Get Teacher outputs, using the soft-label cache when possible.
+
+        For each sample in the batch:
+          - If ``replay_indices`` is provided and the sample is in cache
+            (same teacher version), reuse the cached output.
+          - Otherwise, run a Teacher forward pass and store the result.
+
+        This avoids redundant GPU work when high-priority replay
+        transitions are re-sampled across distillation steps.
+        """
+        B = None
+        for v in inputs.values():
+            if isinstance(v, torch.Tensor) and v.dim() >= 1:
+                B = v.shape[0]
+                break
+
+        # Fast path: no indices → full forward, no caching
+        if replay_indices is None or B is None:
+            return self._teacher_forward(inputs)
+
+        # Check cache for each sample
+        cached = [None] * B
+        miss_positions: list[int] = []
+        ver = self._teacher_version
+        for i, idx in enumerate(replay_indices):
+            cached[i] = self._label_cache.get(idx, ver)
+            if cached[i] is None:
+                miss_positions.append(i)
+
+        # If all cached, reconstruct and return
+        if not miss_positions:
+            return self._stitch_cached(cached, device)
+
+        # If all missed, full forward
+        if len(miss_positions) == B:
+            teacher_out = self._teacher_forward(inputs)
+            # Cache individual samples
+            for i, idx in enumerate(replay_indices):
+                sample_out = {k: v[i] for k, v in teacher_out.items()
+                              if isinstance(v, torch.Tensor) and v.dim() >= 1}
+                self._label_cache.put(idx, ver, sample_out)
+            return teacher_out
+
+        # Partial cache hit: build sub-batch for misses
+        miss_inputs = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B:
+                miss_inputs[k] = v[miss_positions]
+            else:
+                miss_inputs[k] = v
+
+        miss_out = self._teacher_forward(miss_inputs)
+
+        # Cache the miss outputs
+        for local_i, global_i in enumerate(miss_positions):
+            idx = replay_indices[global_i]
+            sample_out = {k: v[local_i] for k, v in miss_out.items()
+                          if isinstance(v, torch.Tensor) and v.dim() >= 1}
+            self._label_cache.put(idx, ver, sample_out)
+            cached[global_i] = {k: v[local_i].detach().cpu()
+                                for k, v in miss_out.items()
+                                if isinstance(v, torch.Tensor) and v.dim() >= 1}
+
+        return self._stitch_cached(cached, device)
+
+    def _teacher_forward(self, inputs: dict) -> dict[str, torch.Tensor]:
+        """Run a full Teacher forward pass (thread-safe, no grad)."""
+        with self._teacher_lock:
+            with torch.no_grad():
+                if self.use_amp:
+                    with torch.amp.autocast("cuda"):
+                        return self.teacher(**inputs)
+                else:
+                    return self.teacher(**inputs)
+
+    def _stitch_cached(
+        self,
+        cached: list[dict[str, torch.Tensor]],
+        device: str,
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct a batched output dict from per-sample cached tensors."""
+        # Use key intersection — cached hits (from LRU) and freshly-computed
+        # miss entries may carry slightly different tensor keys (e.g. 0-dim
+        # scalars filtered during caching).  Intersection avoids KeyError.
+        key_sets = [set(c.keys()) for c in cached]
+        keys = key_sets[0]
+        for ks in key_sets[1:]:
+            keys = keys & ks
+
+        out: dict[str, torch.Tensor] = {}
+        for k in keys:
+            tensors = [c[k] for c in cached]
+            try:
+                out[k] = torch.stack(tensors).to(device)
+            except RuntimeError:
+                pass  # skip keys with mismatched shapes
+        return out
 
     @property
     def step_count(self) -> int:
