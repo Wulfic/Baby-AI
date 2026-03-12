@@ -6,11 +6,11 @@ using Residual Vector Quantization, capturing multimodal action
 distributions (mining, building, exploring, combat, etc.).
 
 Architecture:
-    Encoder:  20-dim action → project to code_dim → Residual VQ → indices
-    Decoder:  codebook vectors → project back → 20-dim action
+    Encoder:  23-dim action → project to code_dim → Residual VQ → indices
+    Decoder:  codebook vectors → project back → 23-dim action
 
 The tokenizer sits *after* the policy head:
-    core_state → FlowMatchingHead → 20-dim continuous → VQ Tokenizer → codebook indices
+    core_state → FlowMatchingHead → 23-dim continuous → VQ Tokenizer → codebook indices
 
 Reference: arXiv 2403.03181 (VQ-BeT)
 """
@@ -180,15 +180,15 @@ class ActionTokenizer(nn.Module):
     """
     Full VQ-BeT action tokenizer.
 
-    Encoder: 20-dim action → project → Residual VQ → codebook indices
-    Decoder: codebook vectors → project → 20-dim action
+    Encoder: 23-dim action → project → Residual VQ → codebook indices
+    Decoder: codebook vectors → project → 23-dim action
 
     Wraps around the policy: the policy generates continuous actions,
     the tokenizer discretizes them, and the decoder maps back to
     the continuous action space expected by the ActionDecoder.
 
     Args:
-        action_dim:        Continuous action vector size (default 20).
+        action_dim:        Continuous action vector size (default 23).
         code_dim:          Internal codebook embedding dimension.
         num_codes:         Number of codebook entries per VQ level.
         num_residual:      Number of hierarchical VQ levels.
@@ -199,7 +199,7 @@ class ActionTokenizer(nn.Module):
 
     def __init__(
         self,
-        action_dim: int = 20,
+        action_dim: int = 23,
         code_dim: int = 64,
         num_codes: int = 512,
         num_residual: int = 2,

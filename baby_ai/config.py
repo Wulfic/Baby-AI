@@ -109,7 +109,7 @@ class System3Config:
 @dataclass
 class DiffusionPolicyConfig:
     """Diffusion policy hyperparameters for continuous action generation."""
-    action_continuous_dim: int = 20   # continuous action vector size
+    action_continuous_dim: int = 23   # continuous action vector size
     num_train_steps: int = 100        # diffusion timesteps during training
     num_infer_steps: int = 4          # DDIM sampling steps for inference (<200ms)
     time_embed_dim: int = 64          # sinusoidal timestep embedding dim
@@ -142,7 +142,7 @@ class JambaConfig:
 @dataclass
 class FlowMatchingConfig:
     """Flow Matching policy hyperparameters (Phase C)."""
-    action_continuous_dim: int = 20   # same as diffusion
+    action_continuous_dim: int = 23   # same as diffusion
     time_embed_dim: int = 64
     num_infer_steps: int = 2          # Euler steps for inference (Student)
     sigma_min: float = 1e-4           # minimum noise floor
@@ -199,7 +199,7 @@ class StudentConfig:
     # Jamba temporal core
     jamba: JambaConfig = field(default_factory=JambaConfig)
 
-    # Diffusion policy (20-dim continuous actions)
+    # Diffusion policy (23-dim continuous actions)
     diffusion: DiffusionPolicyConfig = field(default_factory=DiffusionPolicyConfig)
 
     # Flow Matching policy (Phase C)
@@ -353,7 +353,7 @@ class TrainingConfig:
 
 @dataclass
 class RuntimeConfig:
-    inference_target_ms: float = 200.0
+    inference_target_ms: float = 250.0
     learner_sleep_ms: float = 10.0   # yield between training steps
     distill_sleep_ms: float = 50.0
     max_ram_gb: float = 32.0

@@ -148,11 +148,11 @@ class DiffusionPolicyHead(nn.Module):
     Generates a bounded continuous action vector via DDIM deterministic
     sampling conditioned on the temporal core's hidden state.
 
-    Action vector layout (default 20-dim):
+    Action vector layout (default 23-dim):
         [0:2]   camera (yaw_delta, pitch_delta) in [-1, 1]
         [2:6]   movement (forward, back, left, right) in [0, 1]
-        [6:11]  actions (attack, use, jump, sneak, sprint) in [0, 1]
-        [11:20] hotbar (9 slots, softmax-normalised)
+        [6:14]  actions (attack, use, jump, sneak, sprint, inventory, drop, pick_block) in [0, 1]
+        [14:23] hotbar (9 slots, softmax-normalised)
 
     Uses **reward-weighted denoising** for RL training:
         loss = advantage * ||noise_pred - noise_true||²
@@ -171,7 +171,7 @@ class DiffusionPolicyHead(nn.Module):
     def __init__(
         self,
         input_dim: int = 256,
-        action_dim: int = 20,
+        action_dim: int = 23,
         hidden_dim: int = 256,
         num_train_steps: int = 100,
         num_infer_steps: int = 4,
@@ -491,7 +491,7 @@ class FlowMatchingPolicyHead(nn.Module):
     def __init__(
         self,
         input_dim: int = 256,
-        action_dim: int = 20,
+        action_dim: int = 23,
         hidden_dim: int = 256,
         num_infer_steps: int = 2,
         time_embed_dim: int = 64,

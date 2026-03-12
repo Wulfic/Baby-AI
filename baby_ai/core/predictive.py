@@ -39,7 +39,7 @@ class LatentWorldModel(nn.Module):
 
     Args:
         state_dim:     Dimension of the temporal core output (core_state).
-        action_dim:    Continuous action dimensionality (e.g. 20).
+        action_dim:    Continuous action dimensionality (e.g. 23).
         latent_dim:    Dimension of the latent world-model representation.
         hidden_dim:    MLP hidden layer size.
         stochastic_dim: Dimension of stochastic state (0 to disable).
@@ -49,7 +49,7 @@ class LatentWorldModel(nn.Module):
     def __init__(
         self,
         state_dim: int = 256,
-        action_dim: int = 20,
+        action_dim: int = 23,
         latent_dim: int = 256,
         hidden_dim: int = 256,
         stochastic_dim: int = 32,

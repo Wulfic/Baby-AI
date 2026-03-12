@@ -35,7 +35,7 @@ def batch_size():
 
 @pytest.fixture
 def action_dim():
-    return 20
+    return 23
 
 
 @pytest.fixture
@@ -193,7 +193,7 @@ class TestPhaseC_FlowMatching:
         """FlowMatchingPolicyHead.forward() with no actions returns zero loss."""
         from baby_ai.core.policy import FlowMatchingPolicyHead
         head = FlowMatchingPolicyHead(
-            input_dim=hidden_dim, action_dim=20, hidden_dim=hidden_dim,
+            input_dim=hidden_dim, action_dim=23, hidden_dim=hidden_dim,
         ).to(device)
         state = torch.randn(2, hidden_dim, device=device)
         loss, value = head(state)
@@ -204,12 +204,12 @@ class TestPhaseC_FlowMatching:
         """FlowMatchingPolicyHead.act() should produce bounded actions."""
         from baby_ai.core.policy import FlowMatchingPolicyHead
         head = FlowMatchingPolicyHead(
-            input_dim=hidden_dim, action_dim=20, hidden_dim=hidden_dim,
+            input_dim=hidden_dim, action_dim=23, hidden_dim=hidden_dim,
             num_infer_steps=2,
         ).to(device)
         state = torch.randn(4, hidden_dim, device=device)
         action, log_prob, value = head.act(state)
-        assert action.shape == (4, 20)
+        assert action.shape == (4, 23)
         # Camera dims should be in [-1, 1] (tanh)
         assert action[:, :2].min() >= -1.0
         assert action[:, :2].max() <= 1.0
@@ -520,7 +520,7 @@ class TestPhaseE_VQBeT:
         s.eval()
         out = s(
             sensor=torch.randn(2, 32, device=device),
-            actions=torch.randn(2, 20, device=device),
+            actions=torch.randn(2, 23, device=device),
         )
         assert "vq_indices" in out
         assert "vq_loss" in out
@@ -547,7 +547,7 @@ class TestCrossPhaseIntegration:
         s = StudentModel(cfg).to(device).eval()
         out = s(
             sensor=torch.randn(2, 32, device=device),
-            actions=torch.randn(2, 20, device=device),
+            actions=torch.randn(2, 23, device=device),
         )
         assert "denoising_loss" in out  # backward compat key
         assert "action" in out
@@ -582,7 +582,7 @@ class TestCrossPhaseIntegration:
         )
         s = StudentModel(cfg).to(device).eval()
         out = s.act(sensor=torch.randn(1, 32, device=device))
-        assert out["action"].shape == (1, 20)
+        assert out["action"].shape == (1, 23)
         assert out["log_prob"].shape == (1,)
         assert out["value"].shape == (1, 1)
 
@@ -590,7 +590,7 @@ class TestCrossPhaseIntegration:
         """World model action_dim should match the active policy's action_dim."""
         from baby_ai.config import StudentConfig, JambaConfig, FlowMatchingConfig
         from baby_ai.models.student import StudentModel
-        fm_cfg = FlowMatchingConfig(action_continuous_dim=20)
+        fm_cfg = FlowMatchingConfig(action_continuous_dim=23)
         cfg = StudentConfig(
             hidden_dim=64, policy_hidden=64,
             encoder=_small_encoder_config(),
@@ -599,7 +599,7 @@ class TestCrossPhaseIntegration:
             flow_matching=fm_cfg,
         )
         s = StudentModel(cfg).to(device)
-        assert s.predictive.action_dim == 20  # should match flow_matching_config
+        assert s.predictive.action_dim == 23  # should match flow_matching_config
 
     def test_rebel_with_flow_matching_end_to_end(self, device):
         """REBEL loss should work end-to-end with FlowMatchingPolicyHead."""
@@ -607,7 +607,7 @@ class TestCrossPhaseIntegration:
         from baby_ai.learning.rebel import REBELLoss
         B = 8
         hidden_dim = 64
-        action_dim = 20
+        action_dim = 23
         policy = FlowMatchingPolicyHead(
             input_dim=hidden_dim, action_dim=action_dim, hidden_dim=hidden_dim,
         ).to(device)
@@ -632,7 +632,7 @@ class TestCrossPhaseIntegration:
         """VQ tokenizer should encode flow-matching-generated actions."""
         from baby_ai.core.policy import FlowMatchingPolicyHead
         from baby_ai.core.action_tokenizer import ActionTokenizer
-        hidden_dim, action_dim = 64, 20
+        hidden_dim, action_dim = 64, 23
         policy = FlowMatchingPolicyHead(
             input_dim=hidden_dim, action_dim=action_dim, hidden_dim=hidden_dim,
         ).to(device)

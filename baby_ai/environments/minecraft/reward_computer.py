@@ -763,6 +763,7 @@ class RewardComputer:
         step_count: int,
         env: Any,
     ) -> float:
+        # ── Task-based stagnation (original) ────────────────────
         productive = (
             block_break_reward > 0
             or craft_score > 0
@@ -773,14 +774,45 @@ class RewardComputer:
             env._last_productive_step = step_count
 
         steps_since_productive = step_count - env._last_productive_step
-        stagnation_penalty = 0.0
+        task_penalty = 0.0
         if steps_since_productive > env._stagnation_timeout:
             overshoot = (
                 (steps_since_productive - env._stagnation_timeout)
                 / env._stagnation_timeout
             )
-            stagnation_penalty = min(0.15 + 0.25 * overshoot, 1.5)
-        return stagnation_penalty
+            task_penalty = min(0.15 + 0.25 * overshoot, 1.5)
+
+        # ── Spatial stagnation ──────────────────────────────────
+        # Penalise staying within a small radius even while doing
+        # repetitive break/place cycles on the same blocks.
+        spatial_penalty = 0.0
+        px, pz = getattr(env, '_player_x', None), getattr(env, '_player_z', None)
+        if px is not None and pz is not None:
+            if not env._spatial_ref_set:
+                # Initialise reference position on first position update
+                env._spatial_ref_x = px
+                env._spatial_ref_z = pz
+                env._spatial_ref_step = step_count
+                env._spatial_ref_set = True
+            else:
+                dx = px - env._spatial_ref_x
+                dz = pz - env._spatial_ref_z
+                dist = (dx * dx + dz * dz) ** 0.5
+                if dist >= env._spatial_stag_radius:
+                    # Agent moved far enough — reset reference
+                    env._spatial_ref_x = px
+                    env._spatial_ref_z = pz
+                    env._spatial_ref_step = step_count
+                else:
+                    steps_in_radius = step_count - env._spatial_ref_step
+                    if steps_in_radius > env._spatial_stag_timeout:
+                        overshoot = (
+                            (steps_in_radius - env._spatial_stag_timeout)
+                            / env._spatial_stag_timeout
+                        )
+                        spatial_penalty = min(0.10 + 0.15 * overshoot, 1.0)
+
+        return max(task_penalty, spatial_penalty)
 
     @staticmethod
     def _log_diagnostics(

@@ -197,6 +197,15 @@ class MinecraftEnv(GameEnvironment):
         self._stagnation_timeout = max(1, int(30.0 / max(self._step_delay, 0.01)))
         self._last_productive_step: int = 0
 
+        # Spatial stagnation: penalise staying within a small radius
+        # for too long, even if doing repetitive break/place cycles.
+        self._spatial_stag_timeout = max(1, int(20.0 / max(self._step_delay, 0.01)))  # ~20 s
+        self._spatial_stag_radius = 5.0     # blocks — must travel this far to reset
+        self._spatial_ref_x: float = 0.0    # reference position X
+        self._spatial_ref_z: float = 0.0    # reference position Z
+        self._spatial_ref_step: int = 0     # step when reference was last updated
+        self._spatial_ref_set: bool = False  # True after first position arrives
+
         # ── Long-break system ───────────────────────────────────
         # Some blocks (dirt w/o shovel, stone w/o pick) take up to
         # 12 s of sustained left-click.  If the agent repeatedly
@@ -345,6 +354,8 @@ class MinecraftEnv(GameEnvironment):
         self._creative_sequence.reset()
         self._is_dead = False
         self._last_productive_step = 0
+        self._spatial_ref_step = 0
+        self._spatial_ref_set = False
 
         # Reset long-break state
         self._attack_streak = 0
@@ -391,7 +402,7 @@ class MinecraftEnv(GameEnvironment):
         Execute an action and return (obs, reward, done, info).
 
         Args:
-            action_id: (20,) continuous action vector from the diffusion policy.
+            action_id: (23,) continuous action vector from the diffusion policy.
             observation_only: If True, skip AI input sending (imitation mode).
 
         1. Decode continuous vector → key/button/look specification.
@@ -434,7 +445,7 @@ class MinecraftEnv(GameEnvironment):
         action_look = decoded["look"]
         action_name_str = decoded["action_name"]
         is_attack = decoded["is_attack"]
-        is_drop = False  # not in the 20-dim layout
+        is_drop = decoded.get("is_drop", False)
         disc_action_id = decoded["approx_action_id"]
 
         # ── Observation-only mode (imitation learning) ──────────

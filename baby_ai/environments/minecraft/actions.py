@@ -402,12 +402,12 @@ def match_player_action(
     return best_id
 
 
-# ── Inverse mapping: player input → 20-dim continuous vector ────
+# ── Inverse mapping: player input → 23-dim continuous vector ────
 # Keeps the same layout as ContinuousActionDecoder:
 #   [0:2]   camera (yaw, pitch) in [-1, 1]
 #   [2:6]   movement (fwd, back, left, right) in {0, 1}
-#   [6:11]  actions (attack, use, jump, sneak, sprint) in {0, 1}
-#   [11:20] hotbar (9 slots, one-hot) in {0, 1}
+#   [6:14]  actions (attack, use, jump, sneak, sprint, inventory, drop, pick_block) in {0, 1}
+#   [14:23] hotbar (9 slots, one-hot) in {0, 1}
 
 # VK codes we care about for channel mapping
 _VK_W     = VK["W"]
@@ -417,6 +417,8 @@ _VK_D     = VK["D"]
 _VK_SPACE = VK["SPACE"]
 _VK_SHIFT = VK["LSHIFT"]
 _VK_CTRL  = VK["LCTRL"]
+_VK_E     = VK["E"]
+_VK_Q     = VK["Q"]
 _VK_SLOTS = [VK[str(i)] for i in range(1, 10)]  # 1-9
 
 # Camera scale must match action_decoder.py so [-1,1] round-trips
@@ -430,7 +432,7 @@ def player_input_to_continuous(
     dyaw: float = 0.0,
     dpitch: float = 0.0,
 ) -> torch.Tensor:
-    """Convert raw player input into a 20-dim continuous action tensor.
+    """Convert raw player input into a 23-dim continuous action tensor.
 
     This is the inverse of ``ContinuousActionDecoder.decode`` — it takes
     the same inputs that ``match_player_action`` receives and produces a
@@ -443,9 +445,9 @@ def player_input_to_continuous(
         dpitch:       degrees of pitch change (>0 = down).
 
     Returns:
-        (20,) float32 tensor with values in [-1, 1] (camera) or [0, 1].
+        (23,) float32 tensor with values in [-1, 1] (camera) or [0, 1].
     """
-    v = torch.zeros(20, dtype=torch.float32)
+    v = torch.zeros(23, dtype=torch.float32)
 
     # [0:2] camera  — clamp to [-1, 1]
     v[0] = max(-1.0, min(1.0, dyaw / _CAM_SCALE_X))
@@ -457,16 +459,19 @@ def player_input_to_continuous(
     v[4] = 1.0 if _VK_A in held_keys else 0.0
     v[5] = 1.0 if _VK_D in held_keys else 0.0
 
-    # [6:11] actions
+    # [6:14] actions
     v[6]  = 1.0 if "left" in held_buttons else 0.0    # attack
     v[7]  = 1.0 if "right" in held_buttons else 0.0   # use
     v[8]  = 1.0 if _VK_SPACE in held_keys else 0.0    # jump
     v[9]  = 1.0 if _VK_SHIFT in held_keys else 0.0    # sneak
     v[10] = 1.0 if _VK_CTRL in held_keys else 0.0     # sprint
+    v[11] = 1.0 if _VK_E in held_keys else 0.0        # inventory
+    v[12] = 1.0 if _VK_Q in held_keys else 0.0        # drop
+    v[13] = 1.0 if "middle" in held_buttons else 0.0   # pick block
 
-    # [11:20] hotbar — one-hot for the active slot key (if any)
+    # [14:23] hotbar — one-hot for the active slot key (if any)
     for i, vk in enumerate(_VK_SLOTS):
         if vk in held_keys:
-            v[11 + i] = 1.0
+            v[14 + i] = 1.0
 
     return v

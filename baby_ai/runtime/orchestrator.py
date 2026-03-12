@@ -250,7 +250,9 @@ class Orchestrator:
         return path
 
     def load_checkpoint(self, path: Path | str) -> None:
-        """Load a checkpoint.  Tolerates corrupt / truncated files."""
+        """Load a checkpoint.  Tolerates corrupt / truncated files
+        and shape mismatches from architecture changes (e.g. action
+        dim expansion)."""
         path = Path(path)
         if not path.exists():
             log.warning("Checkpoint not found: %s — starting fresh.", path)
@@ -273,12 +275,12 @@ class Orchestrator:
                 pass
             return
 
-        self.student.load_state_dict(ckpt["student_state_dict"])
-        self.teacher.load_state_dict(ckpt["teacher_state_dict"])
+        self._safe_load_state_dict(self.student, ckpt["student_state_dict"], "student")
+        self._safe_load_state_dict(self.teacher, ckpt["teacher_state_dict"], "teacher")
         # Load curiosity module (supports old "icm_state_dict" key)
         curiosity_sd = ckpt.get("curiosity_state_dict") or ckpt.get("icm_state_dict")
         if curiosity_sd is not None:
-            self.curiosity.load_state_dict(curiosity_sd)
+            self._safe_load_state_dict(self.curiosity, curiosity_sd, "curiosity")
         # Load System 3 module weights (GoalProposer, SubgoalPlanner)
         s3_sd = ckpt.get("system3_state_dict")
         if s3_sd:
@@ -288,6 +290,49 @@ class Orchestrator:
         if "reward_composer_step" in ckpt:
             self.reward_composer._step = ckpt["reward_composer_step"]
         log.info("Checkpoint loaded from: %s", path)
+
+    @staticmethod
+    def _safe_load_state_dict(
+        module: torch.nn.Module,
+        state_dict: dict,
+        label: str,
+    ) -> None:
+        """Load a state dict, skipping tensors whose shapes don't match.
+
+        This handles architecture changes (e.g. action_dim 20→23)
+        gracefully: matching weights are loaded, mismatched layers
+        keep their fresh random initialization so training can
+        adapt them quickly.
+        """
+        model_sd = module.state_dict()
+        filtered = {}
+        skipped = []
+        for key, val in state_dict.items():
+            if key in model_sd:
+                if val.shape == model_sd[key].shape:
+                    filtered[key] = val
+                else:
+                    skipped.append(
+                        f"  {key}: checkpoint {tuple(val.shape)} "
+                        f"→ model {tuple(model_sd[key].shape)}"
+                    )
+            else:
+                skipped.append(f"  {key}: not in current model (removed)")
+        missing = set(model_sd.keys()) - set(filtered.keys())
+        if skipped:
+            log.warning(
+                "[%s] Skipped %d checkpoint tensors (shape mismatch):\n%s",
+                label, len(skipped), "\n".join(skipped),
+            )
+        if missing - set(state_dict.keys()):
+            new_keys = missing - set(state_dict.keys())
+            log.info(
+                "[%s] %d new parameters initialized randomly: %s",
+                label, len(new_keys),
+                ", ".join(sorted(new_keys)[:10])
+                + ("..." if len(new_keys) > 10 else ""),
+            )
+        module.load_state_dict(filtered, strict=False)
 
     def system_stats(self) -> dict:
         """Get a full system status report."""

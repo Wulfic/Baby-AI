@@ -1,14 +1,14 @@
 """
 Continuous action decoder for Minecraft.
 
-Maps the 20-dim continuous action vector from the DiffusionPolicyHead
+Maps the 23-dim continuous action vector from the DiffusionPolicyHead
 to concrete key presses, mouse buttons, and camera look deltas.
 
 Action vector layout (from DiffusionPolicyHead):
     [0:2]   camera (yaw_delta, pitch_delta) in [-1, 1]
     [2:6]   movement (forward, back, left, right) in [0, 1]
-    [6:11]  actions (attack, use, jump, sneak, sprint) in [0, 1]
-    [11:20] hotbar (9 slots, softmax-normalised) in [0, 1]
+    [6:14]  actions (attack, use, jump, sneak, sprint, inventory, drop, pick_block) in [0, 1]
+    [14:23] hotbar (9 slots, softmax-normalised) in [0, 1]
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ CAMERA_DEADZONE = 0.05  # ignore tiny camera signals
 
 class ContinuousActionDecoder:
     """
-    Decodes a 20-dim continuous action vector into Minecraft inputs.
+    Decodes a 23-dim continuous action vector into Minecraft inputs.
 
     Provides:
       - Keys, buttons, and look deltas for the InputController
@@ -52,7 +52,7 @@ class ContinuousActionDecoder:
         Decode a continuous action vector into Minecraft inputs.
 
         Args:
-            action: (20,) or (1, 20) continuous action tensor.
+            action: (23,) or (1, 23) continuous action tensor.
 
         Returns:
             dict with:
@@ -88,27 +88,38 @@ class ContinuousActionDecoder:
         jump = a[8].item()        # jump
         sneak = a[9].item()       # sneak
         sprint = a[10].item()     # sprint
+        inventory = a[11].item()  # inventory (E key)
+        drop = a[12].item()       # drop (Q key)
+        pick_block = a[13].item() # pick block (middle click)
 
-        hotbar = a[11:20]         # 9 hotbar slots
+        hotbar = a[14:23]         # 9 hotbar slots
 
         # ── Keys ────────────────────────────────────────────
         keys: Set[int] = set()
         t = self.threshold
 
-        if fwd > t:
-            keys.add(VK["W"])
-        if back > t:
-            keys.add(VK["S"])
-        if left > t:
-            keys.add(VK["A"])
-        if right > t:
-            keys.add(VK["D"])
+        # Mutual exclusivity: if both axes fire, only the stronger one wins.
+        # This prevents contradictory fwd+back or left+right presses.
+        if fwd > t or back > t:
+            if fwd >= back:
+                keys.add(VK["W"])
+            else:
+                keys.add(VK["S"])
+        if left > t or right > t:
+            if left >= right:
+                keys.add(VK["A"])
+            else:
+                keys.add(VK["D"])
         if jump > t:
             keys.add(VK["SPACE"])
         if sneak > t:
             keys.add(VK["LSHIFT"])
         if sprint > t:
             keys.add(VK["LCTRL"])
+        if inventory > t:
+            keys.add(VK["E"])
+        if drop > t:
+            keys.add(VK["Q"])
 
         # ── Buttons ─────────────────────────────────────────
         buttons: Set[str] = set()
@@ -116,6 +127,8 @@ class ContinuousActionDecoder:
             buttons.add("left")
         if use > t:
             buttons.add("right")
+        if pick_block > t:
+            buttons.add("middle")
 
         # ── Look ────────────────────────────────────────────
         dx = int(cam_yaw * CAMERA_SCALE_X) if abs(cam_yaw) > CAMERA_DEADZONE else 0
@@ -140,11 +153,20 @@ class ContinuousActionDecoder:
         is_jump = jump > t
         is_sneak = sneak > t
         is_sprint = sprint > t
+        is_inventory = inventory > t
+        is_drop = drop > t
+        is_pick_block = pick_block > t
 
         # ── Human-readable name ─────────────────────────────
+        # Pass the resolved (mutually exclusive) movement flags
+        eff_fwd = (fwd > t or back > t) and fwd >= back
+        eff_back = (fwd > t or back > t) and back > fwd
+        eff_left = (left > t or right > t) and left >= right
+        eff_right = (left > t or right > t) and right > left
         name = self._make_name(
-            fwd > t, back > t, left > t, right > t,
+            eff_fwd, eff_back, eff_left, eff_right,
             is_attack, is_use, is_jump, is_sneak, is_sprint,
+            is_inventory, is_drop, is_pick_block,
             is_look, hotbar_slot, cam_yaw, cam_pitch,
         )
 
@@ -164,6 +186,9 @@ class ContinuousActionDecoder:
             "is_jump": is_jump,
             "is_sneak": is_sneak,
             "is_sprint": is_sprint,
+            "is_inventory": is_inventory,
+            "is_drop": is_drop,
+            "is_pick_block": is_pick_block,
             "hotbar_slot": hotbar_slot,
             "action_name": name,
             "approx_action_id": approx_id,
@@ -172,6 +197,7 @@ class ContinuousActionDecoder:
     def _make_name(
         self, fwd, back, left, right,
         attack, use, jump, sneak, sprint,
+        inventory, drop, pick_block,
         look, hotbar_slot, cam_yaw, cam_pitch,
     ) -> str:
         """Build a human-readable name for logging."""
@@ -194,6 +220,12 @@ class ContinuousActionDecoder:
             parts.append("attack")
         if use:
             parts.append("use")
+        if inventory:
+            parts.append("inv")
+        if drop:
+            parts.append("drop")
+        if pick_block:
+            parts.append("pick")
         if look:
             dx_name = "R" if cam_yaw > 0 else "L"
             dy_name = "D" if cam_pitch > 0 else "U"

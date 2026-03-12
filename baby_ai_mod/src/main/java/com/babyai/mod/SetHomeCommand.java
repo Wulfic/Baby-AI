@@ -6,6 +6,7 @@ import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.BlockPos;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,6 +57,17 @@ public class SetHomeCommand {
 
         // Save in the server-side HomeManager.
         HomeManager.INSTANCE.setHome(player.getUuid(), x, y, z);
+
+        // Update Minecraft's actual respawn point so the player
+        // respawns here natively (like sleeping in a bed).
+        BlockPos spawnPos = BlockPos.ofFloored(x, y, z);
+        player.setSpawnPoint(
+            player.getWorld().getRegistryKey(), // current dimension
+            spawnPos,
+            0.0f,   // spawn angle
+            true,    // forced — bypass bed/anchor checks
+            true     // send update to client
+        );
 
         // Broadcast to Python via the TCP event bridge.
         EventBridge.INSTANCE.onHomeSet(x, y, z, tick);
