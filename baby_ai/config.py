@@ -323,8 +323,8 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 2
 
     # Replay
-    replay_capacity: int = 50_000
-    replay_disk_cap_gb: float = 4.0  # compressed on-disk cap
+    replay_capacity: int = 500_000
+    replay_disk_cap_gb: float = 300.0  # compressed on-disk cap
 
     # Distillation
     distill_every_n_steps: int = 100
