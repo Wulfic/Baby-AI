@@ -91,10 +91,10 @@ class DistillThread:
 
     def _loop(self) -> None:
         while self._running:
-            # Pause distillation while record-only mode is active.
+            # Pause distillation while record-only or disable-learning mode is active.
             try:
-                from baby_ai.ui.control_panel import get_record_only
-                if get_record_only():
+                from baby_ai.ui.control_panel import get_record_only, get_learning_disabled
+                if get_record_only() or get_learning_disabled():
                     self._stop_event.wait(timeout=1.0)
                     continue
             except ImportError:

@@ -440,7 +440,14 @@ def run_offline_training(
     # When running as a multi-GPU worker, save with a per-GPU tag
     # so the parent process can find and average all of them.
     final_tag = f"offline_final_gpu{gpu_rank}" if gpu_rank is not None else "offline_final"
-    orchestrator.save_checkpoint(final_tag)
+    final_path = orchestrator.save_checkpoint(final_tag)
+
+    # For single-GPU runs, also copy as 'latest' for easy resumption
+    if gpu_rank is None:
+        import shutil
+        latest_path = final_path.parent / "checkpoint_latest.pt"
+        shutil.copy2(final_path, latest_path)
+
     _total_wall = time.perf_counter() - _global_t0
     log.info("=" * 60)
     if gpu_rank is not None:

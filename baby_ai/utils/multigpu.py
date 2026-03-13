@@ -62,7 +62,7 @@ def detect_gpus() -> list[dict]:
         gpus.append({
             "index": i,
             "name": props.name,
-            "vram_mb": props.total_mem // (1024 * 1024),
+            "vram_mb": props.total_memory // (1024 * 1024),
         })
     return gpus
 
@@ -225,16 +225,14 @@ def run_multi_gpu_offline(
     """Orchestrate multi-GPU offline training.
 
     1. Validate that all GPUs are eligible (same model + VRAM).
-    2. Split the requested epochs linearly across GPUs.
-       E.g. 10 epochs / 2 GPUs → each GPU trains 5 epochs.
-    3. Spawn one ``main.py --offline`` subprocess per GPU, each
+    2. Spawn one ``main.py --offline`` subprocess per GPU, each
        pinned to a single device via ``CUDA_VISIBLE_DEVICES``.
-       All workers start from the **same checkpoint** — the temporal
-       data is sequential so each GPU sees every epoch it's assigned.
-    4. Wait for all workers to finish.
-    5. Average the per-GPU checkpoints into a final merged file.
+       All workers start from the **same checkpoint** and train
+       ALL epochs independently on the full temporal replay data.
+    3. Wait for all workers to finish (logs streamed concurrently).
+    4. Average the per-GPU checkpoints into a final merged file.
     """
-    import math
+    import threading as _thr
     from baby_ai.config import CHECKPOINT_DIR
     from baby_ai.utils.logging import get_logger
     mgpu_log = get_logger("multigpu", log_file="multigpu.log")
@@ -244,32 +242,17 @@ def run_multi_gpu_offline(
     eligible = validate_multi_gpu(gpus)
     n_gpus = len(eligible)
 
-    # ── Split epochs across GPUs ───────────────────────────────
-    # Divide evenly; last GPU absorbs any remainder.
-    base_per_gpu = epochs // n_gpus
-    remainder = epochs % n_gpus
-    epoch_assignments: list[int] = []
-    for rank in range(n_gpus):
-        # Give one extra epoch to the first `remainder` GPUs
-        epoch_assignments.append(base_per_gpu + (1 if rank < remainder else 0))
-
     mgpu_log.info("=" * 60)
-    mgpu_log.info("MULTI-GPU OFFLINE TRAINING  (%d GPUs, %d total epochs)", n_gpus, epochs)
+    mgpu_log.info("MULTI-GPU OFFLINE TRAINING  (%d GPUs, %d epochs each)", n_gpus, epochs)
     mgpu_log.info("=" * 60)
-    for rank, g in enumerate(eligible):
-        mgpu_log.info("  GPU %d: %s  (%d MiB) — %d epochs",
-                       g["index"], g["name"], g["vram_mb"], epoch_assignments[rank])
+    for g in eligible:
+        mgpu_log.info("  GPU %d: %s  (%d MiB)",
+                       g["index"], g["name"], g["vram_mb"])
 
     # ── Step 2: Spawn workers ──────────────────────────────────
-    # Each worker is a subprocess that runs:
-    #   python main.py --offline --epochs E --gpu-rank K --gpu-total T
-    #
-    # The --gpu-rank flag tells run_offline_training() to save its
-    # final checkpoint as "offline_final_gpuK" instead of
-    # "offline_final".  CUDA_VISIBLE_DEVICES pins each worker to
-    # exactly one physical GPU (the worker always sees device 0).
-    # All workers start from the same checkpoint so they begin from
-    # identical model weights.
+    # Each worker runs ALL epochs independently from the same
+    # starting checkpoint.  CUDA_VISIBLE_DEVICES pins each worker
+    # to exactly one physical GPU (the worker always sees device 0).
     python_exe = sys.executable
     script = str(Path(__file__).resolve().parent.parent.parent / "main.py")
 
@@ -286,7 +269,7 @@ def run_multi_gpu_offline(
         cmd = [
             python_exe, "-X", "utf8", script,
             "--offline",
-            "--epochs", str(epoch_assignments[rank]),
+            "--epochs", str(epochs),
             "--gpu-rank", str(rank),
             "--gpu-total", str(n_gpus),
         ]
@@ -298,8 +281,8 @@ def run_multi_gpu_offline(
         env = base_env.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu["index"])
 
-        mgpu_log.info("Spawning worker rank=%d on GPU %d (CUDA_VISIBLE_DEVICES=%s, epochs=%d)",
-                       rank, gpu["index"], gpu["index"], epoch_assignments[rank])
+        mgpu_log.info("Spawning worker rank=%d on GPU %d (CUDA_VISIBLE_DEVICES=%s)",
+                       rank, gpu["index"], gpu["index"])
         mgpu_log.info("  cmd: %s", " ".join(cmd))
 
         proc = subprocess.Popen(
@@ -314,18 +297,31 @@ def run_multi_gpu_offline(
         workers.append(proc)
 
     # ── Step 3: Wait for all workers ───────────────────────────
+    # Stream stdout from ALL workers concurrently using reader
+    # threads so both GPUs' progress is interleaved in real-time.
     mgpu_log.info("Waiting for %d workers to complete...", n_gpus)
 
-    failures: list[int] = []
-    for rank, proc in enumerate(workers):
-        # Stream output to log (combine stdout+stderr)
+    def _stream_worker(rank: int, proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.rstrip()
             if line:
                 mgpu_log.info("[GPU %d] %s", rank, line)
-        proc.wait()
 
+    readers: list[_thr.Thread] = []
+    for rank, proc in enumerate(workers):
+        t = _thr.Thread(target=_stream_worker, args=(rank, proc), daemon=True)
+        t.start()
+        readers.append(t)
+
+    # Wait for all readers to finish (they exit when stdout closes)
+    for t in readers:
+        t.join()
+
+    # Collect exit codes
+    failures: list[int] = []
+    for rank, proc in enumerate(workers):
+        proc.wait()
         if proc.returncode != 0:
             mgpu_log.error("Worker rank=%d exited with code %d", rank, proc.returncode)
             failures.append(rank)
@@ -361,11 +357,19 @@ def run_multi_gpu_offline(
     latest_path = CHECKPOINT_DIR / "checkpoint_latest.pt"
     shutil.copy2(merged_path, latest_path)
 
+    # Clean up per-GPU intermediates so they can't be confused
+    # with the real merged checkpoint.
+    for p in ckpt_paths:
+        try:
+            p.unlink()
+            mgpu_log.info("  Removed intermediate: %s", p.name)
+        except OSError:
+            pass
+
     mgpu_log.info("=" * 60)
     mgpu_log.info("MULTI-GPU TRAINING COMPLETE")
     mgpu_log.info("  Workers          : %d", n_gpus)
-    mgpu_log.info("  Total epochs     : %d", epochs)
-    mgpu_log.info("  Epochs per GPU   : %s", epoch_assignments)
+    mgpu_log.info("  Epochs per GPU   : %d", epochs)
     mgpu_log.info("  Merged ckpt      : %s", merged_path)
     mgpu_log.info("  Latest ckpt      : %s", latest_path)
     mgpu_log.info("=" * 60)

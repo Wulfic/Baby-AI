@@ -106,6 +106,26 @@ def set_record_only(value: bool) -> None:
         _record_only = value
 
 
+# ── Thread-safe learning-disabled toggle ─────────────────────
+# When active: AI inference continues normally but the learner
+# and distill threads pause — no gradient updates at all.
+_learning_disabled: bool = False
+_learning_disabled_lock = threading.Lock()
+
+
+def get_learning_disabled() -> bool:
+    """Return whether learning is disabled (thread-safe)."""
+    with _learning_disabled_lock:
+        return _learning_disabled
+
+
+def set_learning_disabled(value: bool) -> None:
+    """Enable or disable learning from the GUI (thread-safe)."""
+    global _learning_disabled
+    with _learning_disabled_lock:
+        _learning_disabled = value
+
+
 # Theme constants and DPI helper are now imported from baby_ai.ui.theme.
 
 
@@ -220,6 +240,9 @@ class AIControlPanel:
 
         # tk variable for record-only mode toggle
         self._record_only_var: Optional[tk.BooleanVar] = None
+
+        # tk variable for disable-learning toggle
+        self._learning_disabled_var: Optional[tk.BooleanVar] = None
 
         # Home waypoint coordinate labels (updated when home changes)
         self._home_x_label: Optional[tk.Label] = None
@@ -696,6 +719,33 @@ class AIControlPanel:
         )
         rec_cb.pack(fill=tk.X, padx=(int(12 * s), 0))
 
+        # ── Disable Learning toggle ────────────────────────────
+        saved_ld = self._store.get("learning_disabled")
+        ld_default = bool(saved_ld) if saved_ld is not None else False
+        set_learning_disabled(ld_default)
+
+        self._learning_disabled_var = tk.BooleanVar(value=ld_default)
+
+        def _on_learning_disabled_toggle() -> None:
+            enabled = self._learning_disabled_var.get()
+            set_learning_disabled(enabled)
+            self._store.set("learning_disabled", enabled)
+
+        ld_cb = tk.Checkbutton(
+            imit_frame,
+            text="Disable Learning (AI runs, no weight updates)",
+            variable=self._learning_disabled_var,
+            command=_on_learning_disabled_toggle,
+            bg=_BG_GROUP, fg=_FG,
+            selectcolor=_BG_FRAME,
+            activebackground=_BG_GROUP,
+            activeforeground=_ACCENT,
+            font=("Segoe UI", int(9 * s)),
+            anchor="w",
+            bd=0, highlightthickness=0,
+        )
+        ld_cb.pack(fill=tk.X, padx=(int(12 * s), 0))
+
         # ── Learning Rate slider ───────────────────────────────
         lr_frame = tk.Frame(parent, bg=_BG_GROUP,
                             padx=int(6 * s), pady=int(4 * s))
@@ -940,6 +990,7 @@ class AIControlPanel:
             self._lr_var = None
             self._lr_label = None
             self._imit_var = None
+            self._learning_disabled_var = None
             self._home_x_entry = None
             self._home_y_entry = None
             self._home_z_entry = None
