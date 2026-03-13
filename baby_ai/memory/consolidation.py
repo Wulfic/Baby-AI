@@ -94,10 +94,15 @@ class EWC:
 
                 outputs = model(**forward_kwargs)
 
-                # Squared-norm of continuous action output -> scalar for Fisher
-                action = outputs["action"]
-                loss = action.pow(2).sum(dim=-1).mean()
-                batch_size = action.size(0)
+                # Use core_state for Fisher — it flows through ALL model
+                # layers (encoders → fusion → temporal core) so its
+                # gradients capture parameter importance across the full
+                # network.  The "action" key is produced under
+                # torch.no_grad() in forward(), so it has no grad_fn and
+                # cannot be used here.
+                core = outputs["core_state"]
+                loss = core.pow(2).sum(dim=-1).mean()
+                batch_size = core.size(0)
 
                 # Use autograd.grad to avoid touching .grad attributes.
                 grads = torch.autograd.grad(

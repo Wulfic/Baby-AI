@@ -204,8 +204,8 @@ class DistillThread:
             if isinstance(values[0], torch.Tensor):
                 try:
                     batch[key] = torch.stack(values).to(self.device)
-                except RuntimeError:
-                    pass
+                except RuntimeError as e:
+                    log.debug("Dropped key '%s' in collate (shape mismatch): %s", key, e)
             elif isinstance(values[0], (int, float)):
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)
 

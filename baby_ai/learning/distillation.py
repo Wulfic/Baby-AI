@@ -332,6 +332,16 @@ class DistillationEngine:
             ge = batch["goal_embedding"]
             inputs["goal"] = ge.to(device) if isinstance(ge, torch.Tensor) else ge
 
+        # Guard: at least one modality must survive collation.
+        # When torch.stack fails for all modality keys (shape mismatch
+        # across replay transitions), the batch has no encodable inputs
+        # and the fusion layer would raise ValueError.
+        _modality_keys = {"vision", "audio", "sensor", "code_x"}
+        if not (_modality_keys & inputs.keys()):
+            log.warning("Skipping distill step: batch has no modality inputs "
+                        "(keys present: %s)", list(batch.keys()))
+            return {"total": 0.0, "skipped": True}
+
         # Get Teacher targets (no grad, clean inputs)
         # Use soft-label cache when replay_indices are provided.
         # For each sample in the batch, check the cache first; only run
