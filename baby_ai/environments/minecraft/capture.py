@@ -87,7 +87,9 @@ class ScreenCapture:
         self._region = {"left": sx, "top": sy, "width": sw, "height": sh}
         shot = sct.grab(self._region)
 
-        # mss returns BGRA; drop alpha and convert to contiguous array
+        # mss returns BGRA (Blue, Green, Red, Alpha); drop alpha channel.
+        # We keep BGR order here because cv2 (used downstream) expects BGR.
+        # RGB conversion happens only when building the model tensor.
         frame = np.array(shot, dtype=np.uint8)[..., :3]  # (H, W, 3) BGR
 
         # Resize to model resolution
@@ -103,6 +105,7 @@ class ScreenCapture:
         is enabled.
         """
         bgr = self.grab_raw()
+        # Convert BGR (OpenCV/mss convention) → RGB (PyTorch convention)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         # (H, W, 3) uint8 → (3, H, W) float32
@@ -153,7 +156,8 @@ class ScreenCapture:
         self._region = {"left": sx, "top": sy, "width": sw, "height": sh}
         shot = sct.grab(self._region)
 
-        # Native-resolution BGR (no resize) — used by screen analysers
+        # Native-resolution BGR (no resize) — screen analysers need full
+        # pixel detail for hotbar diff and death-screen colour analysis.
         native_bgr = np.array(shot, dtype=np.uint8)[..., :3]
 
         # Downscale to model resolution for the vision encoder

@@ -80,8 +80,26 @@ class MinecraftEnv(GameEnvironment):
     Captures the game window, preprocesses frames into model-ready
     tensors, and sends actions as keyboard/mouse events via PostMessage.
 
-    **No external mods or APIs required** — works with any Minecraft
-    version (Java or Bedrock) running in windowed mode.
+    **No external mods or APIs required** for basic operation — works
+    with any Minecraft version (Java or Bedrock) running in windowed mode.
+    The optional Fabric mod bridge (TCP on port 5556) provides authoritative
+    game events (block breaks, crafting, deaths, position) for richer
+    reward signals and the sensor tensor.
+
+    Step lifecycle (per call to :meth:`step`)::
+
+        1. Decode continuous action vector → keys / buttons / look delta
+        2. Apply pitch clamping to prevent sky/feet staring
+        3. Send input to the Minecraft window (PostMessage)
+        4. Smooth camera interpolation (multiple sub-moves over step budget)
+        5. Pace to maintain target step delay
+        6. Capture frame + drain mod events + pack sensor tensor
+        7. Compute multi-channel extrinsic reward (via RewardComputer)
+        8. Return (obs, reward, done, info)
+
+    In **observation_only** mode (imitation learning), steps 2-4 are
+    skipped and action-based reward channels are frozen, but frame
+    capture and mod-event rewards still fire.
 
     Args:
         window_title: Substring to match in window title (case-insensitive).
@@ -402,7 +420,8 @@ class MinecraftEnv(GameEnvironment):
         Execute an action and return (obs, reward, done, info).
 
         Args:
-            action_id: (23,) continuous action vector from the diffusion policy.
+            action_id: (23,) continuous action vector from the policy head
+                       (DiffusionPolicyHead or FlowMatchingPolicyHead).
             observation_only: If True, skip AI input sending (imitation mode).
 
         1. Decode continuous vector → key/button/look specification.

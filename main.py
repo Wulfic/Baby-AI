@@ -20,7 +20,11 @@ import atexit
 import ctypes
 from pathlib import Path
 
-# --- Fallback to always release mouse cursor on crash ---
+# --- Emergency cursor release ---
+# Windows ClipCursor() confines the mouse to a rectangle.  If the process
+# crashes while the cursor is clipped (e.g. during Minecraft input mode),
+# the user's mouse would be stuck.  This atexit handler guarantees the
+# cursor is always freed, even on unhandled exceptions.
 def _emergency_release_cursor():
     try:
         ctypes.windll.user32.ClipCursor(None)
@@ -68,7 +72,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def profile_models(config: BabyAIConfig) -> None:
-    """Profile Student and Teacher models."""
+    """Profile Student and Teacher models.
+
+    Builds both models on the configured device, reports parameter counts
+    and memory usage, then runs 20 dummy inference passes to measure
+    average latency.  Useful for verifying the model fits in GPU memory
+    and meets the <200 ms inference target.
+    """
     from baby_ai.models.student import StudentModel
     from baby_ai.models.teacher import TeacherModel
     from baby_ai.preprocessing.video import VideoPreprocessor
@@ -133,7 +143,13 @@ def profile_models(config: BabyAIConfig) -> None:
 
 
 def run_demo(config: BabyAIConfig) -> None:
-    """Run a quick demo with dummy observations."""
+    """Run a quick demo with dummy observations.
+
+    Creates an Orchestrator and feeds 50 steps of random noise through
+    the full pipeline (encode → fuse → temporal → policy → replay).
+    Loads the latest checkpoint if available, so this also serves as
+    a quick smoke-test that a saved model loads and runs.
+    """
     log.info("=" * 60)
     log.info("BABY-AI DEMO MODE")
     log.info("=" * 60)
@@ -716,7 +732,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 # Lightweight recording path — no GPU inference at all.
                 # Use a zero placeholder for fused; the learner's
                 # forward pass will recompute from raw obs anyway.
-                _fused_dim = getattr(config.student, "hidden_dim", 512)
+                # Use fused_dim (encoder output) not hidden_dim (Jamba core);
+                # they happen to be equal for Student (512) but are semantically
+                # different — fused is what gets stored in replay transitions.
+                _fused_dim = config.student.encoder.fused_dim
                 fused = torch.zeros(_fused_dim)
 
                 # Store transition from the PREVIOUS tick
@@ -788,8 +807,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
             # ── Model inference ──────────────────────────────────
             result = orchestrator.step(obs)
-            # Action is now a 20-dim continuous tensor from DiffusionPolicy
-            action_tensor = result["action"]   # (20,) continuous
+            # Action is a 23-dim continuous tensor from the policy head
+            action_tensor = result["action"]   # (23,) continuous
             fused = result.get("fused")
 
             # ── Store transition (using PREVIOUS step's data) ───
@@ -804,7 +823,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     if _cur_next.dim() == 1:
                         _cur_next = _cur_next.unsqueeze(0)
                     if _cur_act.dim() == 1:
-                        _cur_act = _cur_act.unsqueeze(0)  # (20,) → (1, 20)
+                        _cur_act = _cur_act.unsqueeze(0)  # (23,) → (1, 23)
                     # Project Student fused (512) → Teacher state dim (1024)
                     # so it matches the Teacher's LatentWorldModel input.
                     if orchestrator.curiosity_proj is not None:
@@ -1013,7 +1032,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if _imitation_active and env._guard is not None:
                 held_keys, held_buttons = env._guard.snapshot_player_input()
                 dyaw, dpitch = env.get_look_delta()
-                # Build a 20-dim continuous vector from the player's
+                # Build a 23-dim continuous vector from the player's
                 # physical input so curiosity / replay stay consistent.
                 prev_action = player_input_to_continuous(
                     held_keys, held_buttons, dyaw, dpitch,

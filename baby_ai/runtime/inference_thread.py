@@ -45,7 +45,8 @@ class InferenceThread:
     as they arrive via a queue. Results are returned through events.
 
     Features:
-    - Non-blocking: callers submit requests and wait on events
+    - Event-driven: callers submit requests via a queue and block-
+      wait on per-request ``threading.Event`` objects
     - Latency tracking: measures per-step inference time
     - Hidden state management: maintains Jamba hidden per "session"
     - Atomic model swap: accepts new weights without stopping

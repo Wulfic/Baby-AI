@@ -24,6 +24,13 @@ Detected signals
   forward view (distinct from mining crack animation).
 - **Crafting event** : hotbar change that occurs while a crafting
   UI is open or immediately after it closes.
+
+NOTE: The pixel-based tracker classes (HotbarTracker, BlockBreakTracker,
+CraftingTracker) in this module are **legacy code** from before the
+Fabric mod bridge was implemented.  They are not instantiated anywhere
+in the codebase — all block-break, item-pickup, and crafting detection
+now happens via mod events in reward_computer.py.  Only ``detect_death``
+is still used (as a fallback in env.py).
 """
 
 from __future__ import annotations
@@ -66,8 +73,10 @@ def detect_death(frame: np.ndarray) -> bool:
     r = frame[:, :, 2].astype(np.float32)
 
     # ── Check 1: Global red-tinted overlay ──────────────────────
-    # Relaxed vs. the old check — modern MC death screens are darker.
-    # Pixel qualifies if red channel clearly dominates green + blue.
+    # MC 1.21+ death screens are darker than older versions, so
+    # thresholds are tuned conservatively (R > 40 instead of 80,
+    # 20% pixel coverage instead of 35%).  The AND conditions
+    # (G < 100, B < 100) avoid false positives from sunsets/lava.
     red_mask = (
         (r > 40)            # not too dark (floor lowered from 80)
         & (r > g * 1.6)     # red strongly exceeds green

@@ -83,7 +83,7 @@ class CodePreprocessor:
         vec = np.zeros(self.node_feature_dim, dtype=np.float32)
         if idx < self.node_feature_dim:
             vec[idx] = 1.0
-        # Encode depth and child count in remaining dims
+        # Remaining dims are zero here; depth is written in parse_to_graph()
         return vec
 
     def parse_to_graph(

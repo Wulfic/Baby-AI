@@ -8,6 +8,17 @@ with infinite context caching.
 Phase B upgrade: Mamba-2 SSD (Structured State Space Duality)
 adds chunked-parallel scan for training while keeping the identical
 O(1) single-step recurrence at inference.
+
+Key classes:
+
+- **MambaBlock** — Single Mamba-2 SSM block with three execution paths:
+  SSD chunked-parallel (training), single-step recurrence (inference),
+  and sequential scan (fallback).
+- **MoELayer** — Sparse Mixture-of-Experts with top-k routing and
+  Switch-Transformer-style load-balancing loss.
+- **JambaBlock** — Mamba + (MoE or Dense FFN) with residual connections.
+- **JambaCore** — Full temporal backbone: stacked JambaBlocks with
+  input/output projections and packed ``JambaState`` for recurrence.
 """
 
 from __future__ import annotations

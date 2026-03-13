@@ -30,7 +30,7 @@ class SensorPreprocessor:
 
     def __init__(
         self,
-        max_channels: int = 16,
+        max_channels: int = 32,
         frame_rate: int = 30,
         normalize: bool = True,
         window_size: int = 1000,

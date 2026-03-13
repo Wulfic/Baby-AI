@@ -75,7 +75,9 @@ class GoalProposer(nn.Module):
         # Value head: scores each candidate
         self.score_head = nn.Linear(hidden_dim, num_candidates)
 
-        # Projection from fused_dim → goal_dim (used during hindsight training)
+        # Projection from state_dim → goal_dim (used during hindsight training).
+        # state_dim == hidden_dim in both Student and Teacher configs;
+        # project_fused() receives temporal core output, not raw fused embedding.
         self.goal_proj = nn.Linear(state_dim, goal_dim)
 
     def forward(
@@ -370,9 +372,8 @@ class GoalMonitor:
         self._best_similarity = -1.0
 
     def reset_full(self) -> None:
-        """Full reset (e.g. new episode / death)."""
+        """Full reset for a new episode (e.g. player death or world reload)."""
         self._steps_on_subgoal = 0
         self._total_steps = 0
         self._last_replan_step = -999
         self._best_similarity = -1.0
-        self._last_replan_step = -999

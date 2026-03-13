@@ -54,6 +54,7 @@ class LearnerThread:
         teacher_lock: threading.Lock | None = None,
         runtime_config: RuntimeConfig | None = None,
         distill_ready_callback=None,
+        curiosity_proj: nn.Linear | None = None,
     ):
         self.teacher = teacher
         self.replay = replay
@@ -91,9 +92,9 @@ class LearnerThread:
                 policy_params.append(param)
 
         self.optimizer = torch.optim.Adam([
-            {"params": encoder_params, "lr": self.config.encoder_lr},
-            {"params": core_params, "lr": self.config.core_lr},
-            {"params": policy_params, "lr": self.config.policy_lr},
+            {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr},
+            {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr},
+            {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr},
         ])
 
         # No warmup scheduler — constant LR controlled by the GUI.
@@ -108,18 +109,19 @@ class LearnerThread:
         # Projection: Student fused (512-d) → Teacher fused (1024-d).
         # Replay stores fused/next_fused from the Student model, but the
         # Teacher's world-model target_encoder expects Teacher-sized inputs.
-        student_dim = DEFAULT_CONFIG.student.hidden_dim   # 512
-        teacher_dim = DEFAULT_CONFIG.teacher.hidden_dim   # 1024
-        if student_dim != teacher_dim:
-            self._fused_proj = nn.Linear(student_dim, teacher_dim).to(device)
-        else:
-            self._fused_proj = None
+        # This is the SAME nn.Linear instance created by the Orchestrator
+        # (orchestrator.curiosity_proj) so that both the main loop's
+        # real-time curiosity computation and the learner's training
+        # share the same weights.  Without this, the main loop would
+        # use an untrained random projection for intrinsic reward.
+        self._fused_proj = curiosity_proj
 
         # Add _fused_proj parameters to optimizer so they actually train
         if self._fused_proj is not None:
             self.optimizer.add_param_group({
                 "params": list(self._fused_proj.parameters()),
                 "lr": self.config.core_lr,
+                "initial_lr": self.config.core_lr,
             })
 
         # Thread control
@@ -261,11 +263,17 @@ class LearnerThread:
                 self.optimizer.step()
 
             # ── Sync learning rate from GUI ───────────────────────
+            # The GUI provides a single LR value.  To preserve the
+            # per-group LR ratios (encoder_lr : core_lr : policy_lr),
+            # scale each group proportionally rather than overwriting
+            # all groups with the same flat value.
             try:
                 from baby_ai.ui.control_panel import get_live_lr
                 gui_lr = get_live_lr()
+                base_lr = self.config.core_lr or 1e-4
+                scale = gui_lr / base_lr
                 for pg in self.optimizer.param_groups:
-                    pg["lr"] = gui_lr
+                    pg["lr"] = pg.get("initial_lr", base_lr) * scale
             except Exception:
                 pass  # GUI not available yet
 
@@ -378,7 +386,8 @@ class LearnerThread:
 
     def _compute_loss(self, batch: dict, weights: torch.Tensor) -> dict:
         """Compute combined training loss."""
-        # Teacher forward — pass actions for diffusion denoising loss
+        # Teacher forward — pass actions so the policy head can compute
+        # its denoising loss (applies to both Diffusion and Flow Matching).
         forward_kwargs = {
             k: v for k, v in batch.items()
             if k in ("vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor")
@@ -415,6 +424,11 @@ class LearnerThread:
                 loss = rebel_loss + self._rebel_value_loss_weight * value_loss
             else:
                 # ── Legacy: reward-weighted denoising loss ──
+                # NOTE: "value" is never stored in replay transitions,
+                # so old_values is always zeros.  Advantage thus equals
+                # raw rewards.  This is a known limitation — a proper
+                # implementation would store the value estimate at
+                # collection time for off-policy correction.
                 old_values = batch.get("value", torch.zeros_like(rewards))
                 advantage = rewards - old_values.squeeze(-1)
                 advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)

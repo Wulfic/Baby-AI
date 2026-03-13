@@ -1,8 +1,11 @@
 """
 Teacher model — larger agent for continuous background learning (50-100M parameters).
 
-Trains asynchronously on replay data and periodically distills
-knowledge into the Student model.
+Trains asynchronously on replay data using the full Jamba core
+(deeper layers, Top-2 MoE with 8 experts) and wider encoders
+(vision_width_mult=2.0, audio_width_mult=2.5).  Periodically
+distills knowledge into the Student model via the distillation
+engine.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ class TeacherModel(BabyAgentBase):
             audio_width_mult=2.5,
             code_hidden_dim=config.encoder.code_embed_dim * 2,
             code_num_layers=5,
-            sensor_channels=32,  # 32-dim game-state vector from SensorPacker
+            sensor_channels=32,  # must match NUM_SENSOR_CHANNELS in sensor_packer.py
             # Jamba temporal core (Top-2 MoE, 8 experts)
             jamba_config=config.jamba,
             # Diffusion policy (fallback)
@@ -66,8 +69,11 @@ class TeacherModel(BabyAgentBase):
         """
         Generate soft targets for distillation.
 
-        Returns the Teacher's continuous action, communication logits,
-        and intermediate fused features for the Student to match.
+        Returns the Teacher's outputs for the Student to match:
+            action:          (B, 23) continuous action vector
+            comm_logits:     (B, vocab_size) communication head logits
+            fused_features:  (B, fused_dim) intermediate fused embedding
+            core_state:      (B, hidden_dim) temporal core output
         """
         self.eval()
         with torch.no_grad():

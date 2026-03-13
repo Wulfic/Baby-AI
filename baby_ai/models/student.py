@@ -1,8 +1,10 @@
 """
 Student model — compact, fast-inference agent (10-30M parameters).
 
-Designed for <200ms inference latency on RTX 2080 Ti.
-Updated periodically via distillation from the Teacher.
+Designed for <200ms inference latency on consumer GPUs (RTX 2080 Ti).
+Uses width_mult=1.0 encoders and a shallow Jamba core (fewer layers,
+Top-1 MoE with 4 experts).  Weights are periodically updated via
+atomic swap from the distillation engine.
 """
 
 from __future__ import annotations
@@ -37,12 +39,14 @@ class StudentModel(BabyAgentBase):
             action_dim=config.action_dim,
             comm_vocab_size=config.comm_vocab_size,
             comm_max_len=config.comm_max_len,
-            # Student uses moderate encoders — tuned for 10-30M total
+            # Student uses standard-width encoders (width_mult=1.0)
+            # The parameter budget is kept compact via a shallower
+            # Jamba core and fewer MoE experts, not narrower encoders.
             vision_width_mult=1.0,
             audio_width_mult=1.0,
             code_hidden_dim=config.encoder.code_embed_dim,
             code_num_layers=3,
-            sensor_channels=32,  # 32-dim game-state vector from SensorPacker
+            sensor_channels=32,  # must match NUM_SENSOR_CHANNELS in sensor_packer.py
             # Jamba temporal core (Top-1 MoE, 4 experts)
             jamba_config=config.jamba,
             # Diffusion policy (fallback)

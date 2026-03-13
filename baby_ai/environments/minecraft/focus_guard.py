@@ -34,6 +34,11 @@ Safety:
     - Scroll Lock toggles the guard on/off (same as the old InputGuard)
     - If the guard is off, the user CAN click on MC and interact normally
 
+NOTE: FocusGuard is exported via __init__.py but is **not currently
+instantiated** by env.py.  The environment uses InputGuard instead.
+FocusGuard is a newer alternative that avoids global hooks; it can
+be wired in when PostMessage-based input is stabilised.
+
 Usage::
 
     guard = FocusGuard(mc_hwnd=0x12345)

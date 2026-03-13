@@ -1,7 +1,7 @@
 """
 Audio encoder — 1D conv on log-mel spectrograms.
 
-Converts (B, 1, n_mels, T) log-mel spectrograms → (B, embed_dim) embeddings.
+Converts (B, n_mels, T) log-mel spectrograms → (B, embed_dim) embeddings.
 """
 
 from __future__ import annotations
@@ -28,8 +28,13 @@ class AudioEncoder(nn.Module):
     """
     Lightweight 1D convolutional audio encoder.
 
-    Processes log-mel spectrograms by treating mel bins as channels
-    (after a frequency-folding strategy) or as a 2D → 1D pipeline.
+    Processes log-mel spectrograms by projecting mel frequency bins
+    to a lower dimension with a linear layer, then applying a 1D
+    convolution stack over the time axis.
+
+    Pipeline:  (B, n_mels, T) → transpose → linear mel projection →
+               transpose → 1D conv stack (with 2× pooling per stage) →
+               adaptive avg pool → (B, embed_dim)
 
     Args:
         n_mels: Number of mel frequency bins.
@@ -49,10 +54,14 @@ class AudioEncoder(nn.Module):
             return max(8, int(c * width_mult))
 
         # Treat the mel spectrogram as (B, n_mels, T) — mel bins are "channels"
-        # over time dimension T. First reduce mel dimension with a linear projection.
+        # over time dimension T.  First reduce mel dimension with a linear
+        # projection (applied per-timestep after transposing to B, T, n_mels).
         self.mel_proj = nn.Linear(n_mels, _ch(64))
 
-        # 1D conv stack over time
+        # 1D conv stack over time, progressively increasing channels
+        # (64 → 64 → 128 → 128 → 256) with 2× temporal pooling at each
+        # stage to compress the time dimension.  width_mult scales all
+        # channel counts for Student (narrow) vs Teacher (wide).
         self.conv_stack = nn.Sequential(
             ConvBlock1D(_ch(64), _ch(64), kernel=3, pool=2),
             ConvBlock1D(_ch(64), _ch(128), kernel=3, pool=2),
@@ -74,9 +83,11 @@ class AudioEncoder(nn.Module):
         Returns:
             (B, embed_dim) embedding.
         """
-        # x: (B, n_mels, T) → transpose to (B, T, n_mels) for linear
+        # x: (B, n_mels, T) → transpose to (B, T, n_mels) for the linear
+        # projection, which reduces mel bins to a lower channel count.
+        # The same projection is applied independently to every timestep.
         x = self.mel_proj(x.transpose(1, 2))  # (B, T, proj_dim)
-        x = x.transpose(1, 2)                 # (B, proj_dim, T)
+        x = x.transpose(1, 2)                 # (B, proj_dim, T) for conv1d
         x = self.conv_stack(x)
         x = self.head(x)
         return x

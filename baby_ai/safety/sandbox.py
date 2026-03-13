@@ -1,8 +1,12 @@
 """
-Internet sandbox — restricts network access to curated APIs only.
+Internet sandbox (scaffold — not yet wired into the runtime).
 
 Wraps aiohttp to enforce domain whitelisting, rate limiting,
 and response size limits.
+
+NOTE: This module is scaffolded for future use.  No callers import
+or instantiate InternetSandbox in the current codebase.  To activate,
+integrate into the preprocessing/internet module or a future web agent.
 """
 
 from __future__ import annotations

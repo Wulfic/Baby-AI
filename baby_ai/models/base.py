@@ -1,8 +1,25 @@
 """
 Base agent model — shared architecture for Student and Teacher.
 
-Composes: modality encoders → multimodal fusion → Jamba core →
-diffusion policy head + communication head + latent world model.
+Architecture flow::
+
+    Raw modalities (vision, audio, code, sensor)
+        ↓
+    Per-modality encoders (VisionEncoder, AudioEncoder, CodeEncoder, SensorMLP)
+        ↓
+    MultimodalFusion (gated attention over available modalities)
+        ↓ (B, fused_dim)
+    JambaCore (Mamba-2 SSM + MoE temporal backbone)
+        ↓ (B, hidden_dim) + recurrent hidden state
+    GoalConditioner [optional] (FiLM modulation from System 3 goals)
+        ↓
+    Output heads:
+        ├─ Policy (FlowMatchingPolicyHead or DiffusionPolicyHead) → 23-dim action
+        ├─ CommunicationHead → token sequence
+        └─ LatentWorldModel (JEPA/RSSM) → curiosity reward + dynamics loss
+
+Scale is controlled by config: Student uses narrow encoders (10–30M params),
+Teacher uses wider/deeper encoders (50–100M params).
 """
 
 from __future__ import annotations
@@ -165,6 +182,12 @@ class BabyAgentBase(nn.Module):
                 beta_start=diffusion_config.beta_start,
                 beta_end=diffusion_config.beta_end,
             )
+        # NOTE: The communication head produces utterance logits but is
+        # currently not directly trained by the RL loop (learner_thread).
+        # It receives gradients only through distillation KL from Teacher
+        # → Student.  For the Teacher, comm_logits have no training
+        # signal at all (no ground-truth utterances or reward shaping).
+        # This is a known gap — future work could add language grounding.
         self.communication = CommunicationHead(
             input_dim=hidden_dim,
             vocab_size=comm_vocab_size,
@@ -269,8 +292,15 @@ class BabyAgentBase(nn.Module):
         Full forward pass: encode → fuse → temporal → policy + comm.
 
         Returns dict with:
-            fused, core_state, hidden, value, comm_logits,
-            denoising_loss (scalar), action (B, action_dim).
+            fused:           (B, fused_dim) multimodal embedding
+            core_state:      (B, hidden_dim) temporal core output
+            hidden:          Recurrent state for next step
+            value:           (B, 1) or scalar state-value estimate
+            comm_logits:     (B, vocab_size) communication head logits
+            denoising_loss:  Scalar policy training loss (named for
+                             backward compat — applies to both diffusion
+                             and flow matching policy heads)
+            action:          (B, 23) deterministic action vector
         """
         fused = self.encode(
             vision=vision, audio=audio,

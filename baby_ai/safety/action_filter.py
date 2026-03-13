@@ -1,8 +1,12 @@
 """
-Action safety filter.
+Action safety filter (scaffold — not yet wired into the runtime).
 
 Screens proposed continuous action vectors against safety rules
 before execution.  Blocks or penalizes unsafe actions.
+
+NOTE: This module is scaffolded for future use.  It is not currently
+imported or invoked by inference_thread, main.py, or any runtime code.
+To activate, integrate into InferenceThread._infer() after policy.act().
 """
 
 from __future__ import annotations

@@ -41,6 +41,40 @@ class RewardComputer:
     idle streaks, etc.) and exposes :meth:`compute` to produce a dict of
     per-channel rewards plus a weighted ``total``.
 
+    Reward channels (all values are non-negative unless noted)::
+
+        POSITIVE (bonuses):
+          survival          — small constant per-step alive bonus (0.005)
+          visual_change     — frame-diff magnitude when scene changes
+          action_diversity  — ratio of unique recent actions (0.0–0.3)
+          interaction       — sustained block attack/use with visual impact
+          exploration       — long-horizon visual novelty (every 100 steps)
+          movement          — forward/strafe/sprint with visual confirmation
+          new_chunk         — one-shot bonus for entering an unvisited chunk
+          block_break       — mod event, scaled by item_rewards table
+          item_pickup       — mod event, suppressed after drops (anti-gaming)
+          block_place       — mod event, scaled by item_rewards table
+          crafting          — mod event, scaled by recipe value × count
+          building_streak   — super-linear bonus for consecutive placements
+          creative_sequence — gather→craft→build state machine bonus
+          healing           — health recovery (mod event delta > 0)
+          food_reward       — food level increase (mod event delta > 0)
+          xp_reward         — experience gained (mod event amount)
+          home_proximity    — positive near home, negative far away
+
+        NEGATIVE (penalties, subtracted from total):
+          idle_penalty      — noop streak + monotone action + chunk linger
+          death_penalty     — 1.0 on player death (mod event)
+          stagnation_penalty — no productive actions for ~30 s
+          item_drop_penalty — 0.3 per drop action (discourages waste)
+          damage_taken      — health loss (mod event |delta|)
+          hotbar_spam_penalty — repeated hotbar-only presses
+          height_penalty    — underground depth + fall damage + darkness
+          pitch_penalty     — extreme camera angle (>45°) after grace period
+
+    Weights are read from the dynamic ``RewardWeightsState`` each step
+    (UI-adjustable), falling back to hardcoded defaults.
+
     The ``env`` reference is used *read-only* for position / mod-bridge
     data and *write* for a small set of shared counters (attack_streak,
     blocks_broken_total, is_dead, last_drop_time).
@@ -876,6 +910,21 @@ class RewardComputer:
     def _combine_rewards(
         rewards: Dict[str, float], reward_weights: Any
     ) -> float:
+        """Weighted sum of all reward channels into a single scalar.
+
+        Reads channel weights from the dynamic ``RewardWeightsState``
+        snapshot (UI-adjustable in real time).  Falls back to hardcoded
+        defaults if no weight state is injected.
+
+        The formula groups channels into:
+          - Baseline (survival, visual change)
+          - Exploration (diversity, interaction, movement, chunks)
+          - Resource gathering (block break, item pickup)
+          - Creation (placement, crafting, building, creative sequence)
+          - Penalties (idle, death, stagnation, damage, spam — subtracted)
+          - Sustain (healing, food, XP)
+          - Proximity (home distance — can be positive or negative)
+        """
         if reward_weights is not None:
             w = reward_weights.snapshot()
         else:

@@ -2,9 +2,20 @@
 Latent World Model — JEPA / RSSM-style forward dynamics in latent space.
 
 Predicts *transitions in the latent embedding space* conditioned on
-continuous actions from the diffusion policy. The agent never decodes
+continuous actions from the policy head.  The agent never decodes
 back to pixels; curiosity reward is the latent prediction error
 (JEPA-style), which naturally filters stochastic noise.
+
+Key design choices:
+
+- **Deterministic path (prior)**: MLP predicts next latent from
+  (core_state, action).  Fast at inference for curiosity + planning.
+- **Stochastic path (posterior)**: Optional Gaussian latent variable
+  trained via KL(posterior || prior) to capture aleatoric uncertainty
+  (e.g. random mob behaviour).  Only used during training.
+- **EMA target encoder**: The comparison target for the predictor is
+  produced by an exponential-moving-average copy of the online encoder,
+  following JEPA / BYOL to prevent representation collapse.
 """
 
 from __future__ import annotations

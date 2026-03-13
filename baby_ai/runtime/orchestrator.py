@@ -108,13 +108,19 @@ class Orchestrator:
         )
 
         # --- Distillation ---
-        # Lock to prevent concurrent forward/backward on the Teacher
-        # from the learner and distillation threads (cuDNN/SSM is not
-        # thread-safe — its internal reserve buffers get corrupted).
+        # Lock hierarchy (always acquire in this order to avoid deadlock):
+        #   1. _teacher_lock   — guards Teacher forward/backward
+        #   2. _model_swap_lock — guards Student weight swap
+        # A thread must NEVER acquire _teacher_lock while holding
+        # _model_swap_lock.
+        #
+        # _teacher_lock: prevents concurrent forward/backward on the
+        # Teacher from the learner and distillation threads (cuDNN/SSM
+        # is not thread-safe — internal reserve buffers get corrupted).
         self._teacher_lock = threading.Lock()
 
-        # Lock shared between inference and distillation so that
-        # swap_to_live() doesn't write weights while _infer() reads.
+        # _model_swap_lock: shared between inference and distillation
+        # so swap_to_live() doesn't write weights while _infer() reads.
         self._model_swap_lock = threading.Lock()
 
         self.distill_engine = DistillationEngine(
@@ -158,6 +164,7 @@ class Orchestrator:
             device=device,
             teacher_lock=self._teacher_lock,
             runtime_config=self.config.runtime,
+            curiosity_proj=self.curiosity_proj,
         )
 
         self.distill_thread = DistillThread(
@@ -269,6 +276,9 @@ class Orchestrator:
             "distill_count": self.distill_thread.stats["distill_count"],
             "replay_stats": self.replay.stats(),
             "reward_composer_step": self.reward_composer._step,
+            # Save learner optimizer state (Adam momentum/variance) so
+            # training resumes smoothly without a cold-start period.
+            "learner_optimizer_state_dict": self.learner_thread.optimizer.state_dict(),
         }
         if self.curiosity_proj is not None:
             ckpt_data["curiosity_proj_state_dict"] = self.curiosity_proj.state_dict()
@@ -342,6 +352,23 @@ class Orchestrator:
         # decay continues across sessions instead of resetting.
         if "reward_composer_step" in ckpt:
             self.reward_composer._step = ckpt["reward_composer_step"]
+        # Restore learner step counter so consolidation timing,
+        # distillation signalling, and periodic logging continue
+        # from where they left off instead of restarting at 0.
+        if "learner_step" in ckpt:
+            self.learner_thread._step = ckpt["learner_step"]
+        # Restore learner optimizer state (Adam momentum/variance)
+        # to avoid a cold-start training instability period.
+        opt_sd = ckpt.get("learner_optimizer_state_dict")
+        if opt_sd is not None:
+            try:
+                self.learner_thread.optimizer.load_state_dict(opt_sd)
+                log.info("Learner optimizer state restored.")
+            except (ValueError, RuntimeError) as exc:
+                log.warning(
+                    "Could not restore learner optimizer state "
+                    "(likely architecture change): %s", exc,
+                )
         log.info("Checkpoint loaded from: %s", path)
 
     @staticmethod

@@ -1,10 +1,25 @@
 """
-Policy head — action selection from core hidden state.
+Policy heads — action selection from core hidden state.
+
+Provides two policy implementations, selectable via ``config.student.policy_type``:
 
 **DiffusionPolicyHead** — Conditional DDIM diffusion for continuous
 compound actions (pitch, yaw, movement, attack, hotbar, …).
-Generates a unified continuous action vector in 3-5 denoising steps
-conditioned on the JambaCore hidden state.
+Generates a unified 23-dim continuous action vector in 3–5 denoising
+steps conditioned on the JambaCore hidden state.
+
+**FlowMatchingPolicyHead** (Phase C) — Optimal-transport flow matching.
+Learns a velocity field v(x_t, t) and integrates from noise to data
+via 1–2 Euler steps.  Faster inference + simpler training than diffusion.
+
+Both heads also contain an independent **value head** (state → scalar)
+used by System 2 planning and REBEL RL.
+
+Action vector layout (23-dim):
+    [0:2]   camera (yaw_delta, pitch_delta)   in [−1, 1]
+    [2:6]   movement (fwd, back, left, right) in [0, 1]
+    [6:14]  actions (attack, use, jump, sneak, sprint, inv, drop, pick) in [0, 1]
+    [14:23] hotbar slot selection (9 slots, argmax-selected) in [0, 1]
 """
 
 from __future__ import annotations
@@ -152,7 +167,7 @@ class DiffusionPolicyHead(nn.Module):
         [0:2]   camera (yaw_delta, pitch_delta) in [-1, 1]
         [2:6]   movement (forward, back, left, right) in [0, 1]
         [6:14]  actions (attack, use, jump, sneak, sprint, inventory, drop, pick_block) in [0, 1]
-        [14:23] hotbar (9 slots, softmax-normalised)
+        [14:23] hotbar (9 slots, argmax-selected at decode time) in [0, 1]
 
     Uses **reward-weighted denoising** for RL training:
         loss = advantage * ||noise_pred - noise_true||²

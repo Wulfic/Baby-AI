@@ -3,10 +3,23 @@ Teacher → Student distillation engine.
 
 Performs knowledge distillation using:
 - MSE on continuous action vectors
-- KL divergence on communication logits
-- Feature matching on fused embeddings
+- KL divergence on communication logits (temperature-scaled)
+- Feature matching on fused embeddings (with lazy linear projection)
 
-Supports atomic Student weight swaps to avoid blocking inference.
+Key design choices:
+- **Staging copy**: All gradient updates happen on an offline copy of
+  the Student.  Once a distillation round is complete, weights are
+  atomically swapped into the live Student used by the inference thread.
+  This avoids blocking inference during backprop.
+- **Teacher label cache**: An LRU cache keyed by (replay_index,
+  teacher_version) avoids redundant Teacher forward passes when the
+  same high-priority transitions are re-sampled.
+- **Asymmetric augmentation**: Student sees cropped/jittered/noisy
+  frames while Teacher sees clean frames, following BYOL.
+- **Curriculum warmup**: KL weight ramps from 20%→100% over
+  kl_warmup_steps; feature weight ramps from 0→100% over
+  feat_warmup_steps.  This avoids unstable gradients while
+  the Student's representations are still random.
 """
 
 from __future__ import annotations
@@ -136,18 +149,26 @@ class DistillationEngine:
         self._teacher_lock = teacher_lock or threading.Lock()
 
         # Create a staging copy of Student for offline updates.
-        # Avoid copy.deepcopy — it fails if the model has been used
-        # for inference (non-leaf tensors cached in the graph).  Instead
-        # construct a fresh instance from the class + load weights.
-        self._staging_student = type(student).__new__(type(student))
-        nn.Module.__init__(self._staging_student)
-        # Re-initialise using the same class constructor
+        # deepcopy is safe here because the staging copy is created at
+        # orchestrator init time, before any forward pass runs on the
+        # live student (which would leave non-leaf tensors in the graph
+        # and cause deepcopy to fail).
         try:
-            self._staging_student.__init__()  # StudentModel() uses DEFAULT_CONFIG
-        except Exception:
-            # Fallback: deepcopy under no_grad (works if no forward ran)
             with torch.no_grad():
                 self._staging_student = copy.deepcopy(student)
+        except Exception:
+            # Fallback: construct a fresh instance via __new__ + __init__.
+            # WARNING: __init__() uses DEFAULT_CONFIG — if the user's
+            # config differs (e.g. policy_type='diffusion'), this will
+            # create a mismatched architecture that load_state_dict
+            # may fail on.
+            log.warning(
+                "deepcopy failed for staging Student — falling back to "
+                "DEFAULT_CONFIG re-init.  Custom configs may mismatch."
+            )
+            self._staging_student = type(student).__new__(type(student))
+            nn.Module.__init__(self._staging_student)
+            self._staging_student.__init__()
         # Load the live weights into the staging copy
         self._staging_student.load_state_dict(student.state_dict())
         self._optimizer = torch.optim.Adam(

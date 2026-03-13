@@ -51,7 +51,10 @@ class MultimodalFusion(nn.Module):
             for name, dim in modality_dims.items()
         })
 
-        # Gating network: takes concatenated raw embeddings → gate per modality
+        # Gating network: concatenates all raw embeddings and produces
+        # per-modality attention weights via softmax.  This lets the model
+        # dynamically focus on whichever modality is most informative
+        # (e.g. audio when visual is unchanged, vision when audio is silent).
         self.gate = nn.Sequential(
             nn.Linear(total_dim, len(modality_dims)),
             nn.Softmax(dim=-1),
@@ -90,7 +93,9 @@ class MultimodalFusion(nn.Module):
         if batch_size is None:
             raise ValueError("At least one modality embedding must be provided.")
 
-        # Project each modality; zero-fill missing ones
+        # Project each modality; zero-fill missing ones.
+        # Missing modalities produce zero projections and zero raw values,
+        # which contribute minimal weight through the softmax gate.
         projected = []
         raw_parts = []
         for name in self.modality_names:
@@ -100,7 +105,7 @@ class MultimodalFusion(nn.Module):
                 projected.append(proj(emb))
                 raw_parts.append(emb)
             else:
-                # Zero embedding for missing modality
+                # Zero embedding for missing modality — gets near-zero gate weight
                 projected.append(torch.zeros(batch_size, proj.out_features, device=device))
                 raw_parts.append(torch.zeros(batch_size, proj.in_features, device=device))
 
@@ -108,7 +113,10 @@ class MultimodalFusion(nn.Module):
         raw_cat = torch.cat(raw_parts, dim=-1)  # (B, total_dim)
         gates = self.gate(raw_cat)               # (B, num_modalities)
 
-        # Gated weighted sum of projected embeddings
+        # Gated weighted sum of projected embeddings:
+        #   gates (B, num_modalities, 1) broadcasts over fused_dim,
+        #   stacked (B, num_modalities, fused_dim) holds each modality,
+        #   elementwise multiply + sum over modality axis → (B, fused_dim)
         stacked = torch.stack(projected, dim=1)  # (B, num_modalities, fused_dim)
         gates = gates.unsqueeze(-1)               # (B, num_modalities, 1)
         fused = (stacked * gates).sum(dim=1)      # (B, fused_dim)

@@ -146,7 +146,7 @@ class RewardComposer:
         "communication", "exploration", "interaction", "action_diversity",
         "movement", "block_break", "item_pickup", "block_place",
         "crafting", "building_streak", "creative_sequence",
-        "new_chunk",
+        "new_chunk", "healing", "food_reward", "xp_reward",
     })
 
     def _normalize_channel(self, channel: str, value: float) -> float:
@@ -201,6 +201,8 @@ class RewardComposer:
         intrinsic: float = 0.0,
         communication: float = 0.0,
         extrinsic: float = 0.0,
+        # NOTE: compose() is legacy code — the Minecraft loop uses
+        # compose_dynamic() exclusively.  Kept for reference / testing.
         exploration: float = 0.0,
         interaction: float = 0.0,
         action_diversity: float = 0.0,
@@ -337,10 +339,16 @@ class RewardComposer:
         Args:
             channel_values: Mapping of channel_name → raw float value.
                            Must include 'intrinsic' for curiosity.
+                           NOTE: must NOT include 'total' — that key
+                           is skipped to prevent double-counting.
             weight_overrides: Optional mapping of channel_name → weight
                              from the GUI reward-weight sliders.  When a
-                             channel is absent from this dict the built-in
-                             default weight (1.0) is used.
+                             channel is absent from this dict the fallback
+                             weight is 1.0.  In practice, the GUI always
+                             provides weights for all known channels (see
+                             RewardWeightsState.snapshot()), so the 1.0
+                             fallback only applies to novel / unknown
+                             channels.
 
         Returns:
             Composed, clamped scalar reward in [-5, 5].
@@ -350,6 +358,13 @@ class RewardComposer:
 
         for channel, raw_value in channel_values.items():
             if raw_value == 0.0:
+                continue
+
+            # Skip pre-composed totals — including them would
+            # double-count the reward that compose_dynamic() itself
+            # is about to compute.  The env's reward_breakdown dict
+            # includes a "total" key for diagnostic purposes only.
+            if channel == "total":
                 continue
 
             # Look up weight — special-case 'intrinsic' to use annealed weight

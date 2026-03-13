@@ -37,6 +37,8 @@ class InvertedResidual(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1, expand_ratio: int = 2):
         super().__init__()
         mid = in_ch * expand_ratio
+        # Residual connections only work when stride=1 (spatial dims
+        # preserved) AND in_ch==out_ch (channel dims match for addition).
         self.use_residual = (stride == 1 and in_ch == out_ch)
 
         layers = []

@@ -190,7 +190,8 @@ class StudentConfig:
     policy_hidden: int = 512
     comm_vocab_size: int = 4096  # small vocabulary for utterances
     comm_max_len: int = 32
-    action_dim: int = 128        # discrete action count (used by env reward computer)
+    action_dim: int = 128        # legacy discrete action count; stored as self.action_dim
+                                 # in BabyAgentBase but unused by current continuous policy
     total_target_params: str = "10-30M"
 
     # Policy type selector: "diffusion" or "flow_matching"
@@ -232,7 +233,8 @@ class TeacherConfig:
     policy_hidden: int = 1024
     comm_vocab_size: int = 4096
     comm_max_len: int = 64
-    action_dim: int = 128        # discrete action count (used by env reward computer)
+    action_dim: int = 128        # legacy discrete action count; stored as self.action_dim
+                                 # in BabyAgentBase but unused by current continuous policy
     total_target_params: str = "50-100M"
 
     # Policy type selector: "diffusion" or "flow_matching"

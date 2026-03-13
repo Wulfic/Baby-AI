@@ -79,6 +79,11 @@ class CodeEncoder(nn.Module):
         Returns:
             (B, embed_dim) per-graph embedding.
         """
+        # GCN message-passing layers: each convolution aggregates
+        # features from neighbouring nodes in the AST graph.
+        # Batch normalisation + ReLU activation after each layer.
+        # Residual skip connections stabilise training for deeper GNNs
+        # (only when input and output dims match, i.e. not the first layer).
         x = F.relu(self.node_embed(x))
 
         for conv, bn in zip(self.convs, self.bns):
@@ -86,7 +91,9 @@ class CodeEncoder(nn.Module):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
-            # Residual connection if dimensions match
+            # Residual connection: only applies when dims match
+            # (first layer maps node_embed → hidden_dim, so skip is possible
+            # only from the second layer onward)
             if x.shape == residual.shape:
                 x = x + residual
 
@@ -102,19 +109,31 @@ class CodeEncoder(nn.Module):
         num_edges: int = 30,
         batch_size: int = 1,
     ) -> dict:
-        """Create a dummy batched graph for testing/profiling."""
+        """Create a dummy batched graph for testing/profiling.
+
+        Builds ``batch_size`` independent random graphs, concatenates
+        their node features and edge indices into a single batched
+        representation (as expected by torch_geometric), and returns
+        them in a dict ready to be unpacked into ``forward()``.
+        """
         all_x, all_edge_index, all_batch = [], [], []
+        # offset tracks the running node count so edge indices are
+        # adjusted to reference global (batched) node IDs.
         offset = 0
         for b in range(batch_size):
             x = torch.randn(num_nodes, node_feature_dim)
+            # Randomly generate source/dest edges (may have duplicates/self-loops)
             src = torch.randint(0, num_nodes, (num_edges,))
             dst = torch.randint(0, num_nodes, (num_edges,))
+            # Add offset to convert local node IDs (0..num_nodes-1)
+            # to global IDs in the concatenated graph
             edge_index = torch.stack([src, dst]) + offset
             batch_vec = torch.full((num_nodes,), b, dtype=torch.long)
 
             all_x.append(x)
             all_edge_index.append(edge_index)
             all_batch.append(batch_vec)
+            # Next graph's node IDs start after this one
             offset += num_nodes
 
         return {

@@ -38,7 +38,14 @@ class SumTree:
     """
     Binary sum tree for efficient O(log n) prioritized sampling.
 
-    Each leaf stores the priority; internal nodes store the sum of children.
+    Each leaf stores a transition's priority value.  Internal nodes
+    store the sum of their children, enabling proportional sampling
+    (i.e. transitions with higher priority are drawn more often).
+
+    The tree array has 2 * capacity elements:
+      - Index 0 is unused (sentinel).
+      - Index 1 is the root (total sum of all priorities).
+      - Indices [capacity, 2*capacity) are the leaves (one per transition).
     """
 
     def __init__(self, capacity: int):
@@ -647,6 +654,10 @@ class PrioritizedReplayBuffer:
     ) -> Tuple[List[Tuple[Dict, Dict, float, float]], np.ndarray, List[int]]:
         """
         Sample pairs of transitions for REBEL training (Phase D).
+
+        NOTE: Currently unused — LearnerThread._compute_rebel_loss()
+        does inline half-batch pairing instead of calling this method.
+        Kept as a public API for external / offline REBEL training.
 
         Samples 2 * batch_size transitions, pairs them up, and designates
         the higher-reward transition as "winner" in each pair.

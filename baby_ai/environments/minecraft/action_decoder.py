@@ -1,14 +1,15 @@
 """
 Continuous action decoder for Minecraft.
 
-Maps the 23-dim continuous action vector from the DiffusionPolicyHead
-to concrete key presses, mouse buttons, and camera look deltas.
+Maps the 23-dim continuous action vector from the policy head
+(DiffusionPolicyHead or FlowMatchingPolicyHead) to concrete
+key presses, mouse buttons, and camera look deltas.
 
-Action vector layout (from DiffusionPolicyHead):
+Action vector layout (23 dimensions):
     [0:2]   camera (yaw_delta, pitch_delta) in [-1, 1]
     [2:6]   movement (forward, back, left, right) in [0, 1]
     [6:14]  actions (attack, use, jump, sneak, sprint, inventory, drop, pick_block) in [0, 1]
-    [14:23] hotbar (9 slots, softmax-normalised) in [0, 1]
+    [14:23] hotbar (9 slots) in [0, 1] — argmax-selected at decode time
 """
 
 from __future__ import annotations

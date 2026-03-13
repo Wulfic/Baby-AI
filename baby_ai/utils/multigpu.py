@@ -13,10 +13,13 @@ Strategy: **Epoch-Split + Checkpoint Averaging**
     covering all requested epochs.
 
 Requirements:
-    - All GPUs must be from the same vendor (NVIDIA) so driver
-      semantics are consistent.
-    - All GPUs must have the same total VRAM so batch sizes and
-      memory-budget assumptions hold equally.
+    - All GPUs must be the same model (e.g. two RTX 2080 Ti) so
+      compute throughput and memory budgets are identical.  Mixed
+      models (e.g. RTX 2080 Ti + RTX 3090) are rejected because
+      checkpoint averaging is less reliable when training speed
+      differs.
+    - All GPUs must have the same total VRAM (within ~256 MiB
+      tolerance) so batch sizes hold equally.
 
 Typical usage::
 

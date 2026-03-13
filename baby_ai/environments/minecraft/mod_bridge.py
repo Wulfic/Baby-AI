@@ -21,11 +21,26 @@ Event dict keys
 ---------------
 All events have ``"event"`` (str) and ``"tick"`` (int).
 
-- ``block_broken``  — block, x, y, z
-- ``block_placed``  — block, x, y, z
-- ``item_crafted``  — item, count
-- ``item_picked_up`` — item, count
-- ``player_death``  — source (death message string)
+Core events (always sent):
+
+- ``position_update`` — x, y, z, pitch, yaw, on_ground, sky_light
+- ``player_status``   — health, max_health, food, saturation, armor,
+                        air, max_air, xp_level, xp_progress, is_sprinting,
+                        is_swimming, is_sneaking, is_on_fire,
+                        game_time, day_time, is_raining, is_thundering,
+                        velocity_x, velocity_y, velocity_z, inventory_used
+- ``block_broken``    — block, x, y, z
+- ``block_placed``    — block, x, y, z
+- ``item_crafted``    — item, count
+- ``item_picked_up``  — item, count
+- ``player_death``    — source (death message string)
+
+Optional / conditional events:
+
+- ``health_changed``  — delta
+- ``food_changed``    — delta
+- ``xp_gained``       — amount
+- ``home_set``        — x, y, z
 """
 
 from __future__ import annotations

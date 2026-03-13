@@ -90,7 +90,8 @@ class MinecraftLauncher:
 
     def ensure_background_options(self) -> None:
         """
-        Patch ``options.txt`` so Minecraft keeps running when unfocused.
+        Patch Minecraft's ``options.txt`` (vanilla config file in .minecraft/)
+        so the game keeps running when unfocused.
 
         Sets ``pauseOnLostFocus:false`` which is required for the AI to
         control the game via PostMessage while the window is in the

@@ -59,7 +59,7 @@ class VideoPreprocessor:
         Returns:
             (C, H, W) float32 tensor.
         """
-        # Resize
+        # Resize — cv2.resize takes (width, height), so swap our (H, W) tuple
         frame = cv2.resize(frame, (self.resolution[1], self.resolution[0]))
 
         # Color conversion
