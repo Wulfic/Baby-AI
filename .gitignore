@@ -39,12 +39,22 @@ raw_data/
 *.pth
 *.onnx
 
+# Local settings (user-specific)
+baby_ai_settings.json
+
+# Diagnostic / scratch scripts
+_diag*
+_test_run*
+
 # Test captures
 test_capture.png
 
-# Gradle / Fabric mod build artefacts
+# Java / Gradle / Fabric mod build artefacts
 baby_ai_mod/.gradle/
 baby_ai_mod/build/
+baby_ai_mod/bin/
 baby_ai_mod/run/
-baby_ai_settings.json
+*.class
+
+# Reference code (large, external)
 reference_hrm/
