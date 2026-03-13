@@ -37,6 +37,13 @@ class EWC:
         self._params_star: Dict[str, torch.Tensor] = {}
         self._initialized = False
 
+    # Keys that the Teacher model's forward() actually accepts.
+    _VALID_FORWARD_KEYS = frozenset({
+        "vision", "audio", "sensor",
+        "code_x", "code_edge_index", "code_batch",
+        "actions", "goal",
+    })
+
     def compute_fisher(
         self,
         model: nn.Module,
@@ -47,49 +54,73 @@ class EWC:
         """
         Estimate diagonal Fisher Information from a data sample.
 
+        Uses ``torch.autograd.grad`` instead of ``.backward()`` so that
+        no gradients are accumulated on parameter ``.grad`` attributes.
+        This prevents corruption of the AMP GradScaler / optimizer state
+        in the calling training loop.
+
         Args:
             model: Current model.
-            data_loader: Iterable yielding (inputs_dict, targets_dict).
+            data_loader: Iterable yielding dicts of batched tensors.
             num_samples: Number of samples for estimation.
             device: Device for computation.
         """
+        was_training = model.training
         model.eval()
 
+        params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        param_tensors = [p for _, p in params]
         fisher = {
             n: torch.zeros_like(p, device=device)
-            for n, p in model.named_parameters()
-            if p.requires_grad
+            for n, p in params
         }
 
         count = 0
-        for batch in data_loader:
-            if count >= num_samples:
-                break
+        try:
+            for batch in data_loader:
+                if count >= num_samples:
+                    break
 
-            # Forward pass — use continuous action output for Fisher
-            model.zero_grad()
-            outputs = model(**{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()})
+                # Filter to only keys the Teacher forward() accepts.
+                # Replay batches contain extra keys (reward, fused, is_demo, ...)
+                # that would cause a TypeError if passed through.
+                forward_kwargs = {}
+                for k, v in batch.items():
+                    # Map 'action' -> 'actions' (Teacher kwarg name)
+                    fwd_key = "actions" if k == "action" else k
+                    if fwd_key not in self._VALID_FORWARD_KEYS:
+                        continue
+                    forward_kwargs[fwd_key] = v.to(device) if isinstance(v, torch.Tensor) else v
 
-            # Squared-norm of continuous action → scalar loss for Fisher
-            action = outputs["action"]
-            loss = action.pow(2).sum(dim=-1).mean()
-            batch_size = action.size(0)
+                outputs = model(**forward_kwargs)
 
-            loss.backward()
+                # Squared-norm of continuous action output -> scalar for Fisher
+                action = outputs["action"]
+                loss = action.pow(2).sum(dim=-1).mean()
+                batch_size = action.size(0)
 
-            for n, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    fisher[n] += p.grad.data.pow(2)
+                # Use autograd.grad to avoid touching .grad attributes.
+                grads = torch.autograd.grad(
+                    loss, param_tensors,
+                    retain_graph=False, create_graph=False,
+                    allow_unused=True,
+                )
+                for (n, _p), g in zip(params, grads):
+                    if g is not None:
+                        fisher[n] += g.detach().pow(2)
 
-            count += batch_size
+                count += batch_size
 
-        # Average
-        for n in fisher:
-            fisher[n] /= max(count, 1)
-
-        # Restore training mode — callers (e.g. the learner thread)
-        # expect the model to remain in .train() mode.
-        model.train()
+            # Average
+            for n in fisher:
+                fisher[n] /= max(count, 1)
+        finally:
+            # ALWAYS restore training mode, even if an exception occurred.
+            # Leaving the model in eval mode causes _aux_loss (MoE) and
+            # other training-only state to go stale, which triggers
+            # "backward through the graph a second time" on the next step.
+            if was_training:
+                model.train()
 
         # Store snapshot
         self._fisher = fisher

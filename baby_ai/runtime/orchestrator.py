@@ -28,6 +28,7 @@ from baby_ai.models.teacher import TeacherModel
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.learning.intrinsic import JEPACuriosity
+import torch.nn as nn
 from baby_ai.learning.distillation import DistillationEngine
 from baby_ai.learning.rewards import RewardComposer
 from baby_ai.runtime.inference_thread import InferenceThread
@@ -85,6 +86,16 @@ class Orchestrator:
             reward_scale=1.0,
             max_reward=5.0,
         ).to(device)
+
+        # Projection: Student fused_dim → Teacher hidden_dim so that
+        # Student embeddings can be fed into the Teacher's world model
+        # for curiosity computation (Student=512, Teacher=1024).
+        student_fused = self.config.student.encoder.fused_dim
+        teacher_state = self.config.teacher.hidden_dim
+        if student_fused != teacher_state:
+            self.curiosity_proj = nn.Linear(student_fused, teacher_state).to(device)
+        else:
+            self.curiosity_proj = None
 
         self.consolidator = Consolidator(
             ewc_lambda=self.config.training.ewc_lambda,
@@ -248,7 +259,7 @@ class Orchestrator:
         ensure_dirs()
         path = CHECKPOINT_DIR / f"checkpoint_{tag}.pt"
         tmp_path = path.with_suffix(".pt.tmp")
-        torch.save({
+        ckpt_data = {
             "student_state_dict": self.student.state_dict(),
             "teacher_state_dict": self.teacher.state_dict(),
             "curiosity_state_dict": self.curiosity.state_dict(),
@@ -258,7 +269,10 @@ class Orchestrator:
             "distill_count": self.distill_thread.stats["distill_count"],
             "replay_stats": self.replay.stats(),
             "reward_composer_step": self.reward_composer._step,
-        }, tmp_path)
+        }
+        if self.curiosity_proj is not None:
+            ckpt_data["curiosity_proj_state_dict"] = self.curiosity_proj.state_dict()
+        torch.save(ckpt_data, tmp_path)
 
         # Atomic rename — prevents corrupted checkpoints if the process
         # crashes mid-write (especially on network storage like Z:\).
@@ -315,6 +329,11 @@ class Orchestrator:
         curiosity_sd = ckpt.get("curiosity_state_dict") or ckpt.get("icm_state_dict")
         if curiosity_sd is not None:
             self._safe_load_state_dict(self.curiosity, curiosity_sd, "curiosity")
+        # Restore the Student→Teacher fused-dim projection for curiosity
+        if self.curiosity_proj is not None and "curiosity_proj_state_dict" in ckpt:
+            self._safe_load_state_dict(
+                self.curiosity_proj, ckpt["curiosity_proj_state_dict"], "curiosity_proj",
+            )
         # Load System 3 module weights (GoalProposer, SubgoalPlanner)
         s3_sd = ckpt.get("system3_state_dict")
         if s3_sd:

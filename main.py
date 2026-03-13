@@ -250,7 +250,7 @@ def run_offline_training(
             orchestrator.load_checkpoint(latest)
             log.info("Loaded latest checkpoint: %s", latest)
         else:
-            log.warning("No checkpoint found — models start from random init.")
+            log.warning("No checkpoint found -- models start from random init.")
 
     # ── Rebuild replay from on-disk chunk files ─────────────────
     n_recovered = orchestrator.replay.rebuild_from_disk(default_priority=1.0)
@@ -269,10 +269,12 @@ def run_offline_training(
     log.info("Replay: %d transitions | batch_size=%d | steps/epoch=%d",
              replay_size, batch_size, steps_per_epoch)
     log.info("Distillation every %d teacher steps", distill_interval)
+    log.info("Consolidation every %d steps (Fisher recompute + EWC snapshot)",
+             config.training.consolidation_every_n_steps)
 
     # ── Get direct references to threads ────────────────────────
     # We drive training synchronously instead of starting background
-    # threads — this avoids thread overhead and gives us deterministic
+    # threads -- this avoids thread overhead and gives us deterministic
     # epoch boundaries.
     learner = orchestrator.learner_thread
     distill = orchestrator.distill_thread
@@ -282,17 +284,30 @@ def run_offline_training(
     orchestrator.teacher.to(device).train()
     orchestrator.student.to(device)
 
+    # ── Verbose progress helpers ────────────────────────────────
+    _LOG_EVERY = 10          # print a progress line every N steps
+    _epoch_t0 = time.perf_counter()
+    _global_t0 = time.perf_counter()
+    _step_errors = 0
+
     # ── Training loop ───────────────────────────────────────────
     total_steps = 0
     try:
         for epoch in range(1, epochs + 1):
             epoch_steps = 0
+            _epoch_t0 = time.perf_counter()
 
-            log.info("─── Epoch %d / %d ───", epoch, epochs)
+            log.info("=" * 60)
+            log.info("EPOCH %d / %d  (teacher_step=%d)", epoch, epochs, learner.step_count)
+            log.info("=" * 60)
 
             for step_i in range(steps_per_epoch):
                 if orchestrator.replay.size < batch_size:
+                    log.warning("Replay buffer smaller than batch (%d < %d) -- stopping epoch.",
+                                orchestrator.replay.size, batch_size)
                     break
+
+                _step_t0 = time.perf_counter()
 
                 try:
                     # _train_step already handles: loss computation,
@@ -302,10 +317,12 @@ def run_offline_training(
                     # 100 steps.
                     learner._train_step()
                 except Exception as e:
+                    _step_errors += 1
                     log.warning("Train step error (step %d): %s",
-                                total_steps, e)
+                                total_steps, e, exc_info=(_step_errors <= 3))
                     continue
 
+                _step_dt = time.perf_counter() - _step_t0
                 epoch_steps += 1
                 total_steps += 1
 
@@ -314,45 +331,76 @@ def run_offline_training(
                 # we call _distill_round directly on the same thread.
                 if total_steps % distill_interval == 0:
                     try:
+                        _d_t0 = time.perf_counter()
                         distill._distill_round()
+                        _d_dt = time.perf_counter() - _d_t0
                         log.info(
-                            "  Distill round %d at step %d",
-                            distill._distill_count, total_steps,
+                            ">>> DISTILL round %d at step %d  (%.1f s)",
+                            distill._distill_count, total_steps, _d_dt,
                         )
                     except Exception as e:
-                        log.warning("Distill error: %s", e)
+                        log.warning("Distill error: %s", e, exc_info=True)
 
-                # ── Extra progress line each epoch quarter ──────
-                if epoch_steps == steps_per_epoch // 4:
+                # ── Verbose progress line ───────────────────────
+                if epoch_steps % _LOG_EVERY == 0 or epoch_steps == 1:
+                    pct = 100.0 * epoch_steps / steps_per_epoch
+                    elapsed_epoch = time.perf_counter() - _epoch_t0
+                    steps_per_sec = epoch_steps / max(elapsed_epoch, 1e-6)
+                    remaining_steps = steps_per_epoch - epoch_steps
+                    eta_sec = remaining_steps / max(steps_per_sec, 1e-6)
+                    # Get LR from optimizer
+                    lr_vals = [pg["lr"] for pg in learner.optimizer.param_groups]
+                    lr_str = "/".join(f"{v:.2e}" for v in lr_vals)
                     log.info(
-                        "  [epoch %d] 25%%  teacher_step=%d",
-                        epoch, learner.step_count,
-                    )
-                elif epoch_steps == steps_per_epoch // 2:
-                    log.info(
-                        "  [epoch %d] 50%%  teacher_step=%d",
-                        epoch, learner.step_count,
-                    )
-                elif epoch_steps == (3 * steps_per_epoch) // 4:
-                    log.info(
-                        "  [epoch %d] 75%%  teacher_step=%d",
-                        epoch, learner.step_count,
+                        "  [%3.0f%%] step %d/%d (global %d) | "
+                        "%.0f ms/step | %.1f steps/s | "
+                        "lr=%s | ETA %dm%02ds",
+                        pct, epoch_steps, steps_per_epoch, learner.step_count,
+                        _step_dt * 1000, steps_per_sec,
+                        lr_str,
+                        int(eta_sec) // 60, int(eta_sec) % 60,
                     )
 
             # ── End-of-epoch distillation + swap ────────────────
             if orchestrator.replay.size >= batch_size:
                 try:
+                    _d_t0 = time.perf_counter()
                     distill._distill_round()
+                    _d_dt = time.perf_counter() - _d_t0
+                    log.info(">>> End-of-epoch distill round %d  (%.1f s)",
+                             distill._distill_count, _d_dt)
                 except Exception as e:
                     log.warning("End-of-epoch distill error: %s", e)
 
             # ── Checkpoint ──────────────────────────────────────
+            _save_t0 = time.perf_counter()
             orchestrator.save_checkpoint(f"offline_epoch_{epoch:03d}")
             orchestrator.save_checkpoint("latest")  # overwrite rolling
+            _save_dt = time.perf_counter() - _save_t0
+
+            _epoch_dt = time.perf_counter() - _epoch_t0
+            _total_dt = time.perf_counter() - _global_t0
+            log.info("-" * 60)
             log.info(
-                "Epoch %d complete | teacher_step=%d | distill_rounds=%d",
-                epoch, learner.step_count, distill._distill_count,
+                "EPOCH %d DONE | %d steps in %.1fs (%.1f steps/s) | "
+                "teacher_step=%d | distill_rounds=%d | "
+                "checkpoint saved (%.1fs) | errors=%d",
+                epoch, epoch_steps, _epoch_dt,
+                epoch_steps / max(_epoch_dt, 1e-6),
+                learner.step_count, distill._distill_count,
+                _save_dt, _step_errors,
             )
+            remaining_epochs = epochs - epoch
+            if remaining_epochs > 0:
+                eta_total = _epoch_dt * remaining_epochs
+                log.info(
+                    "  Remaining: %d epochs, ETA ~%dm%02ds  (wall time so far: %dm%02ds)",
+                    remaining_epochs,
+                    int(eta_total) // 60, int(eta_total) % 60,
+                    int(_total_dt) // 60, int(_total_dt) % 60,
+                )
+            log.info("-" * 60)
+            _step_errors = 0  # reset per-epoch error counter
 
     except KeyboardInterrupt:
         log.info("Offline training interrupted by user at epoch/step %d/%d.",
@@ -360,11 +408,13 @@ def run_offline_training(
 
     # ── Final save ──────────────────────────────────────────────
     orchestrator.save_checkpoint("offline_final")
+    _total_wall = time.perf_counter() - _global_t0
     log.info("=" * 60)
-    log.info("Offline training complete.")
-    log.info("  Total teacher steps: %d", learner.step_count)
-    log.info("  Distillation rounds: %d", distill._distill_count)
-    log.info("  Checkpoint saved as 'offline_final'")
+    log.info("OFFLINE TRAINING COMPLETE")
+    log.info("  Total teacher steps : %d", learner.step_count)
+    log.info("  Distillation rounds : %d", distill._distill_count)
+    log.info("  Wall time           : %dm%02ds", int(_total_wall) // 60, int(_total_wall) % 60)
+    log.info("  Checkpoint saved as : 'offline_final'")
     log.info("=" * 60)
 
 
@@ -458,7 +508,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     lp_estimator = orchestrator.lp_estimator
 
     # ── UI Control Panel + Reward Toggles ───────────────────────
-    from baby_ai.ui.control_panel import AIControlPanel, get_imitation_enabled
+    from baby_ai.ui.control_panel import AIControlPanel, get_imitation_enabled, get_record_only
     from baby_ai.ui.reward_toggles import RewardToggleState
     from baby_ai.ui.controls_state import AIControlsState
     from baby_ai.ui.reward_weights import RewardWeightsState
@@ -566,6 +616,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     # Track whether imitation mode was active on the previous tick so
     # we can toggle the input guard exactly once on state transitions.
     _prev_imitation_active: bool = False
+    _prev_record_only_active: bool = False
 
     try:
         obs = env.reset()
@@ -589,6 +640,81 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
             if env._guard is not None and env._guard.ai_paused:
                 time.sleep(0.5)
                 continue
+
+            # ── Record-only mode ─────────────────────────────────
+            # When active: skip ALL inference and curiosity.  Only
+            # capture raw observations + player's actions + mod-event
+            # rewards.  Stored transitions are trainable offline later.
+            _record_only_active = get_record_only()
+
+            if _record_only_active and not _prev_record_only_active:
+                # Transition ON — unlock user input
+                if env._input is not None:
+                    env._input.release_all()
+                if env._guard is not None:
+                    env._guard._kb_blocked = False
+                    env._guard._mouse_blocked = False
+                    env._guard.clear_player_input()
+                env._prev_yaw = None
+                env._prev_pitch = None
+                prev_fused = None          # avoid stale graph refs
+                log.info("Record-Only ON -- AI disabled, recording player data only.")
+            elif not _record_only_active and _prev_record_only_active:
+                # Transition OFF — re-lock user input, reset refs
+                if env._guard is not None:
+                    env._guard._kb_blocked = True
+                    env._guard._mouse_blocked = True
+                    env._guard.clear_player_input()
+                prev_fused = None
+                log.info("Record-Only OFF -- resuming normal operation.")
+            _prev_record_only_active = _record_only_active
+
+            if _record_only_active:
+                # Lightweight recording path — no GPU inference at all.
+                # Use a zero placeholder for fused; the learner's
+                # forward pass will recompute from raw obs anyway.
+                _fused_dim = getattr(config.student, "hidden_dim", 512)
+                fused = torch.zeros(_fused_dim)
+
+                # Store transition from the PREVIOUS tick
+                if prev_fused is not None and prev_obs is not None and prev_action is not None:
+                    _action = prev_action.squeeze(0) if prev_action.dim() > 1 else prev_action
+                    transition = {
+                        "vision":     prev_obs["vision"].squeeze(0),
+                        "audio":      prev_obs["audio"].squeeze(0),
+                        "sensor":     prev_obs["sensor"].squeeze(0),
+                        "action":     _action,
+                        "reward":     torch.tensor(0.0),
+                        "fused":      prev_fused,
+                        "next_fused": fused.detach(),
+                        "is_demo":    torch.tensor(1.0),
+                    }
+                    _demo_boost = getattr(config.training, "demo_priority_boost", 5.0)
+                    orchestrator.add_experience(transition, priority=_demo_boost)
+
+                # Advance env — observation only, no AI action
+                obs, ext_reward, done, info = env.step(
+                    torch.zeros(23), observation_only=True,
+                )
+                episode_steps += 1
+
+                # Capture the player's physical input as a 23-dim tensor
+                if env._guard is not None:
+                    held_keys, held_buttons = env._guard.snapshot_player_input()
+                    dyaw, dpitch = env.get_look_delta()
+                    prev_action = player_input_to_continuous(
+                        held_keys, held_buttons, dyaw, dpitch,
+                    )
+                else:
+                    prev_action = torch.zeros(23)
+
+                prev_fused = fused
+                prev_obs = obs
+
+                control_panel.update_live_stats(
+                    reward=episode_reward, step=episode_steps,
+                )
+                continue  # skip normal inference + curiosity path
 
             # ── Imitation learning mode ──────────────────────────
             # When active: suppress AI outputs (noop), unblock user
@@ -636,6 +762,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                         _cur_next = _cur_next.unsqueeze(0)
                     if _cur_act.dim() == 1:
                         _cur_act = _cur_act.unsqueeze(0)  # (20,) → (1, 20)
+                    # Project Student fused (512) → Teacher state dim (1024)
+                    # so it matches the Teacher's LatentWorldModel input.
+                    if orchestrator.curiosity_proj is not None:
+                        _cur_state = orchestrator.curiosity_proj(_cur_state)
+                        _cur_next  = orchestrator.curiosity_proj(_cur_next)
                     cur_out = curiosity(_cur_state, _cur_next, _cur_act)
                 raw_ir = cur_out["curiosity_reward"].mean().item()
                 # Update Learning Progress Estimator — tracks whether the

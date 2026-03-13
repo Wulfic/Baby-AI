@@ -7,6 +7,7 @@ and anomaly tracking for reward signals and safety events.
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 import time
@@ -33,15 +34,19 @@ def get_logger(
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console
-    ch = logging.StreamHandler(sys.stdout)
+    # Console — wrap stdout in a UTF-8 stream so non-ASCII log
+    # messages never crash on Windows cp1252 consoles.
+    _utf8_out = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True,
+    )
+    ch = logging.StreamHandler(_utf8_out)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    # File
+    # File — explicit UTF-8 encoding for the same reason.
     if log_file:
         ensure_dirs()
-        fh = logging.FileHandler(LOG_DIR / log_file)
+        fh = logging.FileHandler(LOG_DIR / log_file, encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 

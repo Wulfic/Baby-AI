@@ -549,10 +549,10 @@ class PrioritizedReplayBuffer:
     def rebuild_from_disk(self, default_priority: float = 1.0) -> int:
         """Rebuild the SumTree and metadata from existing chunk files.
 
-        Scans every chunk file on disk, reads slot headers, and inserts
-        a uniform priority for each non-empty slot.  This makes the
-        buffer usable for offline training without first collecting new
-        data.
+        Scans every **existing** chunk file on disk, reads slot headers,
+        and inserts a uniform priority for each non-empty slot.  This
+        makes the buffer usable for offline training without first
+        collecting new data.
 
         Call this **once** after construction when you want to re-use
         replay data from a previous session (e.g. ``--offline`` mode).
@@ -568,31 +568,62 @@ class PrioritizedReplayBuffer:
         recovered = 0
         alpha_priority = max(default_priority, self.min_priority) ** self.alpha
 
+        # Discover which chunk files actually exist on disk so we only
+        # read those instead of probing all capacity/CHUNK_SIZE paths
+        # (which is extremely slow on network drives).
+        existing_chunks: list[int] = []
+        for f in self._store._dir.glob("chunk_*.bin"):
+            try:
+                chunk_id = int(f.stem.split("_")[1])
+                existing_chunks.append(chunk_id)
+            except (IndexError, ValueError):
+                continue
+        existing_chunks.sort()
+
+        log.info(
+            "rebuild_from_disk: found %d chunk files on disk, scanning...",
+            len(existing_chunks),
+        )
+
+        max_data_idx = 0
+
         with self._lock:
-            for data_idx in range(self.capacity):
-                blob = self._store.read(data_idx)
-                if blob is None or len(blob) == 0:
-                    continue
+            for chunk_id in existing_chunks:
+                # Read the chunk header to find populated slots
+                header = self._store._read_header(chunk_id)
+                base_idx = chunk_id * CHUNK_SIZE
+                chunk_recovered = 0
 
-                tree_idx = data_idx + self.tree.capacity
-                self.tree.update(tree_idx, alpha_priority)
-                self.tree.n_entries = min(
-                    self.tree.n_entries + 1, self.capacity,
-                )
-                # Track the data pointer so new add() calls don't
-                # overwrite recovered transitions prematurely.
-                self.tree.data_pointer = max(
-                    self.tree.data_pointer, data_idx + 1,
-                )
-                if self.tree.data_pointer >= self.capacity:
-                    self.tree.data_pointer = 0
+                for slot, (off, ln) in enumerate(header):
+                    if ln == 0:
+                        continue  # empty slot
 
-                self._meta[data_idx] = {}
-                # Assign sequential episode ids (conservative:
-                # every transition gets its own episode so
-                # sample_sequence still works, just short seqs).
-                self._episode_ids[data_idx] = data_idx
-                recovered += 1
+                    data_idx = base_idx + slot
+                    if data_idx >= self.capacity:
+                        break
+
+                    tree_idx = data_idx + self.tree.capacity
+                    self.tree.update(tree_idx, alpha_priority)
+                    self.tree.n_entries = min(
+                        self.tree.n_entries + 1, self.capacity,
+                    )
+                    if data_idx >= max_data_idx:
+                        max_data_idx = data_idx + 1
+
+                    self._meta[data_idx] = {}
+                    self._episode_ids[data_idx] = data_idx
+                    recovered += 1
+                    chunk_recovered += 1
+
+                if chunk_recovered > 0:
+                    log.info(
+                        "  chunk_%04d: %d transitions recovered",
+                        chunk_id, chunk_recovered,
+                    )
+
+            # Set data_pointer past the highest recovered index so new
+            # add() calls don't overwrite recovered data prematurely.
+            self.tree.data_pointer = max_data_idx % self.capacity
 
             # Assign contiguous episode ids in index order so that
             # neighbouring slots are likely from the same episode.

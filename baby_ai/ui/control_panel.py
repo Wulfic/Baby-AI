@@ -85,6 +85,27 @@ def set_imitation_enabled(value: bool) -> None:
         _imitation_enabled = value
 
 
+# ── Thread-safe record-only mode toggle ──────────────────────
+# When active: AI inference is skipped, user controls are fully
+# unlocked, and only replay data is recorded.  Training threads
+# are paused so the GPU is free and latency is minimal.
+_record_only: bool = False
+_record_only_lock = threading.Lock()
+
+
+def get_record_only() -> bool:
+    """Return whether record-only mode is active (thread-safe)."""
+    with _record_only_lock:
+        return _record_only
+
+
+def set_record_only(value: bool) -> None:
+    """Enable or disable record-only mode from the GUI (thread-safe)."""
+    global _record_only
+    with _record_only_lock:
+        _record_only = value
+
+
 # Theme constants and DPI helper are now imported from baby_ai.ui.theme.
 
 
@@ -196,6 +217,9 @@ class AIControlPanel:
 
         # tk variable for imitation learning toggle
         self._imit_var: Optional[tk.BooleanVar] = None
+
+        # tk variable for record-only mode toggle
+        self._record_only_var: Optional[tk.BooleanVar] = None
 
         # Home waypoint coordinate labels (updated when home changes)
         self._home_x_label: Optional[tk.Label] = None
@@ -644,6 +668,33 @@ class AIControlPanel:
             bd=0, highlightthickness=0,
         )
         imit_cb.pack(fill=tk.X, padx=(int(12 * s), 0))
+
+        # ── Record-Only mode toggle ────────────────────────────
+        saved_rec = self._store.get("record_only")
+        rec_default = bool(saved_rec) if saved_rec is not None else False
+        set_record_only(rec_default)
+
+        self._record_only_var = tk.BooleanVar(value=rec_default)
+
+        def _on_record_only_toggle() -> None:
+            enabled = self._record_only_var.get()
+            set_record_only(enabled)
+            self._store.set("record_only", enabled)
+
+        rec_cb = tk.Checkbutton(
+            imit_frame,
+            text="Record Only (save replay data, no AI)",
+            variable=self._record_only_var,
+            command=_on_record_only_toggle,
+            bg=_BG_GROUP, fg=_FG,
+            selectcolor=_BG_FRAME,
+            activebackground=_BG_GROUP,
+            activeforeground=_ACCENT,
+            font=("Segoe UI", int(9 * s)),
+            anchor="w",
+            bd=0, highlightthickness=0,
+        )
+        rec_cb.pack(fill=tk.X, padx=(int(12 * s), 0))
 
         # ── Learning Rate slider ───────────────────────────────
         lr_frame = tk.Frame(parent, bg=_BG_GROUP,

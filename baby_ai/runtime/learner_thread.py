@@ -279,11 +279,18 @@ class LearnerThread:
         ]
         self.replay.update_priorities(indices, new_priorities)
 
-        # Periodic consolidation — recompute Fisher then apply EWC penalty
+        # Periodic consolidation -- recompute Fisher Information so the
+        # EWC penalty (which is already part of _compute_loss every step)
+        # actually protects important weights.
         if self._step > 0 and self._step % self.config.consolidation_every_n_steps == 0:
-            # Recompute Fisher Information from recent replay data so the
-            # EWC penalty actually protects important weights.  Previously
-            # compute_fisher was never called, making EWC a no-op.
+            # Save & restore GradScaler state so that Fisher computation
+            # (which runs its own forward/backward passes) cannot corrupt
+            # the scaler's internal bookkeeping and cause "backward through
+            # the graph a second time" on the next training step.
+            _scaler_snapshot = (
+                self.scaler.state_dict() if self.scaler is not None else None
+            )
+
             try:
                 fisher_loader = self._make_fisher_loader(num_samples=200)
                 self.consolidator.update_fisher(
@@ -292,14 +299,37 @@ class LearnerThread:
                 )
                 log.info("Fisher Information recomputed at step %d.", self._step)
             except Exception as e:
-                log.warning("Fisher computation failed at step %d: %s", self._step, e)
+                log.warning("Fisher computation failed at step %d: %s",
+                            self._step, e, exc_info=True)
+            finally:
+                # ── Unconditional cleanup after Fisher computation ──
+                # 1. Force-restore training mode.  compute_fisher() sets
+                #    model.eval(); if it throws before model.train(), the
+                #    MoE aux_loss guard ("if self.training") will skip
+                #    updates on subsequent steps, leaving a stale tensor
+                #    whose graph was already freed → double-backward.
+                self.teacher.train()
 
-            ewc_loss = self.consolidator.consolidation_loss(self.teacher)
-            if ewc_loss.item() > 0:
-                ewc_loss.backward()
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            log.info("Consolidation at step %d, EWC loss: %.4f", self._step, ewc_loss.item())
+                # 2. Clear MoE _aux_loss cache.  Even if model.train() is
+                #    restored, a Fisher eval-mode forward wouldn't have
+                #    overwritten _aux_loss.  The stale tensor still holds
+                #    a reference to a freed computation graph.
+                for m in self.teacher.modules():
+                    if hasattr(m, '_aux_loss'):
+                        m._aux_loss = None
+
+            # Restore scaler to a known-good state and wipe gradients
+            # so the next _train_step starts completely clean.
+            if self.scaler is not None and _scaler_snapshot is not None:
+                self.scaler.load_state_dict(_scaler_snapshot)
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # Log the current EWC penalty (under no_grad -- we only need
+            # the scalar value, not a computation graph).
+            with torch.no_grad():
+                ewc_snapshot = self.consolidator.consolidation_loss(self.teacher)
+            log.info("Consolidation at step %d, EWC loss snapshot: %.4f",
+                     self._step, ewc_snapshot.item())
 
         self._step += 1
 
