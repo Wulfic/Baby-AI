@@ -91,6 +91,15 @@ class DistillThread:
 
     def _loop(self) -> None:
         while self._running:
+            # Pause distillation while record-only mode is active.
+            try:
+                from baby_ai.ui.control_panel import get_record_only
+                if get_record_only():
+                    self._stop_event.wait(timeout=1.0)
+                    continue
+            except ImportError:
+                pass
+
             # Event-driven: wait until signalled or timeout (fallback poll)
             self._distill_ready.wait(timeout=2.0)
             self._distill_ready.clear()

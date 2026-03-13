@@ -175,6 +175,15 @@ class LearnerThread:
     def _loop(self) -> None:
         """Main training loop (event-driven)."""
         while self._running:
+            # Pause training while record-only mode is active.
+            try:
+                from baby_ai.ui.control_panel import get_record_only
+                if get_record_only():
+                    self._stop_event.wait(timeout=1.0)
+                    continue
+            except ImportError:
+                pass
+
             # Wait until we have enough transitions
             if self.replay.size < self.config.micro_batch_size * 2:
                 # Block until signalled (with timeout so we can check _running)
