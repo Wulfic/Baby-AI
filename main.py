@@ -56,6 +56,13 @@ def parse_args() -> argparse.Namespace:
                         help="Offline training: replay existing imitation data for multiple epochs (no Minecraft).")
     parser.add_argument("--epochs", type=int, default=10,
                         help="Number of epochs for --offline training (default: 10).")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Use all matching GPUs for --offline training. "
+                             "Each GPU trains independently, then checkpoints are averaged.")
+    parser.add_argument("--gpu-rank", type=int, default=None,
+                        help=argparse.SUPPRESS)  # internal: set by multi-gpu spawner
+    parser.add_argument("--gpu-total", type=int, default=None,
+                        help=argparse.SUPPRESS)  # internal: set by multi-gpu spawner
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from checkpoint.")
     return parser.parse_args()
 
@@ -210,6 +217,8 @@ def run_offline_training(
     config: BabyAIConfig,
     checkpoint_path: str | None = None,
     epochs: int = 10,
+    gpu_rank: int | None = None,
+    gpu_total: int | None = None,
 ) -> None:
     """Train the Teacher and Student offline on existing replay data.
 
@@ -227,12 +236,21 @@ def run_offline_training(
         python main.py --offline                   # 10 epochs (default)
         python main.py --offline --epochs 50       # 50 epochs
         python main.py --offline --checkpoint latest  # resume + fine-tune
+        python main.py --offline --epochs 10 --multi-gpu  # split across GPUs
+
+    When ``gpu_rank`` is set (via ``--multi-gpu``), the final
+    checkpoint is saved as ``offline_final_gpu{rank}`` instead of
+    ``offline_final`` so the parent process can average them.
 
     Because the GPU never has to wait for Minecraft frames or input
     latency, training is **10-50× faster** than online mode.
     """
     log.info("=" * 60)
-    log.info("OFFLINE TRAINING MODE  (%d epochs)", epochs)
+    if gpu_rank is not None:
+        log.info("OFFLINE TRAINING MODE  (%d epochs)  [GPU worker %d / %d]",
+                 epochs, gpu_rank, gpu_total or 0)
+    else:
+        log.info("OFFLINE TRAINING MODE  (%d epochs)", epochs)
     log.info("=" * 60)
 
     ensure_dirs()
@@ -260,6 +278,15 @@ def run_offline_training(
             "with --minecraft first to collect imitation data."
         )
         return
+
+    # ── Enable sequential (temporal) sampling ───────────────────
+    # Rolling prefetch: the sequential sampler automatically keeps
+    # the current + next 2 chunks (~1 500 transitions, ~500 MB) in
+    # RAM and evicts consumed chunks.  No bulk preload needed.
+    # Transitions are replayed in the order they were recorded,
+    # preserving temporal coherence for the Jamba temporal core
+    # and JEPA world model.
+    orchestrator.replay.enable_sequential_mode()
 
     replay_size = orchestrator.replay.size
     batch_size = config.training.micro_batch_size
@@ -297,14 +324,17 @@ def run_offline_training(
             epoch_steps = 0
             _epoch_t0 = time.perf_counter()
 
+            # Reset sequential cursor so we iterate the full dataset
+            # from the beginning each epoch.
+            orchestrator.replay.reset_sequential()
+
             log.info("=" * 60)
             log.info("EPOCH %d / %d  (teacher_step=%d)", epoch, epochs, learner.step_count)
             log.info("=" * 60)
 
-            for step_i in range(steps_per_epoch):
-                if orchestrator.replay.size < batch_size:
-                    log.warning("Replay buffer smaller than batch (%d < %d) -- stopping epoch.",
-                                orchestrator.replay.size, batch_size)
+            while not orchestrator.replay.sequential_exhausted:
+                if orchestrator.replay.sequential_remaining < batch_size:
+                    # Not enough transitions left for a full batch — end epoch.
                     break
 
                 _step_t0 = time.perf_counter()
@@ -407,14 +437,20 @@ def run_offline_training(
                  epoch, total_steps)
 
     # ── Final save ──────────────────────────────────────────────
-    orchestrator.save_checkpoint("offline_final")
+    # When running as a multi-GPU worker, save with a per-GPU tag
+    # so the parent process can find and average all of them.
+    final_tag = f"offline_final_gpu{gpu_rank}" if gpu_rank is not None else "offline_final"
+    orchestrator.save_checkpoint(final_tag)
     _total_wall = time.perf_counter() - _global_t0
     log.info("=" * 60)
-    log.info("OFFLINE TRAINING COMPLETE")
+    if gpu_rank is not None:
+        log.info("OFFLINE TRAINING COMPLETE  (GPU worker %d / %d)", gpu_rank, gpu_total or 0)
+    else:
+        log.info("OFFLINE TRAINING COMPLETE")
     log.info("  Total teacher steps : %d", learner.step_count)
     log.info("  Distillation rounds : %d", distill._distill_count)
     log.info("  Wall time           : %dm%02ds", int(_total_wall) // 60, int(_total_wall) % 60)
-    log.info("  Checkpoint saved as : 'offline_final'")
+    log.info("  Checkpoint saved as : '%s'", final_tag)
     log.info("=" * 60)
 
 
@@ -1020,7 +1056,23 @@ def main() -> None:
         return
 
     if args.offline:
-        run_offline_training(config, args.checkpoint, epochs=args.epochs)
+        # ── Multi-GPU: spawn parallel workers + merge ────────
+        if args.multi_gpu and args.gpu_rank is None:
+            from baby_ai.utils.multigpu import run_multi_gpu_offline
+            run_multi_gpu_offline(
+                epochs=args.epochs,
+                checkpoint_path=args.checkpoint,
+                config_path=args.config,
+            )
+            return
+        # ── Single-GPU (or a spawned multi-gpu worker) ──────
+        run_offline_training(
+            config,
+            args.checkpoint,
+            epochs=args.epochs,
+            gpu_rank=args.gpu_rank,
+            gpu_total=args.gpu_total,
+        )
         return
 
     # --- Full continuous learning mode ---

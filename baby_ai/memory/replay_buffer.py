@@ -125,6 +125,10 @@ class _ChunkStore:
         self._blob_cache: OrderedDict[int, bytes] = OrderedDict()
         self._CACHE_MAX = 256
 
+        # Track which chunks are fully loaded into the blob cache
+        # so ensure_chunks() can skip re-reads and evict old ones.
+        self._loaded_chunks: set[int] = set()
+
         # Scan existing files to get disk usage
         for f in self._dir.glob("chunk_*.bin"):
             self._disk_bytes += f.stat().st_size
@@ -269,6 +273,74 @@ class _ChunkStore:
         self._disk_bytes = 0
         self._blob_cache.clear()
 
+    def load_chunk(self, chunk_id: int) -> int:
+        """Load all blobs from one chunk file into the blob cache.
+
+        Reads the chunk file **once** (a single sequential I/O
+        operation) and inserts every non-empty slot into
+        ``_blob_cache``.  If the chunk is already loaded this is a
+        no-op.
+
+        Returns:
+            Number of blobs loaded (0 if already cached or missing).
+        """
+        if chunk_id in self._loaded_chunks:
+            return 0
+
+        path = self._chunk_path(chunk_id)
+        if not path.exists():
+            return 0
+
+        header = self._read_header(chunk_id)
+        header_sz = self._header_size()
+
+        # Read the entire blob region in one I/O operation
+        with open(path, "rb") as f:
+            f.seek(header_sz)
+            blob_region = f.read()
+
+        base_idx = chunk_id * CHUNK_SIZE
+        loaded = 0
+        for slot, (off, ln) in enumerate(header):
+            if ln == 0:
+                continue
+            data_idx = base_idx + slot
+            self._blob_cache[data_idx] = blob_region[off : off + ln]
+            loaded += 1
+
+        self._loaded_chunks.add(chunk_id)
+        return loaded
+
+    def evict_chunk(self, chunk_id: int) -> None:
+        """Remove all cached blobs belonging to *chunk_id*."""
+        if chunk_id not in self._loaded_chunks:
+            return
+        base = chunk_id * CHUNK_SIZE
+        for idx in range(base, base + CHUNK_SIZE):
+            self._blob_cache.pop(idx, None)
+        self._loaded_chunks.discard(chunk_id)
+
+    def ensure_chunks(self, needed: set[int]) -> None:
+        """Load *needed* chunk IDs and evict all others.
+
+        This is the main entry-point used by the sequential sampler
+        to keep a rolling prefetch window of a few chunks in RAM
+        while discarding chunks that have already been consumed.
+        """
+        # Evict chunks no longer needed
+        for cid in list(self._loaded_chunks - needed):
+            self.evict_chunk(cid)
+
+        # Load new chunks
+        for cid in sorted(needed - self._loaded_chunks):
+            loaded = self.load_chunk(cid)
+            if loaded > 0:
+                log.info("Prefetched chunk_%04d (%d blobs)", cid, loaded)
+
+        # Keep CACHE_MAX large enough so LRU eviction never
+        # kicks out prefetched blobs during normal reads.
+        self._CACHE_MAX = max(len(self._blob_cache) + CHUNK_SIZE, self._CACHE_MAX)
+
     @property
     def disk_bytes(self) -> int:
         return self._disk_bytes
@@ -332,6 +404,11 @@ class PrioritizedReplayBuffer:
         self._lock = threading.Lock()
         self._step = 0
 
+        # ── Sequential-mode state (for offline training) ────────
+        self._sequential_mode: bool = False
+        self._seq_cursor: int = 0
+        self._seq_indices: list[int] = []  # populated indices in order
+
     @property
     def size(self) -> int:
         return self.tree.n_entries
@@ -341,6 +418,103 @@ class PrioritizedReplayBuffer:
         """Annealed importance-sampling exponent."""
         frac = min(1.0, self._step / max(1, self.beta_anneal_steps))
         return self.beta_start + frac * (self.beta_end - self.beta_start)
+
+    # ── Sequential mode (offline training) ──────────────────────
+
+    def enable_sequential_mode(self) -> None:
+        """Switch ``sample()`` to return transitions in temporal order.
+
+        Builds an ordered index of all populated slots so each call to
+        ``sample(batch_size)`` yields the *next* batch in data-index
+        order (i.e. the order transitions were originally recorded).
+        This preserves temporal coherence for Jamba/JEPA models.
+
+        Call :meth:`reset_sequential` at the start of each epoch.
+        """
+        with self._lock:
+            self._seq_indices = [
+                i for i in range(self.capacity) if self._meta[i] is not None
+            ]
+            self._seq_cursor = 0
+            self._sequential_mode = True
+        log.info(
+            "Sequential mode enabled — %d transitions in temporal order.",
+            len(self._seq_indices),
+        )
+
+    def disable_sequential_mode(self) -> None:
+        """Revert ``sample()`` to prioritized random sampling."""
+        self._sequential_mode = False
+        self._seq_cursor = 0
+        self._seq_indices = []
+
+    def reset_sequential(self) -> None:
+        """Reset the sequential cursor to the beginning (new epoch)."""
+        self._seq_cursor = 0
+
+    @property
+    def sequential_exhausted(self) -> bool:
+        """True when the sequential cursor has reached the end."""
+        return self._seq_cursor >= len(self._seq_indices)
+
+    @property
+    def sequential_remaining(self) -> int:
+        """Number of transitions left in the current sequential pass."""
+        return max(0, len(self._seq_indices) - self._seq_cursor)
+
+    _PREFETCH_AHEAD: int = 3  # number of chunks to keep loaded ahead
+
+    def _prefetch_sequential(self) -> None:
+        """Ensure the current and next few chunks are in memory.
+
+        Looks at upcoming indices (up to ``_PREFETCH_AHEAD`` chunks
+        worth) and calls :meth:`_ChunkStore.ensure_chunks` so only
+        a small rolling window of data lives in RAM at any time.
+        Chunks that the cursor has passed are evicted automatically.
+        """
+        if not self._seq_indices:
+            return
+        lookahead_end = min(
+            self._seq_cursor + self._PREFETCH_AHEAD * CHUNK_SIZE,
+            len(self._seq_indices),
+        )
+        upcoming = self._seq_indices[self._seq_cursor : lookahead_end]
+        if not upcoming:
+            return
+        needed: set[int] = {idx // CHUNK_SIZE for idx in upcoming}
+        self._store.ensure_chunks(needed)
+
+    def _sample_sequential(
+        self, batch_size: int, device: str = "cpu",
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, List[int]]:
+        """Return the next *batch_size* transitions in index order.
+
+        Weights are uniform (1.0) — importance sampling is irrelevant
+        for ordered full-pass training.
+        """
+        # Rolling prefetch: load upcoming chunks, evict consumed ones
+        self._prefetch_sequential()
+
+        transitions: List[Dict[str, Any]] = []
+        indices: List[int] = []
+
+        with self._lock:
+            while len(transitions) < batch_size and self._seq_cursor < len(self._seq_indices):
+                data_idx = self._seq_indices[self._seq_cursor]
+                self._seq_cursor += 1
+
+                blob = self._store.read(data_idx)
+                if blob is None:
+                    continue
+
+                trans = decompress_transition(
+                    blob, method=self.compression, device=device,
+                )
+                transitions.append(trans)
+                indices.append(data_idx + self.tree.capacity)
+
+        weights = np.ones(len(transitions), dtype=np.float32)
+        return transitions, weights, indices
 
     def add(
         self,
@@ -398,11 +572,19 @@ class PrioritizedReplayBuffer:
         """
         Sample a prioritized minibatch.
 
+        If sequential mode is enabled (see :meth:`enable_sequential_mode`),
+        returns the next ``batch_size`` transitions in temporal order
+        instead of random prioritized sampling.
+
         Returns:
             transitions: List of decompressed transition dicts.
             weights: (batch_size,) importance-sampling weights.
             indices: List of tree indices (for priority updates).
         """
+        # ── Sequential mode: delegate to temporal-order sampler ──
+        if self._sequential_mode:
+            return self._sample_sequential(batch_size, device)
+
         if self.size < batch_size:
             raise ValueError(f"Buffer has {self.size} items, need {batch_size}")
 
