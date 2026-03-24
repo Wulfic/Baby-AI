@@ -99,6 +99,9 @@ class LearnerThread:
 
         # No warmup scheduler — constant LR controlled by the GUI.
         # The live LR is read from the control panel each optimizer step.
+        # For offline training, enable_cosine_schedule() adds a proper
+        # warmup + cosine decay schedule.
+        self._lr_scheduler = None
 
         # AMP scaler
         self.scaler = torch.amp.GradScaler("cuda") if self.config.use_amp else None
@@ -262,20 +265,24 @@ class LearnerThread:
             else:
                 self.optimizer.step()
 
-            # ── Sync learning rate from GUI ───────────────────────
-            # The GUI provides a single LR value.  To preserve the
-            # per-group LR ratios (encoder_lr : core_lr : policy_lr),
-            # scale each group proportionally rather than overwriting
-            # all groups with the same flat value.
-            try:
-                from baby_ai.ui.control_panel import get_live_lr
-                gui_lr = get_live_lr()
-                base_lr = self.config.core_lr or 1e-4
-                scale = gui_lr / base_lr
-                for pg in self.optimizer.param_groups:
-                    pg["lr"] = pg.get("initial_lr", base_lr) * scale
-            except Exception:
-                pass  # GUI not available yet
+            # ── Sync learning rate ─────────────────────────────────
+            if self._lr_scheduler is not None:
+                # Offline mode: use the cosine schedule.
+                self._lr_scheduler.step()
+            else:
+                # Online mode: sync LR from GUI slider.
+                # The GUI provides a single LR value.  To preserve the
+                # per-group LR ratios (encoder_lr : core_lr : policy_lr),
+                # scale each group proportionally.
+                try:
+                    from baby_ai.ui.control_panel import get_live_lr
+                    gui_lr = get_live_lr()
+                    base_lr = self.config.core_lr or 1e-4
+                    scale = gui_lr / base_lr
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = pg.get("initial_lr", base_lr) * scale
+                except Exception:
+                    pass  # GUI not available yet
 
             self.optimizer.zero_grad()
             self._accum_count = 0
@@ -504,6 +511,52 @@ class LearnerThread:
             policy=self.teacher.policy,
         )
         return rebel_loss
+
+    def enable_cosine_schedule(
+        self,
+        total_steps: int,
+        warmup_steps: int = 500,
+        peak_lr_mult: float = 6.0,
+        eta_min_mult: float = 0.1,
+    ) -> None:
+        """Enable cosine-annealing LR schedule for offline training.
+
+        Ramps LR from 10% → peak over ``warmup_steps``, then decays
+        via cosine annealing to ``eta_min_mult * base_lr``.
+
+        Args:
+            total_steps: Total optimizer steps expected (epochs * steps_per_epoch).
+            warmup_steps: Linear warmup phase length.
+            peak_lr_mult: Multiplier on the configured LR for peak value.
+            eta_min_mult: Fraction of peak LR for the cosine floor.
+        """
+        # Scale each param group's LR up to the peak
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = pg["initial_lr"] * peak_lr_mult
+            pg["initial_lr"] = pg["lr"]  # cosine scheduler reads initial_lr
+
+        self._lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=0.1,
+                    total_iters=warmup_steps,
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=max(total_steps - warmup_steps, 1),
+                    eta_min=pg["lr"] * eta_min_mult,
+                ),
+            ],
+            milestones=[warmup_steps],
+        )
+        log.info(
+            "Cosine LR schedule enabled: warmup=%d, total=%d, peak_mult=%.1f, "
+            "peak_lrs=%s",
+            warmup_steps, total_steps, peak_lr_mult,
+            [f"{pg['lr']:.2e}" for pg in self.optimizer.param_groups],
+        )
 
     def _collate_transitions(self, transitions: list[dict]) -> dict:
         """Collate a list of transition dicts into batched tensors."""

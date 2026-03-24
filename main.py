@@ -327,6 +327,15 @@ def run_offline_training(
     orchestrator.teacher.to(device).train()
     orchestrator.student.to(device)
 
+    # ── Cosine LR schedule for offline training ─────────────────
+    total_train_steps = steps_per_epoch * epochs
+    learner.enable_cosine_schedule(
+        total_steps=total_train_steps,
+        warmup_steps=min(500, total_train_steps // 10),
+        peak_lr_mult=6.0,
+        eta_min_mult=0.1,
+    )
+
     # ── Verbose progress helpers ────────────────────────────────
     _LOG_EVERY = 10          # print a progress line every N steps
     _epoch_t0 = time.perf_counter()
