@@ -95,6 +95,11 @@ class ModBridge:
         self._heartbeat_tick: int = 0
         self._total_events: int = 0
 
+        # Pause/resume acknowledgment events — set by the reader
+        # thread when the mod confirms the freeze/unfreeze.
+        self._pause_ack = threading.Event()
+        self._resume_ack = threading.Event()
+
     # ── Properties ──────────────────────────────────────────────
 
     @property
@@ -183,6 +188,44 @@ class ModBridge:
             log.warning("send_command failed: %s", exc)
             return False
 
+    def send_pause(self, paused: bool, reason: str = "", timeout: float = 0.5) -> bool:
+        """Send a pause/resume command and wait for mod acknowledgment.
+
+        The mod sends back a ``pause_ack`` or ``resume_ack`` event once
+        the server thread has actually applied ``setFrozen()``.  This
+        replaces the old fixed-sleep approach and guarantees the game is
+        frozen before the agent starts planning.
+
+        Args:
+            paused:  True to freeze, False to resume.
+            reason:  Human-readable reason string for logging.
+            timeout: Max seconds to wait for the ack.
+
+        Returns:
+            True if the mod confirmed the state change, False on timeout
+            or send failure.
+        """
+        ack_event = self._pause_ack if paused else self._resume_ack
+        ack_event.clear()
+
+        cmd_name = "pause" if paused else "resume"
+        success = self.send_command({"command": cmd_name, "reason": reason})
+        if not success:
+            log.warning("send_pause(%s): send failed (not connected)", cmd_name)
+            return False
+
+        acked = ack_event.wait(timeout=timeout)
+        if not acked:
+            log.warning(
+                "send_pause(%s): no ack from mod within %.1fs — "
+                "game may not be %s",
+                cmd_name, timeout, "frozen" if paused else "resumed",
+            )
+        else:
+            log.info("Game %s confirmed by mod (reason=%s)",
+                     "FROZEN" if paused else "RESUMED", reason)
+        return acked
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run(self) -> None:
@@ -243,6 +286,17 @@ class ModBridge:
                             log.debug("Heartbeat tick=%d clients=%d",
                                       self._heartbeat_tick,
                                       event.get("clients", 0))
+                        elif evt_type == "pause_ack":
+                            # Mod confirmed the freeze — wake the
+                            # inference thread waiting in send_pause().
+                            self._pause_ack.set()
+                            log.debug("Received pause_ack (frozen=%s)",
+                                      event.get("frozen"))
+                        elif evt_type == "resume_ack":
+                            # Mod confirmed the unfreeze.
+                            self._resume_ack.set()
+                            log.debug("Received resume_ack (frozen=%s)",
+                                      event.get("frozen"))
                         else:
                             self._events.append(event)
                             self._total_events += 1

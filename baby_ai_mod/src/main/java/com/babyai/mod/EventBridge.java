@@ -400,7 +400,7 @@ public class EventBridge {
                 if (line.isEmpty()) continue;
                 try {
                     JsonObject cmd = JsonParser.parseString(line).getAsJsonObject();
-                    handleCommand(cmd);
+                    handleCommand(cmd, writer);
                 } catch (Exception e) {
                     LOGGER.warn("Bad command JSON: {}", line);
                 }
@@ -417,25 +417,43 @@ public class EventBridge {
     /**
      * Dispatch a command received from the Python agent.
      *
+     * <p>After the server thread applies a freeze/resume, an acknowledgment
+     * event ({@code pause_ack} / {@code resume_ack}) is sent back to the
+     * requesting client so it can wait for confirmation rather than relying
+     * on a fixed sleep timer.
+     *
      * <p>Supported commands:
      * <ul>
-     *   <li>{@code {"command":"pause"}}   — freeze game ticks (System 2 thinking)</li>
+     *   <li>{@code {"command":"pause"}}   — freeze game ticks (System 2/3 thinking)</li>
      *   <li>{@code {"command":"resume"}}  — resume game ticks</li>
      * </ul>
      */
-    private void handleCommand(JsonObject cmd) {
+    private void handleCommand(JsonObject cmd, PrintWriter clientWriter) {
         String action = cmd.has("command") ? cmd.get("command").getAsString() : "";
-        LOGGER.info("[Baby-AI] Received command: {}", action);
+        String reason = cmd.has("reason") ? cmd.get("reason").getAsString() : "";
+        LOGGER.info("[Baby-AI] Received command: {} (reason: {})", action, reason);
         switch (action) {
             case "pause" -> {
                 MinecraftServer server = serverRef.get();
                 if (server != null) {
                     server.execute(() -> {
                         server.getTickManager().setFrozen(true);
-                        LOGGER.info("[Baby-AI] Game FROZEN (System 2 planning)");
+                        LOGGER.info("[Baby-AI] Game FROZEN ({})", reason);
+                        // Acknowledge back to the Python client so it knows
+                        // the freeze is in effect before it starts planning.
+                        JsonObject ack = new JsonObject();
+                        ack.addProperty("event", "pause_ack");
+                        ack.addProperty("frozen", true);
+                        ack.addProperty("reason", reason);
+                        clientWriter.println(ack.toString());
                     });
                 } else {
                     LOGGER.warn("[Baby-AI] Cannot pause — serverRef is null (server not started?)");
+                    JsonObject ack = new JsonObject();
+                    ack.addProperty("event", "pause_ack");
+                    ack.addProperty("frozen", false);
+                    ack.addProperty("error", "server_not_available");
+                    clientWriter.println(ack.toString());
                 }
             }
             case "resume" -> {
@@ -443,10 +461,20 @@ public class EventBridge {
                 if (server != null) {
                     server.execute(() -> {
                         server.getTickManager().setFrozen(false);
-                        LOGGER.info("[Baby-AI] Game RESUMED");
+                        LOGGER.info("[Baby-AI] Game RESUMED ({})", reason);
+                        JsonObject ack = new JsonObject();
+                        ack.addProperty("event", "resume_ack");
+                        ack.addProperty("frozen", false);
+                        ack.addProperty("reason", reason);
+                        clientWriter.println(ack.toString());
                     });
                 } else {
                     LOGGER.warn("[Baby-AI] Cannot resume — serverRef is null");
+                    JsonObject ack = new JsonObject();
+                    ack.addProperty("event", "resume_ack");
+                    ack.addProperty("frozen", true);
+                    ack.addProperty("error", "server_not_available");
+                    clientWriter.println(ack.toString());
                 }
             }
             default -> LOGGER.warn("[Baby-AI] Unknown command: {}", action);

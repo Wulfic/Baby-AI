@@ -200,6 +200,15 @@ class LearnerThread:
                 self._train_step()
             except Exception as e:
                 log.error("Learner error at step %d: %s", self._step, e, exc_info=True)
+                # Free memory after OOM or allocation failures.
+                # torch.cuda.empty_cache() releases cached blocks and
+                # gc.collect() frees Python-side dead objects that hold
+                # tensor references (e.g. stale closures, exception
+                # tracebacks holding onto frame locals).
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                self._step += 1  # always advance to avoid infinite retry loops
                 self._stop_event.wait(timeout=1.0)
 
             # Yield to other threads (short, bounded sleep)
@@ -253,16 +262,42 @@ class LearnerThread:
             # Gradient clipping — essential for RL stability.
             # Without this, rare reward spikes create enormous
             # gradients that destabilise all model weights.
+            # Clip gradients and perform optimizer step.  Use a guarded
+            # path for AMP's GradScaler so that `update()` is always
+            # called even if `step()` raises, preventing repeated
+            # `unscale_()` errors on subsequent iterations.
             if self.scaler is not None:
-                self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.teacher.parameters(), max_norm=1.0
-            )
-            if self.scaler is not None:
-                scale_before = self.scaler.get_scale()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                _step_ok = False
+                try:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.teacher.parameters(), max_norm=1.0
+                    )
+                    try:
+                        self.scaler.step(self.optimizer)
+                        _step_ok = True
+                    except Exception as e:
+                        log.error("GradScaler.step failed at learner step %d: %s", self._step, e)
+                except RuntimeError as e:
+                    log.error("GradScaler.unscale_ failed at learner step %d: %s", self._step, e)
+                finally:
+                    try:
+                        self.scaler.update()
+                    except Exception as e:
+                        log.error("GradScaler.update failed at learner step %d: %s", self._step, e)
+                    if not _step_ok:
+                        # The scaler is in a corrupt state (e.g. device
+                        # mismatch or double-unscale).  Replace it with a
+                        # fresh one so the next step starts clean instead
+                        # of entering an infinite "unscale_() already called"
+                        # error loop.
+                        log.warning("Resetting GradScaler after failure at step %d", self._step)
+                        self.scaler = torch.amp.GradScaler("cuda")
+                        self.optimizer.zero_grad(set_to_none=True)
             else:
+                torch.nn.utils.clip_grad_norm_(
+                    self.teacher.parameters(), max_norm=1.0
+                )
                 self.optimizer.step()
 
             # ── Sync learning rate ─────────────────────────────────
@@ -559,7 +594,12 @@ class LearnerThread:
         )
 
     def _collate_transitions(self, transitions: list[dict]) -> dict:
-        """Collate a list of transition dicts into batched tensors."""
+        """Collate a list of transition dicts into batched tensors.
+
+        For tensor-valued keys, only transitions whose tensors match
+        the shape of the first transition's tensor are included.  This
+        prevents ``torch.stack`` from failing on variable-shape data.
+        """
         batch = {}
         if not transitions:
             return batch
@@ -570,11 +610,17 @@ class LearnerThread:
             if not values:
                 continue
             if isinstance(values[0], torch.Tensor):
+                # Filter to consistent shapes before stacking.
+                ref_shape = values[0].shape
+                consistent = [v for v in values if v.shape == ref_shape]
+                if len(consistent) < max(len(values) // 2, 1):
+                    log.debug("Skipping key '%s' in collate: only %d/%d tensors "
+                              "match reference shape %s",
+                              key, len(consistent), len(values), ref_shape)
+                    continue
                 try:
-                    batch[key] = torch.stack(values).to(self.device)
+                    batch[key] = torch.stack(consistent).to(self.device)
                 except RuntimeError as e:
-                    # Variable-size tensors can't be stacked — skip the key
-                    # but log it so shape mismatches are visible.
                     log.debug("Skipping key '%s' in collate: %s", key, e)
             elif isinstance(values[0], (int, float)):
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)

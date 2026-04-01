@@ -462,7 +462,9 @@ class MoELayer(nn.Module):
     def aux_loss(self) -> torch.Tensor:
         """Load-balancing loss from the most recent forward pass."""
         if self._aux_loss is None:
-            return torch.tensor(0.0)
+            # Return a zero on the same device as the router weights
+            # to avoid cuda/cpu device mismatch when added to the loss.
+            return torch.tensor(0.0, device=self.router.weight.device)
         return self._aux_loss
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -578,7 +580,7 @@ class JambaBlock(nn.Module):
         """MoE load-balancing loss (0 if using dense FFN)."""
         if self.use_moe and isinstance(self.ffn, MoELayer):
             return self.ffn.aux_loss
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=self.mamba.in_proj.weight.device)
 
     def forward(
         self,
@@ -768,7 +770,8 @@ class JambaCore(nn.Module):
     @property
     def aux_loss(self) -> torch.Tensor:
         """Aggregate MoE load-balancing loss across all blocks."""
-        total = torch.tensor(0.0)
+        device = self.output_proj.weight.device
+        total = torch.tensor(0.0, device=device)
         for block in self.blocks:
             bl = block.aux_loss
             if bl.requires_grad or bl.item() > 0:

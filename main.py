@@ -375,6 +375,9 @@ def run_offline_training(
                     _step_errors += 1
                     log.warning("Train step error (step %d): %s",
                                 total_steps, e, exc_info=(_step_errors <= 3))
+                    # Recover memory after allocation failures on long runs.
+                    import gc; gc.collect()
+                    torch.cuda.empty_cache()
                     continue
 
                 _step_dt = time.perf_counter() - _step_t0

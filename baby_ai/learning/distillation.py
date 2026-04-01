@@ -367,16 +367,34 @@ class DistillationEngine:
 
         # Backward
         self._optimizer.zero_grad()
-        
+
         if self._scaler is not None:
+            # Use guarded handling so that update() runs even if step() fails
             self._scaler.scale(loss["total"]).backward()
-            self._scaler.unscale_(self._optimizer)
-            torch.nn.utils.clip_grad_norm_(self._staging_student.parameters(), max_norm=1.0)
-            
             scale_before = self._scaler.get_scale()
-            self._scaler.step(self._optimizer)
-            self._scaler.update()
-            skip_scheduler = (self._scaler.get_scale() < scale_before)
+            step_failed = False
+            try:
+                try:
+                    self._scaler.unscale_(self._optimizer)
+                except RuntimeError as e:
+                    # If unscale_ was already called, log and continue
+                    log.warning("GradScaler.unscale_ warning during distill step %d: %s", self._step, e)
+                torch.nn.utils.clip_grad_norm_(self._staging_student.parameters(), max_norm=1.0)
+                try:
+                    self._scaler.step(self._optimizer)
+                except Exception as e:
+                    step_failed = True
+                    log.exception("GradScaler.step failed during distill step %d: %s", self._step, e)
+            finally:
+                try:
+                    self._scaler.update()
+                except Exception as e:
+                    log.exception("GradScaler.update failed during distill step %d: %s", self._step, e)
+            try:
+                new_scale = self._scaler.get_scale()
+                skip_scheduler = (new_scale < scale_before) or step_failed
+            except Exception:
+                skip_scheduler = True
         else:
             loss["total"].backward()
             torch.nn.utils.clip_grad_norm_(self._staging_student.parameters(), max_norm=1.0)

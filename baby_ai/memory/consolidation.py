@@ -68,7 +68,14 @@ class EWC:
         was_training = model.training
         model.eval()
 
-        params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        # Unwrap torch.compile'd models so that the forward pass
+        # produces tensors whose autograd graph references the same
+        # parameter objects we collect below.  Compiled wrappers can
+        # break this link, causing ``torch.autograd.grad`` to fail
+        # with "element 0 … does not require grad".
+        raw_model = getattr(model, "_orig_mod", model)
+
+        params = [(n, p) for n, p in raw_model.named_parameters() if p.requires_grad]
         param_tensors = [p for _, p in params]
         fisher = {
             n: torch.zeros_like(p, device=device)
@@ -92,7 +99,18 @@ class EWC:
                         continue
                     forward_kwargs[fwd_key] = v.to(device) if isinstance(v, torch.Tensor) else v
 
-                outputs = model(**forward_kwargs)
+                # Skip batches with no modality inputs — the fusion
+                # layer requires at least one.
+                _modality_keys = {"vision", "audio", "sensor", "code_x"}
+                if not (_modality_keys & forward_kwargs.keys()):
+                    continue
+
+                # Explicitly enable gradient tracking.  torch.compile()
+                # can disable grad context internally, and eval mode
+                # on compiled models may run an inference-optimised
+                # graph that strips autograd.
+                with torch.enable_grad():
+                    outputs = raw_model(**forward_kwargs)
 
                 # Use core_state for Fisher — it flows through ALL model
                 # layers (encoders → fusion → temporal core) so its
@@ -102,6 +120,14 @@ class EWC:
                 # cannot be used here.
                 core = outputs["core_state"]
                 loss = core.pow(2).sum(dim=-1).mean()
+
+                # Guard: if the forward still produced a detached tensor
+                # (should not happen after the enable_grad fix, but be
+                # defensive), skip this batch instead of crashing.
+                if loss.grad_fn is None:
+                    log.debug("Fisher: skipping batch — core_state has no grad_fn")
+                    continue
+
                 batch_size = core.size(0)
 
                 # Use autograd.grad to avoid touching .grad attributes.

@@ -75,7 +75,13 @@ class RewardMonitor:
             import numpy as np
 
             arr = np.array(buf)
-            mean, std = arr.mean(), arr.std() + 1e-8
+            mean = arr.mean()
+            # Minimum std floor of 0.1 to match the normalizer's floor.
+            # Without this, channels that sit at a constant value for
+            # hundreds of steps produce z-scores > 30 for normal
+            # gameplay transitions (e.g. idle→active, return to home),
+            # flooding the log with false anomalies.
+            std = max(arr.std(), 0.1)
             z = abs(value - mean) / std
             if z > self._alert_threshold:
                 self._logger.warning(

@@ -191,7 +191,15 @@ class DistillThread:
         )
 
     def _collate(self, transitions: list[dict]) -> dict:
-        """Collate transitions into batched tensors."""
+        """Collate transitions into batched tensors.
+
+        For tensor-valued keys, only transitions whose tensors match
+        the shape of the first transition's tensor are included.  This
+        prevents ``torch.stack`` from failing on variable-shape data
+        (e.g. vision frames captured at different resolutions) which
+        previously caused every modality key to be silently dropped,
+        producing empty batches.
+        """
         batch = {}
         if not transitions:
             return batch
@@ -202,10 +210,19 @@ class DistillThread:
             if not values:
                 continue
             if isinstance(values[0], torch.Tensor):
+                # Filter to consistent shapes before stacking.
+                ref_shape = values[0].shape
+                consistent = [v for v in values if v.shape == ref_shape]
+                if len(consistent) < max(len(values) // 2, 1):
+                    # Too many shape mismatches — skip this key entirely
+                    log.debug("Dropped key '%s' in collate: only %d/%d tensors "
+                              "match reference shape %s",
+                              key, len(consistent), len(values), ref_shape)
+                    continue
                 try:
-                    batch[key] = torch.stack(values).to(self.device)
+                    batch[key] = torch.stack(consistent).to(self.device)
                 except RuntimeError as e:
-                    log.debug("Dropped key '%s' in collate (shape mismatch): %s", key, e)
+                    log.debug("Dropped key '%s' in collate (stack failed): %s", key, e)
             elif isinstance(values[0], (int, float)):
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)
 

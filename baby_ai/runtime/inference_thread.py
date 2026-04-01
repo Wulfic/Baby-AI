@@ -318,10 +318,6 @@ class InferenceThread:
                 if self._s2_config.pause_game and self._mod_bridge is not None:
                     self._send_pause(True)
                     s2_paused_game = True
-                    # Let the mod actually process the tick-freeze command
-                    settle_s = self._s2_config.pause_settle_ms / 1000.0
-                    if settle_s > 0:
-                        time.sleep(settle_s)
 
                 # ── Multi-round MCTS deliberation ──
                 n_rounds = max(1, self._s2_config.deliberation_rounds)
@@ -396,12 +392,18 @@ class InferenceThread:
         return cpu_result
 
     def _send_pause(self, paused: bool) -> None:
-        """Send pause/resume command to the Minecraft mod bridge."""
+        """Send pause/resume to the mod bridge and wait for ack."""
         try:
-            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_command'):
+            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_pause'):
+                timeout = self._s2_config.pause_settle_ms / 1000.0 + 0.3
+                success = self._mod_bridge.send_pause(
+                    paused, reason="system2_planning", timeout=timeout,
+                )
                 cmd = "pause" if paused else "resume"
-                self._mod_bridge.send_command({"command": cmd, "reason": "system2_planning"})
-                log.info("System 2 %s sent to mod bridge", cmd)
+                log.info(
+                    "System 2 %s %s",
+                    cmd, "confirmed" if success else "unconfirmed (timeout)",
+                )
         except Exception as e:
             log.warning("Could not send pause command: %s", e)
 
@@ -432,11 +434,6 @@ class InferenceThread:
         if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
             self._send_pause_s3(True)
             paused_game = True
-            # Let the mod actually process the tick-freeze command
-            # before we start deliberating (TCP is async)
-            settle_s = self._s3_config.pause_settle_ms / 1000.0
-            if settle_s > 0:
-                time.sleep(settle_s)
 
         device = core_state.device
         state = core_state.detach()  # (1, state_dim)
@@ -555,12 +552,18 @@ class InferenceThread:
             self._trigger_system3(core_state, reason="plan_complete")
 
     def _send_pause_s3(self, paused: bool) -> None:
-        """Send pause/resume for System 3 replanning."""
+        """Send pause/resume for System 3 replanning and wait for ack."""
         try:
-            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_command'):
+            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_pause'):
+                timeout = self._s3_config.pause_settle_ms / 1000.0 + 0.3
+                success = self._mod_bridge.send_pause(
+                    paused, reason="system3_planning", timeout=timeout,
+                )
                 cmd = "pause" if paused else "resume"
-                self._mod_bridge.send_command({"command": cmd, "reason": "system3_planning"})
-                log.info("System 3 %s sent to mod bridge", cmd)
+                log.info(
+                    "System 3 %s %s",
+                    cmd, "confirmed" if success else "unconfirmed (timeout)",
+                )
         except Exception as e:
             log.warning("Could not send System 3 pause command: %s", e)
 

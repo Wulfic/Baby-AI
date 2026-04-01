@@ -363,6 +363,18 @@ class Orchestrator:
         if opt_sd is not None:
             try:
                 self.learner_thread.optimizer.load_state_dict(opt_sd)
+                # Ensure optimizer state tensors are on the training device.
+                # Checkpoint tensors are loaded to CPU by default (map_location="cpu").
+                # Move any tensor values in optimizer.state to the configured device
+                try:
+                    dev = torch.device(self.config.device)
+                    for state in self.learner_thread.optimizer.state.values():
+                        for k, v in list(state.items()):
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(dev)
+                except Exception as _e:
+                    log.warning("Could not move learner optimizer state to device: %s", _e)
+
                 log.info("Learner optimizer state restored.")
             except (ValueError, RuntimeError) as exc:
                 log.warning(
