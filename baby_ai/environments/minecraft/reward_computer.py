@@ -195,7 +195,7 @@ class RewardComputer:
 
         # ── 5. Exploration ──────────────────────────────────────
         exploration_bonus = 0.0
-        baseline_interval = 100
+        baseline_interval = 40
         if self.baseline_frame is None:
             self.baseline_frame = frame_u8.copy()
             self.baseline_frame_step = step_count
@@ -207,7 +207,7 @@ class RewardComputer:
                 ).mean()
                 / 255.0
             )
-            if base_diff > 0.08:
+            if base_diff > 0.05:
                 exploration_bonus = min(base_diff * 3.0, 1.0)
             self.baseline_frame = frame_u8.copy()
             self.baseline_frame_step = step_count
@@ -231,15 +231,9 @@ class RewardComputer:
         rewards["movement"] = movement_bonus
 
         # ── 6b. New chunk exploration bonus ─────────────────────
+        # Computed after _process_position_updates (below) so that
+        # the _chunk_is_new flag is already set.  Placeholder here.
         new_chunk_bonus = 0.0
-        if (
-            env._player_x is not None
-            and env._player_z is not None
-            and env._steps_in_chunk == 0
-            and step_count > 0
-        ):
-            new_chunk_bonus = 0.3
-        rewards["new_chunk"] = new_chunk_bonus
 
         # ── 7. Idle penalty ─────────────────────────────────────
         if observation_only:
@@ -279,6 +273,22 @@ class RewardComputer:
 
         # ── Update player position ──────────────────────────────
         self._process_position_updates(mod_position, env)
+
+        # ── 6b (actual). New chunk exploration bonus ────────────
+        # Now that _process_position_updates has set _chunk_is_new,
+        # compute the reward.  Only fires for first-visit chunks.
+        if (
+            env._player_x is not None
+            and env._player_z is not None
+            and env._steps_in_chunk == 0
+            and step_count > 0
+            and getattr(env, '_chunk_is_new', False)
+        ):
+            n_visited = len(env._visited_chunks)
+            # Diminishing returns: 0.5 for 1st chunk, ~0.3 at 10,
+            # ~0.2 at 50, floors at 0.1.
+            new_chunk_bonus = max(0.1, 0.5 / (1.0 + 0.02 * n_visited))
+        rewards["new_chunk"] = new_chunk_bonus
 
         # ── Process /sethome from mod ────────────────────────
         if mod_home_set:
@@ -665,6 +675,7 @@ class RewardComputer:
             )
 
         # Chunk tracking
+        env._chunk_is_new = False
         if env._player_x is not None and env._player_z is not None:
             cx = int(env._player_x) // 16
             cz = int(env._player_z) // 16
@@ -672,6 +683,9 @@ class RewardComputer:
             if new_chunk != env._current_chunk:
                 env._current_chunk = new_chunk
                 env._steps_in_chunk = 0
+                # Mark as new only if this chunk has never been visited
+                if new_chunk not in env._visited_chunks:
+                    env._chunk_is_new = True
                 env._visited_chunks.add(new_chunk)
             else:
                 env._steps_in_chunk += 1

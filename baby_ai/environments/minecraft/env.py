@@ -311,6 +311,7 @@ class MinecraftEnv(GameEnvironment):
         self._visited_chunks: set[tuple[int, int]] = set()
         self._current_chunk: Optional[tuple[int, int]] = None
         self._steps_in_chunk: int = 0
+        self._chunk_is_new: bool = False
 
         # ── Mod bridge (authoritative game events via TCP) ──────
         self._mod_bridge = ModBridge(port=mod_bridge_port)
@@ -403,6 +404,7 @@ class MinecraftEnv(GameEnvironment):
         self._visited_chunks.clear()
         self._current_chunk = None
         self._steps_in_chunk = 0
+        self._chunk_is_new = False
 
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:

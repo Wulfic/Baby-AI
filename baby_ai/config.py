@@ -72,15 +72,15 @@ class System2Config:
     """System 2 test-time compute — threshold-triggered latent planning."""
     enabled: bool = True
     uncertainty_threshold: float = 0.5   # trigger planning when uncertainty > this
-    num_trajectories: int = 8            # parallel trajectories to evaluate
-    planning_horizon: int = 5            # latent rollout steps per trajectory
-    planning_budget_ms: float = 150.0    # max time for a single MCTS pass
-    discount: float = 0.99              # discount factor for trajectory scoring
+    num_trajectories: int = 16           # parallel trajectories to evaluate
+    planning_horizon: int = 500          # latent rollout steps per trajectory (~50s game time)
+    planning_budget_ms: float = 500.0    # max time for a single MCTS pass
+    discount: float = 0.997             # higher discount — care about distant future
     pause_game: bool = True             # send pause command to MC mod during planning
     warmup_steps: int = 0             # min inference steps before System 2 can trigger
     cooldown_steps: int = 20            # min steps between consecutive triggers
-    deliberation_rounds: int = 3         # number of MCTS passes (keep best across rounds)
-    min_deliberation_ms: float = 300.0   # minimum pause duration (ms) so game visibly freezes
+    deliberation_rounds: int = 3         # fewer rounds since each is deeper
+    min_deliberation_ms: float = 1200.0  # minimum pause duration (ms) so game visibly freezes
     pause_settle_ms: float = 50.0        # delay after sending pause before thinking (let mod process)
 
 
@@ -89,20 +89,20 @@ class System3Config:
     """System 3 hierarchical long-horizon planning via latent goals."""
     enabled: bool = True               # enable goal-conditioned hierarchy
     goal_dim: int = 64                 # latent goal embedding size
-    num_goal_candidates: int = 8       # GoalProposer outputs K candidates
-    max_subgoals: int = 12             # max subgoal sequence length
+    num_goal_candidates: int = 12      # GoalProposer outputs K candidates
+    max_subgoals: int = 24             # max subgoal sequence length (~5-15 min plan)
     planner_layers: int = 2            # SubgoalPlanner transformer layers
     planner_heads: int = 4             # attention heads
     proposer_hidden_dim: int = 256     # GoalProposer MLP width
     achieve_threshold: float = 0.85    # cosine sim to mark subgoal done
-    patience_steps: int = 200          # steps before stuck → replan
-    min_replan_interval: int = 50      # cooldown between replans
+    patience_steps: int = 5000          # steps per subgoal (~8 min) before stuck → replan
+    min_replan_interval: int = 100     # cooldown between replans
     replan_on_death: bool = True       # full replan after player death
     pause_game_on_replan: bool = True  # freeze MC during full System 3 replan
     warmup_steps: int = 0            # min inference steps before System 3 activates
-    propose_every_n: int = 50          # when no goal active, propose one every N steps
-    deliberation_rounds: int = 5       # iterative refinement passes during replan
-    min_deliberation_ms: float = 500.0 # minimum pause duration (ms) so game visibly freezes
+    propose_every_n: int = 100         # when no goal active, propose one every N steps
+    deliberation_rounds: int = 8       # iterative refinement passes during replan
+    min_deliberation_ms: float = 2000.0 # minimum pause duration (ms) so game visibly freezes
     pause_settle_ms: float = 50.0      # delay after sending pause before thinking (let mod process)
 
 

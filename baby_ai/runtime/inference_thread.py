@@ -95,6 +95,11 @@ class InferenceThread:
         self._mod_bridge = mod_bridge
         self._s2_trigger_count = 0
 
+        # ── ESC-based game pause ──
+        self._input_controller = None
+        self._esc_paused = False          # True while pause menu is open
+        self._esc_lock = threading.Lock()  # guard against concurrent toggles
+
         # Lazily initialise planner once student model is available
         if self._s2_config.enabled and hasattr(student, 'predictive') and hasattr(student, 'policy'):
             self._planner = LatentMCTS(
@@ -313,9 +318,9 @@ class InferenceThread:
                     self._step, u, self._s2_config.uncertainty_threshold,
                 )
 
-                # Request game pause via mod bridge (if available)
+                # Request game pause via ESC key (if input controller available)
                 s2_paused_game = False
-                if self._s2_config.pause_game and self._mod_bridge is not None:
+                if self._s2_config.pause_game and self._input_controller is not None:
                     self._send_pause(True)
                     s2_paused_game = True
 
@@ -392,20 +397,8 @@ class InferenceThread:
         return cpu_result
 
     def _send_pause(self, paused: bool) -> None:
-        """Send pause/resume to the mod bridge and wait for ack."""
-        try:
-            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_pause'):
-                timeout = self._s2_config.pause_settle_ms / 1000.0 + 0.3
-                success = self._mod_bridge.send_pause(
-                    paused, reason="system2_planning", timeout=timeout,
-                )
-                cmd = "pause" if paused else "resume"
-                log.info(
-                    "System 2 %s %s",
-                    cmd, "confirmed" if success else "unconfirmed (timeout)",
-                )
-        except Exception as e:
-            log.warning("Could not send pause command: %s", e)
+        """Toggle the MC pause menu via ESC key press."""
+        self._toggle_esc_pause(paused, reason="system2_planning")
 
     # ── System 3: goal planning ──────────────────────────────
 
@@ -431,7 +424,7 @@ class InferenceThread:
 
         # ─ Pause game so the world freezes while we think ─
         paused_game = False
-        if self._s3_config.pause_game_on_replan and self._mod_bridge is not None:
+        if self._s3_config.pause_game_on_replan and self._input_controller is not None:
             self._send_pause_s3(True)
             paused_game = True
 
@@ -486,13 +479,18 @@ class InferenceThread:
         subgoals = best_subgoals    # (1, T, goal_dim)
         done_probs = best_done_probs  # (1, T)
 
-        # Trim at the first step where done_prob > 0.5, or keep all
-        done_mask = done_probs[0] > 0.5
+        # Trim at the first step where done_prob > 0.8, or keep all.
+        # Use a high threshold (0.8) because an untrained done_head
+        # outputs near-0.5 everywhere, which would collapse every
+        # plan to a single subgoal.  Also enforce a minimum of 3
+        # subgoals so the agent always has multi-step intent.
+        min_subgoals = 3
+        done_mask = done_probs[0] > 0.8
         if done_mask.any():
             T_end = done_mask.nonzero(as_tuple=True)[0][0].item() + 1
         else:
             T_end = subgoals.size(1)
-        T_end = max(T_end, 1)  # at least one subgoal
+        T_end = max(T_end, min(min_subgoals, subgoals.size(1)))
 
         # Build the subgoal queue
         self._subgoal_queue = [
@@ -552,20 +550,56 @@ class InferenceThread:
             self._trigger_system3(core_state, reason="plan_complete")
 
     def _send_pause_s3(self, paused: bool) -> None:
-        """Send pause/resume for System 3 replanning and wait for ack."""
-        try:
-            if self._mod_bridge is not None and hasattr(self._mod_bridge, 'send_pause'):
-                timeout = self._s3_config.pause_settle_ms / 1000.0 + 0.3
-                success = self._mod_bridge.send_pause(
-                    paused, reason="system3_planning", timeout=timeout,
+        """Toggle the MC pause menu via ESC key press (System 3)."""
+        self._toggle_esc_pause(paused, reason="system3_planning")
+
+    def _toggle_esc_pause(self, paused: bool, reason: str = "") -> None:
+        """Press ESC to open/close the Minecraft pause menu.
+
+        Guarded: if already in the requested state, the keypress is
+        skipped so we never double-tap ESC and accidentally toggle
+        back.  A threading lock serialises concurrent callers.
+        """
+        with self._esc_lock:
+            if paused == self._esc_paused:
+                log.debug(
+                    "_toggle_esc_pause: already %s — skipping (reason=%s)",
+                    "paused" if paused else "resumed", reason,
                 )
-                cmd = "pause" if paused else "resume"
-                log.info(
-                    "System 3 %s %s",
-                    cmd, "confirmed" if success else "unconfirmed (timeout)",
+                return
+
+            ctrl = self._input_controller
+            if ctrl is None:
+                log.warning(
+                    "_toggle_esc_pause: no InputController attached — "
+                    "cannot %s game", "pause" if paused else "resume",
                 )
-        except Exception as e:
-            log.warning("Could not send System 3 pause command: %s", e)
+                return
+
+            # If pausing, release all held keys first so nothing
+            # gets "stuck" while the pause menu is open.
+            if paused:
+                try:
+                    ctrl.release_all()
+                except Exception:
+                    pass
+
+            # Tap ESC: down → short hold → up
+            try:
+                ctrl.press_key("ESCAPE", force=True)
+                time.sleep(0.05)  # 50 ms hold — enough for MC to register
+                ctrl.release_key("ESCAPE", force=True)
+            except Exception as exc:
+                log.warning("_toggle_esc_pause: ESC keypress failed: %s", exc)
+                return
+
+            self._esc_paused = paused
+            # Give MC a moment to process the menu open/close
+            time.sleep(0.10)
+            log.info(
+                "Game %s via ESC (reason=%s)",
+                "PAUSED" if paused else "RESUMED", reason,
+            )
 
     def set_mod_bridge(self, mod_bridge) -> None:
         """Attach the mod bridge after construction.
@@ -577,6 +611,15 @@ class InferenceThread:
         self._mod_bridge = mod_bridge
         log.info("ModBridge attached to InferenceThread (pause_game=%s)",
                  self._s2_config.pause_game)
+
+    def set_input_controller(self, ctrl) -> None:
+        """Attach the InputController for ESC-based pause.
+
+        Called from main.py after the env (and its InputController)
+        are created.
+        """
+        self._input_controller = ctrl
+        log.info("InputController attached to InferenceThread for ESC pause")
 
     def reset_hidden(self) -> None:
         """Reset the Jamba hidden state (e.g., start of new episode)."""
@@ -590,6 +633,9 @@ class InferenceThread:
         self._s3_step = 0
         if self._goal_monitor is not None:
             self._goal_monitor.reset_full()
+        # If the game is still ESC-paused, resume it before resetting
+        if self._esc_paused:
+            self._toggle_esc_pause(False, reason="episode_reset")
         log.info("System 3 state reset (episode boundary)")
 
     def swap_model(self, new_state_dict: dict) -> None:

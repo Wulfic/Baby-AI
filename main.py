@@ -569,6 +569,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     if env._mod_bridge is not None:
         orchestrator.inference_thread.set_mod_bridge(env._mod_bridge)
 
+    # ── Wire InputController for ESC-based pause ──
+    # System 2/3 press ESC to open the MC pause menu (visible freeze).
+    if hasattr(env, '_input') and env._input is not None:
+        orchestrator.inference_thread.set_input_controller(env._input)
+
     # ── JEPA curiosity for intrinsic reward ─────────────────────────────
     curiosity = orchestrator.curiosity
 
