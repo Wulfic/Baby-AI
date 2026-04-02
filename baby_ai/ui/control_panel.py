@@ -47,6 +47,9 @@ from baby_ai.ui.weights_tab import (
     build_weights_tab as _build_weights_tab_impl,
     toggle_expand as _toggle_expand_impl,
 )
+from baby_ai.ui.model_tab import (
+    build_model_tab as _build_model_tab_impl,
+)
 
 # ── Thread-safe learning rate holder ─────────────────────────
 _DEFAULT_LR = 5e-5        # medium-low constant LR
@@ -448,6 +451,11 @@ class AIControlPanel:
         weights_frame = tk.Frame(self._notebook, bg=_BG)
         self._notebook.add(weights_frame, text="  Reward Weights  ")
         self._build_weights_tab(weights_frame)
+
+        # ── Tab 4: Model Configuration ─────────────────────────
+        model_frame = tk.Frame(self._notebook, bg=_BG)
+        self._notebook.add(model_frame, text="  Model  ")
+        self._build_model_tab(model_frame)
 
         # ── Live stats bar (bottom) ────────────────────────────
         self._sep(self.root)
@@ -1058,6 +1066,14 @@ class AIControlPanel:
     def _build_weights_tab(self, parent: tk.Frame) -> None:
         """Build the reward weight sliders inside *parent*."""
         _build_weights_tab_impl(self, parent)
+
+    # ────────────────────────────────────────────────────────────
+    # Tab builder: Model Configuration (delegated to model_tab)
+    # ────────────────────────────────────────────────────────────
+
+    def _build_model_tab(self, parent: tk.Frame) -> None:
+        """Build model size configuration sliders inside *parent*."""
+        _build_model_tab_impl(self, parent)
 
     def _toggle_expand(self, parent_key: str, arrow_label: tk.Label) -> None:
         """Expand or collapse the sub-weight rows for *parent_key*."""

@@ -1130,6 +1130,15 @@ def main() -> None:
     else:
         config = DEFAULT_CONFIG
 
+    # Apply any model-size overrides saved by the GUI's Model tab.
+    from baby_ai.ui.settings_store import SettingsStore as _SettingsStore
+    _boot_store = _SettingsStore()
+    _saved_model = _boot_store.get("model_config")
+    if _saved_model and isinstance(_saved_model, dict):
+        from baby_ai.ui.model_tab import apply_model_config
+        apply_model_config(config, _saved_model)
+        log.info("Applied saved model config (%d overrides)", len(_saved_model))
+
     ensure_dirs()
 
     if args.profile:
