@@ -149,8 +149,9 @@ class DistillThread:
             if self.replay.size < self.config.micro_batch_size:
                 break
 
-            # Sample prioritized batch
-            transitions, weights, indices = self.replay.sample(
+            # Distillation needs diverse random batches (not sequential)
+            # so modality keys are always present in the collated batch.
+            transitions, weights, indices = self.replay.sample_random(
                 self.config.micro_batch_size, device=self.device
             )
 

@@ -98,6 +98,16 @@ class LearnerThread:
             {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr},
         ])
 
+        # Remember the *configured* base LRs so enable_cosine_schedule()
+        # can always compute the correct peak, even after a checkpoint
+        # load has overwritten initial_lr with a peak value from a
+        # previous offline run.
+        self._config_base_lrs = [
+            self.config.encoder_lr,
+            self.config.core_lr,
+            self.config.policy_lr,
+        ]
+
         # No warmup scheduler — constant LR controlled by the GUI.
         # The live LR is read from the control panel each optimizer step.
         # For offline training, enable_cosine_schedule() adds a proper
@@ -127,6 +137,7 @@ class LearnerThread:
                 "lr": self.config.core_lr,
                 "initial_lr": self.config.core_lr,
             })
+            self._config_base_lrs.append(self.config.core_lr)
 
         # Thread control
         self._thread: Optional[threading.Thread] = None
@@ -259,6 +270,21 @@ class LearnerThread:
                     "Skipping backward at step %d: loss has no grad_fn "
                     "(batch keys: %s)", self._step, list(batch.keys()),
                 )
+                self._step += 1
+                return
+
+            # Guard: skip backward when loss is NaN or Inf to prevent
+            # poisoning the optimizer state (Adam momentum/variance).
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                log.warning(
+                    "Skipping backward at step %d: loss is %s "
+                    "(batch keys: %s)",
+                    self._step,
+                    "NaN" if torch.isnan(total_loss) else "Inf",
+                    list(batch.keys()),
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                self._accum_count = 0
                 self._step += 1
                 return
 
@@ -571,38 +597,65 @@ class LearnerThread:
         Ramps LR from 10% → peak over ``warmup_steps``, then decays
         via cosine annealing to ``eta_min_mult * base_lr``.
 
+        Uses a single LambdaLR to avoid SequentialLR double-stepping
+        bugs that cause the warmup phase to overshoot the peak LR.
+
         Args:
             total_steps: Total optimizer steps expected (epochs * steps_per_epoch).
             warmup_steps: Linear warmup phase length.
             peak_lr_mult: Multiplier on the configured LR for peak value.
             eta_min_mult: Fraction of peak LR for the cosine floor.
         """
-        # Scale each param group's LR up to the peak
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = pg["initial_lr"] * peak_lr_mult
-            pg["initial_lr"] = pg["lr"]  # cosine scheduler reads initial_lr
+        import math as _math
 
-        self._lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[
-                torch.optim.lr_scheduler.LinearLR(
-                    self.optimizer,
-                    start_factor=0.1,
-                    total_iters=warmup_steps,
-                ),
-                torch.optim.lr_scheduler.CosineAnnealingLR(
-                    self.optimizer,
-                    T_max=max(total_steps - warmup_steps, 1),
-                    eta_min=pg["lr"] * eta_min_mult,
-                ),
-            ],
-            milestones=[warmup_steps],
+        # Reset optimizer state (momentum/variance) so stale buffers
+        # from online training at a much lower LR don't cause NaN when
+        # the cosine schedule ramps up to peak_lr_mult × base_lr.
+        self.optimizer.state.clear()
+
+        # Also reset GradScaler — the loaded scale factor may be tuned
+        # for the old LR regime and cause immediate overflow at the
+        # higher offline peak LR.
+        if self.scaler is not None:
+            self.scaler = torch.amp.GradScaler("cuda")
+
+        # Set each param group's LR to peak (config_base * mult).
+        # Use the originally-configured base LRs, NOT initial_lr from
+        # the param group (which may have been overwritten by a previous
+        # offline run and persisted in the checkpoint).
+        peak_lrs: list[float] = []
+        for i, pg in enumerate(self.optimizer.param_groups):
+            base = self._config_base_lrs[i] if i < len(self._config_base_lrs) else pg.get("initial_lr", pg["lr"])
+            peak = base * peak_lr_mult
+            pg["lr"] = peak
+            pg["initial_lr"] = peak
+            peak_lrs.append(peak)
+
+        # Build a single lambda that implements warmup + cosine decay
+        # so there are no SequentialLR init-stepping quirks.
+        _warmup = warmup_steps
+        _total = total_steps
+        _eta_min = eta_min_mult  # fraction of peak
+
+        def _lr_lambda(step: int) -> float:
+            if step < _warmup:
+                # Linear warmup: 10% → 100% of peak
+                return 0.1 + 0.9 * step / max(_warmup, 1)
+            # Cosine decay: 100% → eta_min_mult of peak
+            progress = (step - _warmup) / max(_total - _warmup, 1)
+            return _eta_min + (1.0 - _eta_min) * 0.5 * (
+                1.0 + _math.cos(_math.pi * progress)
+            )
+
+        self._lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=_lr_lambda, last_epoch=-1,
         )
+
         log.info(
             "Cosine LR schedule enabled: warmup=%d, total=%d, peak_mult=%.1f, "
             "peak_lrs=%s",
             warmup_steps, total_steps, peak_lr_mult,
-            [f"{pg['lr']:.2e}" for pg in self.optimizer.param_groups],
+            [f"{lr:.2e}" for lr in peak_lrs],
         )
 
     # ── Live reward recomposition ────────────────────────────────────

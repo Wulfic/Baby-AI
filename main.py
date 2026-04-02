@@ -477,14 +477,12 @@ def run_offline_training(
     # ── Final save ──────────────────────────────────────────────
     # When running as a multi-GPU worker, save with a per-GPU tag
     # so the parent process can find and average all of them.
-    final_tag = f"offline_final_gpu{gpu_rank}" if gpu_rank is not None else "offline_final"
+    # Single-GPU just saves straight to "latest".
+    if gpu_rank is not None:
+        final_tag = f"offline_final_gpu{gpu_rank}"
+    else:
+        final_tag = "latest"
     final_path = orchestrator.save_checkpoint(final_tag)
-
-    # For single-GPU runs, also save as 'latest' for easy resumption
-    if gpu_rank is None:
-        # Final save already wrote offline_final; just ensure latest
-        # points to the same state (atomic overwrite).
-        orchestrator.save_checkpoint("latest")
 
     # ── Clean up intermediate epoch checkpoints ─────────────────
     # These are only useful during training for crash recovery.

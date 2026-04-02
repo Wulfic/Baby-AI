@@ -744,21 +744,29 @@ class JambaCore(nn.Module):
         if hidden is None:
             hidden = self.init_hidden(B, device)
 
-        x = self.input_norm(self.input_proj(x))
-
-        new_ssm: list[torch.Tensor] = []
-        new_conv: list[torch.Tensor] = []
-
-        for i, block in enumerate(self.blocks):
-            x, ssm_s, conv_s = block(
-                x,
-                ssm_state=hidden.ssm_states[i],
-                conv_state=hidden.conv_states[i],
+        # SSM recurrent scans overflow in float16 — run entire core in float32.
+        with torch.amp.autocast('cuda', enabled=False):
+            x = x.float()
+            hidden = JambaState(
+                ssm_states=[s.float() for s in hidden.ssm_states],
+                conv_states=[c.float() for c in hidden.conv_states],
             )
-            new_ssm.append(ssm_s)
-            new_conv.append(conv_s)
 
-        x = self.output_proj(self.output_norm(x))
+            x = self.input_norm(self.input_proj(x))
+
+            new_ssm: list[torch.Tensor] = []
+            new_conv: list[torch.Tensor] = []
+
+            for i, block in enumerate(self.blocks):
+                x, ssm_s, conv_s = block(
+                    x,
+                    ssm_state=hidden.ssm_states[i],
+                    conv_state=hidden.conv_states[i],
+                )
+                new_ssm.append(ssm_s)
+                new_conv.append(conv_s)
+
+            x = self.output_proj(self.output_norm(x))
 
         if squeeze:
             x = x.squeeze(1)

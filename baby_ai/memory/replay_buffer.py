@@ -704,6 +704,24 @@ class PrioritizedReplayBuffer:
 
         return transitions, weights, indices
 
+    def sample_random(
+        self,
+        batch_size: int,
+        device: str = "cpu",
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, List[int]]:
+        """Always use prioritized sampling, ignoring sequential mode.
+
+        Distillation needs randomly sampled batches (diverse modalities)
+        even when the learner is using sequential mode.  This avoids
+        empty-batch issues when the sequential cursor is near the end.
+        """
+        was_seq = self._sequential_mode
+        self._sequential_mode = False
+        try:
+            return self.sample(batch_size, device)
+        finally:
+            self._sequential_mode = was_seq
+
     def update_priorities(self, indices: List[int], priorities: List[float]) -> None:
         """Update priorities for sampled transitions (after learning)."""
         with self._lock:
