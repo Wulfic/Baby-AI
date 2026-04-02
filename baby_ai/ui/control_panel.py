@@ -998,6 +998,7 @@ class AIControlPanel:
         Clears all tk variable references first so their __del__
         methods don't fire from the wrong thread during GC.
         """
+        import gc
         try:
             # Drop all tk variable refs before destroying root —
             # prevents "main thread is not in main loop" RuntimeError
@@ -1013,10 +1014,19 @@ class AIControlPanel:
             self._lr_var = None
             self._lr_label = None
             self._imit_var = None
+            self._record_only_var = None
             self._learning_disabled_var = None
             self._home_x_entry = None
             self._home_y_entry = None
             self._home_z_entry = None
+            # Clear vars added dynamically by model_tab
+            if hasattr(self, "_model_vars"):
+                self._model_vars.clear()
+            if hasattr(self, "_model_labels"):
+                self._model_labels.clear()
+            # Force GC on this thread so Variable.__del__ runs here,
+            # not on the main thread after Tcl is torn down.
+            gc.collect()
             if self.root is not None:
                 self.root.quit()
                 self.root.destroy()
