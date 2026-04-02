@@ -28,7 +28,7 @@ Typical usage::
 This auto-detects eligible GPUs, splits the epochs across them,
 spawns one worker per GPU, waits for all workers to finish, averages
 their checkpoints, and saves the merged result as
-``checkpoint_offline_final.pt``.
+``checkpoint_latest.pt``.
 """
 
 from __future__ import annotations
@@ -352,13 +352,8 @@ def run_multi_gpu_offline(
         )
         return
 
-    merged_path = CHECKPOINT_DIR / "checkpoint_offline_final.pt"
+    merged_path = CHECKPOINT_DIR / "checkpoint_latest.pt"
     average_checkpoints(ckpt_paths, merged_path)
-
-    # Also save as "latest" for easy resumption
-    import shutil
-    latest_path = CHECKPOINT_DIR / "checkpoint_latest.pt"
-    shutil.copy2(merged_path, latest_path)
 
     # Clean up per-GPU intermediates so they can't be confused
     # with the real merged checkpoint.
@@ -369,10 +364,23 @@ def run_multi_gpu_offline(
         except OSError:
             pass
 
+    # Clean up epoch checkpoints saved by worker 0 during training.
+    # These only reflect one GPU's un-averaged state and waste disk.
+    import glob as _glob
+    epoch_pattern = str(CHECKPOINT_DIR / "checkpoint_offline_epoch_*.pt")
+    stale_epochs = sorted(_glob.glob(epoch_pattern))
+    if stale_epochs:
+        mgpu_log.info("Cleaning up %d stale epoch checkpoints...", len(stale_epochs))
+        for ep_path in stale_epochs:
+            try:
+                Path(ep_path).unlink()
+                mgpu_log.info("  Removed: %s", Path(ep_path).name)
+            except OSError:
+                pass
+
     mgpu_log.info("=" * 60)
     mgpu_log.info("MULTI-GPU TRAINING COMPLETE")
     mgpu_log.info("  Workers          : %d", n_gpus)
     mgpu_log.info("  Epochs per GPU   : %d", epochs)
     mgpu_log.info("  Merged ckpt      : %s", merged_path)
-    mgpu_log.info("  Latest ckpt      : %s", latest_path)
     mgpu_log.info("=" * 60)

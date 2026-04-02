@@ -220,7 +220,7 @@ def run_demo(config: BabyAIConfig) -> None:
         log.info("Demo interrupted.")
     finally:
         # Save and stop
-        orchestrator.save_checkpoint("demo")
+        orchestrator.save_checkpoint("latest")
         orchestrator.stop()
 
     log.info("Demo complete. System stats:")
@@ -279,10 +279,10 @@ def run_offline_training(
     else:
         # Try the default latest checkpoint
         from baby_ai.config import CHECKPOINT_DIR
-        latest = CHECKPOINT_DIR / "checkpoint_minecraft.pt"
+        latest = CHECKPOINT_DIR / "checkpoint_latest.pt"
         if latest.exists():
             orchestrator.load_checkpoint(latest)
-            log.info("Loaded latest checkpoint: %s", latest)
+            log.info("Loaded checkpoint: %s", latest)
         else:
             log.warning("No checkpoint found -- models start from random init.")
 
@@ -420,7 +420,10 @@ def run_offline_training(
                     )
 
             # ── End-of-epoch distillation + swap ────────────────
-            if orchestrator.replay.size >= batch_size:
+            # Skip if sequential data is exhausted — all transitions
+            # have already been consumed by learner + periodic distills.
+            if (orchestrator.replay.size >= batch_size
+                    and not orchestrator.replay.sequential_exhausted):
                 try:
                     _d_t0 = time.perf_counter()
                     distill._distill_round()
@@ -431,9 +434,16 @@ def run_offline_training(
                     log.warning("End-of-epoch distill error: %s", e)
 
             # ── Checkpoint ──────────────────────────────────────
+            # Only rank 0 saves shared checkpoints to avoid file
+            # race conditions on network drives.
             _save_t0 = time.perf_counter()
-            orchestrator.save_checkpoint(f"offline_epoch_{epoch:03d}")
-            orchestrator.save_checkpoint("latest")  # overwrite rolling
+            if gpu_rank in (None, 0):
+                orchestrator.save_checkpoint(f"offline_epoch_{epoch:03d}")
+                # Only update 'latest' during single-GPU offline training.
+                # Multi-GPU workers must NOT overwrite latest — the parent
+                # process will write the properly averaged result.
+                if gpu_rank is None:
+                    orchestrator.save_checkpoint("latest")  # overwrite rolling
             _save_dt = time.perf_counter() - _save_t0
 
             _epoch_dt = time.perf_counter() - _epoch_t0
@@ -470,11 +480,29 @@ def run_offline_training(
     final_tag = f"offline_final_gpu{gpu_rank}" if gpu_rank is not None else "offline_final"
     final_path = orchestrator.save_checkpoint(final_tag)
 
-    # For single-GPU runs, also copy as 'latest' for easy resumption
+    # For single-GPU runs, also save as 'latest' for easy resumption
     if gpu_rank is None:
-        import shutil
-        latest_path = final_path.parent / "checkpoint_latest.pt"
-        shutil.copy2(final_path, latest_path)
+        # Final save already wrote offline_final; just ensure latest
+        # points to the same state (atomic overwrite).
+        orchestrator.save_checkpoint("latest")
+
+    # ── Clean up intermediate epoch checkpoints ─────────────────
+    # These are only useful during training for crash recovery.
+    # Now that the final checkpoint is saved, they waste disk space
+    # (~1.3 GB each).  Multi-GPU workers also clean their own epochs
+    # so the parent only needs to average the final per-GPU files.
+    if gpu_rank in (None, 0):
+        import glob as _glob
+        epoch_pattern = str(CHECKPOINT_DIR / "checkpoint_offline_epoch_*.pt")
+        stale_epochs = sorted(_glob.glob(epoch_pattern))
+        if stale_epochs:
+            log.info("Cleaning up %d intermediate epoch checkpoints...", len(stale_epochs))
+            for ep_path in stale_epochs:
+                try:
+                    Path(ep_path).unlink()
+                    log.info("  Removed: %s", Path(ep_path).name)
+                except OSError as exc:
+                    log.warning("  Could not remove %s: %s", ep_path, exc)
 
     _total_wall = time.perf_counter() - _global_t0
     log.info("=" * 60)
@@ -555,7 +583,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     if checkpoint_path:
         orchestrator.load_checkpoint(checkpoint_path)
     else:
-        latest = CHECKPOINT_DIR / "checkpoint_minecraft.pt"
+        latest = CHECKPOINT_DIR / "checkpoint_latest.pt"
         if latest.exists():
             log.info("Resuming from %s", latest)
             orchestrator.load_checkpoint(latest)
@@ -688,10 +716,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         "interaction", "exploration", "death_penalty",
         "item_drop_penalty", "damage_taken", "healing",
         "food_reward", "xp_reward",
-        "hotbar_spam_penalty", "height_penalty",
-        "pitch_penalty", "stagnation_penalty",
+        "hotbar_spam_penalty", "inventory_spam_penalty",
+        "height_penalty", "pitch_penalty", "stagnation_penalty",
         "home_proximity", "visual_change", "movement",
-        "new_chunk",
+        "new_chunk", "entity_hit", "mob_killed",
     )
     _acc = {k: 0.0 for k in _acc_keys}
 
@@ -917,7 +945,10 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 if _imitation_active:
                     _demo_boost = getattr(config.training, "demo_priority_boost", 5.0)
                     priority *= _demo_boost
-                orchestrator.add_experience(transition, priority=priority)
+                # Only save AI transitions with positive reward;
+                # demos are always saved regardless of reward.
+                if _imitation_active or total_r > 0:
+                    orchestrator.add_experience(transition, priority=priority)
                 episode_reward += total_r
 
             # ── Execute action in Minecraft ─────────────────────
@@ -972,7 +1003,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     " | craft=%.3f | bld_streak=%.3f | creative=%.3f"
                     " | death=%.1f | drop=%.2f | stag=%.2f"
                     " | dmg=%.2f | heal=%.2f | food=%.2f | xp=%.2f"
-                    " | hbar=%.2f | height=%.2f | pitch=%.2f | home=%.2f"
+                    " | hbar=%.2f | inv_spam=%.2f | height=%.2f | pitch=%.2f | home=%.2f"
+                    " | new_chunk=%.2f | entity_hit=%.2f | mob_kill=%.2f"
                     " | ep_reward=%.2f | latency=%.0f ms",
                     episode_steps,
                     continuous_action_name(action_tensor),
@@ -996,9 +1028,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     _acc["food_reward"],
                     _acc["xp_reward"],
                     _acc["hotbar_spam_penalty"],
+                    _acc["inventory_spam_penalty"],
                     _acc["height_penalty"],
                     _acc["pitch_penalty"],
                     _acc["home_proximity"],
+                    _acc["new_chunk"],
+                    _acc["entity_hit"],
+                    _acc["mob_killed"],
                     episode_reward,
                     result.get("latency_ms", 0),
                 )
@@ -1051,7 +1087,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
             # ── Periodic checkpoint (every 2000 steps) ──────────
             if episode_steps % 2000 == 0:
-                orchestrator.save_checkpoint("minecraft")
+                orchestrator.save_checkpoint("latest")
 
             prev_fused = fused
             # ── Record the action for the NEXT transition ───────
@@ -1074,7 +1110,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
         log.info("Training interrupted by user.")
     finally:
         env.close()
-        orchestrator.save_checkpoint("minecraft")
+        orchestrator.save_checkpoint("latest")
         orchestrator.stop()
         # Ensure the tkinter control panel closes when the
         # training loop exits for any reason.

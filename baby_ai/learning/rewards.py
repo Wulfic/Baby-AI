@@ -147,6 +147,7 @@ class RewardComposer:
         "movement", "block_break", "item_pickup", "block_place",
         "crafting", "building_streak", "creative_sequence",
         "new_chunk", "healing", "food_reward", "xp_reward",
+        "entity_hit", "mob_killed",
     })
 
     def _normalize_channel(self, channel: str, value: float) -> float:
@@ -313,14 +314,16 @@ class RewardComposer:
     _PENALTY_CHANNELS: frozenset[str] = frozenset({
         "death_penalty", "safety_penalty", "idle_penalty",
         "stagnation_penalty", "item_drop_penalty", "damage_taken",
-        "hotbar_spam_penalty", "height_penalty", "pitch_penalty",
+        "hotbar_spam_penalty", "inventory_spam_penalty",
+        "height_penalty", "pitch_penalty",
     })
 
     # Channels that skip z-score normalization (applied raw).
     _RAW_CHANNELS: frozenset[str] = frozenset({
         "death_penalty", "safety_penalty", "idle_penalty",
         "stagnation_penalty", "item_drop_penalty", "damage_taken",
-        "hotbar_spam_penalty", "height_penalty", "pitch_penalty",
+        "hotbar_spam_penalty", "inventory_spam_penalty",
+        "height_penalty", "pitch_penalty",
     })
 
     def compose_dynamic(

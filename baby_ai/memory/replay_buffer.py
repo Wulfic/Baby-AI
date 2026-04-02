@@ -301,19 +301,38 @@ class _ChunkStore:
         header = self._read_header(chunk_id)
         header_sz = self._header_size()
 
-        # Read the entire blob region in one I/O operation
-        with open(path, "rb") as f:
-            f.seek(header_sz)
-            blob_region = f.read()
-
         base_idx = chunk_id * CHUNK_SIZE
         loaded = 0
-        for slot, (off, ln) in enumerate(header):
-            if ln == 0:
-                continue
-            data_idx = base_idx + slot
-            self._blob_cache[data_idx] = blob_region[off : off + ln]
-            loaded += 1
+
+        # Try reading the entire blob region in one I/O operation
+        # (fastest on network drives).  Fall back to per-blob seeks
+        # if the single large allocation triggers a MemoryError.
+        try:
+            with open(path, "rb") as f:
+                f.seek(header_sz)
+                blob_region = f.read()
+
+            for slot, (off, ln) in enumerate(header):
+                if ln == 0:
+                    continue
+                data_idx = base_idx + slot
+                self._blob_cache[data_idx] = blob_region[off : off + ln]
+                loaded += 1
+            del blob_region  # release bulk buffer immediately
+        except MemoryError:
+            # Not enough contiguous RAM for the whole chunk.
+            # Free what we can, then read each blob individually.
+            import gc; gc.collect()
+            log.warning("Bulk read for chunk_%04d failed (MemoryError); "
+                        "falling back to per-blob reads.", chunk_id)
+            with open(path, "rb") as f:
+                for slot, (off, ln) in enumerate(header):
+                    if ln == 0:
+                        continue
+                    f.seek(header_sz + off)
+                    data_idx = base_idx + slot
+                    self._blob_cache[data_idx] = f.read(ln)
+                    loaded += 1
 
         self._loaded_chunks.add(chunk_id)
         return loaded
@@ -497,7 +516,7 @@ class PrioritizedReplayBuffer:
         """Number of transitions left in the current sequential pass."""
         return max(0, len(self._seq_indices) - self._seq_cursor)
 
-    _PREFETCH_AHEAD: int = 3  # number of chunks to keep loaded ahead
+    _PREFETCH_AHEAD: int = 2  # number of chunks to keep loaded ahead
 
     def _prefetch_sequential(self) -> None:
         """Ensure the current and next few chunks are in memory.
@@ -542,9 +561,12 @@ class PrioritizedReplayBuffer:
                 if blob is None:
                     continue
 
-                trans = decompress_transition(
-                    blob, method=self.compression, device=device,
-                )
+                try:
+                    trans = decompress_transition(
+                        blob, method=self.compression, device=device,
+                    )
+                except (RuntimeError, Exception):
+                    continue
                 transitions.append(trans)
                 indices.append(data_idx + self.tree.capacity)
 
@@ -584,13 +606,13 @@ class PrioritizedReplayBuffer:
             tree_idx = self.tree.add(priority)
             data_idx = tree_idx - self.tree.capacity
 
-            # Write blob into chunk file (overwrites old slot)
-            self._store.write(data_idx, blob)
-
-            # Archive demo transitions separately (append-only, never pruned)
             if is_demo:
+                # Archive demo transitions separately (append-only, never pruned)
                 self._demo_store.write(self._demo_write_idx, blob)
                 self._demo_write_idx += 1
+            else:
+                # Write blob into chunk file (overwrites old slot)
+                self._store.write(data_idx, blob)
 
             self._meta[data_idx] = metadata or {}
             self._episode_ids[data_idx] = self._current_episode_id
@@ -664,7 +686,10 @@ class PrioritizedReplayBuffer:
                     # Still nothing — skip this sample
                     continue
 
-                trans = decompress_transition(blob, method=self.compression, device=device)
+                try:
+                    trans = decompress_transition(blob, method=self.compression, device=device)
+                except (RuntimeError, Exception):
+                    continue
                 transitions.append(trans)
 
                 # Importance-sampling weight
@@ -870,8 +895,19 @@ class PrioritizedReplayBuffer:
 
             # Inject demo archive transitions into the training buffer
             # with boosted priority so they're sampled more often.
+            # A marker file tracks how many demos were previously
+            # injected so we never duplicate them across rebuilds.
+            _injection_marker = self._store._dir / "_demo_injection_count.txt"
+            _prev_injected = 0
+            if _injection_marker.exists():
+                try:
+                    _prev_injected = int(_injection_marker.read_text().strip())
+                except (ValueError, OSError):
+                    _prev_injected = 0
+
             demo_priority = max(default_priority * 5.0, self.min_priority) ** self.alpha
             demo_injected = 0
+            demo_cursor = 0  # absolute index across all demo chunks
             for chunk_id in demo_chunks:
                 header = self._demo_store._read_header(chunk_id)
                 base_idx = chunk_id * CHUNK_SIZE
@@ -882,6 +918,14 @@ class PrioritizedReplayBuffer:
                 for slot, (off, ln) in enumerate(header):
                     if ln == 0:
                         continue
+                    # Skip demos that were already injected in a
+                    # previous rebuild (they're already in the AI
+                    # store's chunk files on disk).
+                    if demo_cursor < _prev_injected:
+                        demo_cursor += 1
+                        continue
+                    demo_cursor += 1
+
                     blob = blob_region[off : off + ln]
                     # Write into next available slot in the AI store
                     data_idx = (max_data_idx + demo_injected) % self.capacity
@@ -901,12 +945,25 @@ class PrioritizedReplayBuffer:
                         chunk_id,
                     )
 
+            # Persist the total number of demos now in the AI store
+            # so the next rebuild skips them.
+            try:
+                _injection_marker.write_text(str(_prev_injected + demo_injected))
+            except OSError:
+                log.warning("Could not write demo injection marker.")
+
             if demo_injected > 0:
                 max_data_idx = max_data_idx + demo_injected
                 recovered += demo_injected
                 log.info(
-                    "Injected %d demo transitions with %.1fx priority boost.",
-                    demo_injected, 5.0,
+                    "Injected %d new demo transitions (skipped %d already "
+                    "present) with %.1fx priority boost.",
+                    demo_injected, _prev_injected, 5.0,
+                )
+            elif _prev_injected > 0:
+                log.info(
+                    "All %d demo transitions already in AI store — "
+                    "skipped injection.", _prev_injected,
                 )
 
             # Set data_pointer past the highest recovered index so new
@@ -1007,9 +1064,12 @@ class PrioritizedReplayBuffer:
                         blob = self._store.read(idx)
                         if blob is None:
                             break
-                        trans = decompress_transition(
-                            blob, method=self.compression, device=device,
-                        )
+                        try:
+                            trans = decompress_transition(
+                                blob, method=self.compression, device=device,
+                            )
+                        except (RuntimeError, Exception):
+                            break
                         seq.append(trans)
 
                     if len(seq) >= 2:
@@ -1025,9 +1085,12 @@ class PrioritizedReplayBuffer:
                     tree_idx, priority, data_idx = self.tree.get(s)
                     blob = self._store.read(data_idx)
                     if blob is not None:
-                        trans = decompress_transition(
-                            blob, method=self.compression, device=device,
-                        )
+                        try:
+                            trans = decompress_transition(
+                                blob, method=self.compression, device=device,
+                            )
+                        except (RuntimeError, Exception):
+                            continue
                         sequences.append([trans])
                         prob = priority / max(self.tree.total, 1e-8)
                         w = (prob * self.size) ** (-beta)

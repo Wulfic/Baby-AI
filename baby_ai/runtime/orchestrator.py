@@ -213,7 +213,7 @@ class Orchestrator:
         self.learner_thread.stop()
         self.inference_thread.stop()
 
-        self.save_checkpoint("shutdown")
+        self.save_checkpoint("latest")
         self._started = False
         log.info("System stopped.")
 

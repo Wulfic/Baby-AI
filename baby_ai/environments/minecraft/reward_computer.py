@@ -786,7 +786,9 @@ class RewardComputer:
 
         Rules:
         - Threshold is **45°** (not 60°).  Looking up is penalised
-          more steeply than looking down.
+          more steeply than looking down (45°–60°).
+        - Looking down **>60°** triggers a harsher penalty to
+          discourage staring at the ground for extended periods.
         - **Exempt when interacting with a block** (attack / use):
           mining straight down or placing high are legitimate.
         - **3-second grace period** (~30 steps at 10 steps/s):
@@ -816,8 +818,11 @@ class RewardComputer:
                     if looking_up:
                         # Steeper ramp for sky-staring
                         pitch_penalty = 0.15 + 0.03 * min(over, 40)
+                    elif abs_pitch > 60:
+                        # Harsh ramp for staring at the ground (>60°)
+                        pitch_penalty = 0.20 + 0.04 * min(over, 40)
                     else:
-                        # Gentler ramp for looking down
+                        # Moderate ramp for looking down (45°–60°)
                         pitch_penalty = 0.08 + 0.015 * min(over, 40)
             else:
                 env._extreme_pitch_steps = max(0, env._extreme_pitch_steps - 3)
