@@ -8,7 +8,8 @@
     "CraftingMixin"
   ],
   "client": [
-    "DeathScreenMixin"
+    "DeathScreenMixin",
+    "ScreenStateMixin"
   ],
   "injectors": {
     "defaultRequire": 1

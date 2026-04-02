@@ -170,6 +170,17 @@ class InputController:
         # Cache scan codes (VK → SC mapping doesn't change)
         self._scan_cache: Dict[int, int] = {}
 
+        # ── Inventory cooldown (max 2 taps per 5 s) ───────────
+        self._inventory_tap_times: list[float] = []
+        self._INVENTORY_MAX_TAPS: int = 2
+        self._INVENTORY_WINDOW: float = 5.0
+        self.inventory_spam_blocked: int = 0  # counter for reward penalty
+
+        # When True, ALL inputs (keys, mouse, look) are silently
+        # dropped.  Set by the inference thread during System 2/3
+        # planning while the mod freezes server ticks.
+        self.paused: bool = False
+
         # Background-mode tracked cursor position (client coords).
         # Look deltas accumulate here so the AI can reach any part
         # of the screen (inventory slots, crafting grid, etc.).
@@ -197,6 +208,8 @@ class InputController:
         dropped unless *force=True*.
         """
         vk = VK[key] if isinstance(key, str) else key
+        if not force and self.paused:
+            return
         if not force and vk in BLOCKED_KEYS:
             log.debug("Blocked key %s (vk=0x%02X) — not allowed for AI.", key, vk)
             return
@@ -263,6 +276,8 @@ class InputController:
         """
         if not self._window.is_valid:
             return
+        if self.paused:
+            return
         # Check AI Controls state (UI toggles).
         if _controls_state is not None:
             if not _controls_state.is_button_allowed(button):
@@ -320,6 +335,8 @@ class InputController:
         Camera look disabled via the AI Controls panel is silently dropped.
         """
         if not self._window.is_valid:
+            return False
+        if self.paused:
             return False
         # Check AI Controls state (UI toggles).
         if _controls_state is not None:
@@ -411,6 +428,18 @@ class InputController:
 
         # Tap toggle keys (press then immediate release)
         for vk in tap_desired:
+            # Inventory cooldown: max 2 taps per 5 seconds
+            if vk == VK["E"]:
+                now = time.monotonic()
+                cutoff = now - self._INVENTORY_WINDOW
+                self._inventory_tap_times = [
+                    t for t in self._inventory_tap_times if t > cutoff
+                ]
+                if len(self._inventory_tap_times) >= self._INVENTORY_MAX_TAPS:
+                    self.inventory_spam_blocked += 1
+                    log.debug("Inventory tap suppressed (cooldown)")
+                    continue
+                self._inventory_tap_times.append(now)
             self.press_key(vk)
             time.sleep(0.035)          # 35 ms hold — long enough for MC to register
             self.release_key(vk)

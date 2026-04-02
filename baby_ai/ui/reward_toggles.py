@@ -59,12 +59,15 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("healing",            "Healing",              "Survival",      False),
     ChannelInfo("food_reward",        "Food Reward",          "Survival",      False),
     ChannelInfo("xp_reward",          "XP Reward",            "Survival",      False),
-
+    # ── Combat ───────────────────────────────────────────────────
+    ChannelInfo("entity_hit",         "Entity Hit",           "Combat",        True),
+    ChannelInfo("mob_killed",         "Mob Killed",           "Combat",        True),
     # ── Penalties / Shaping ─────────────────────────────────────
     ChannelInfo("death_penalty",      "Death Penalty",        "Penalties",     False, is_penalty=True),
     ChannelInfo("idle_penalty",       "Idle Penalty",         "Penalties",     True,  is_penalty=True),
     ChannelInfo("stagnation_penalty", "Stagnation Penalty",   "Penalties",     False, is_penalty=True),
     ChannelInfo("hotbar_spam_penalty","Hotbar Spam Penalty",  "Penalties",     True,  is_penalty=True),
+    ChannelInfo("inventory_spam_penalty","Inventory Spam",    "Penalties",     True,  is_penalty=True),
     ChannelInfo("height_penalty",     "Height Penalty",       "Penalties",     False, is_penalty=True),
     ChannelInfo("pitch_penalty",      "Pitch Penalty",        "Penalties",     True,  is_penalty=True),
     ChannelInfo("home_proximity",     "Home Proximity",       "Penalties",     False),

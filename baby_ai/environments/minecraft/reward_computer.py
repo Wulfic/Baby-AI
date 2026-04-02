@@ -254,6 +254,16 @@ class RewardComputer:
             hotbar_spam_penalty = self._compute_hotbar_spam(hotbar_slot)
         rewards["hotbar_spam_penalty"] = hotbar_spam_penalty
 
+        # ── 7c. Inventory spam penalty ────────────────────────
+        inv_spam = 0.0
+        inp = getattr(env, "_input", None)
+        if inp is not None:
+            blocked = getattr(inp, "inventory_spam_blocked", 0)
+            if blocked > 0:
+                inv_spam = min(0.3 * blocked, 1.0)
+                inp.inventory_spam_blocked = 0  # reset after reading
+        rewards["inventory_spam_penalty"] = inv_spam
+
         # ── Mod events ──────────────────────────────────────────
         # Events were already drained and fed to the sensor packer
         # inside _observe() so all modalities share the same temporal
@@ -270,6 +280,8 @@ class RewardComputer:
         mod_xp = [e for e in mod_events if e.get("event") == "xp_gained"]
         mod_position = [e for e in mod_events if e.get("event") == "position_update"]
         mod_home_set = [e for e in mod_events if e.get("event") == "home_set"]
+        mod_entity_hits = [e for e in mod_events if e.get("event") == "entity_hit"]
+        mod_mob_kills = [e for e in mod_events if e.get("event") == "mob_killed"]
 
         # ── Update player position ──────────────────────────────
         self._process_position_updates(mod_position, env)
@@ -390,6 +402,32 @@ class RewardComputer:
             for evt in mod_xp:
                 xp_reward += float(evt.get("amount", 0))
         rewards["xp_reward"] = xp_reward
+
+        # ── 11d-2. Entity hit reward (mod-only) ────────────────
+        # Reward for landing melee hits on living entities.
+        # Hostile mobs get a higher bonus (self-defence), passive
+        # mobs still rewarded (food/resource gathering).
+        entity_hit_reward = 0.0
+        if use_mod:
+            for evt in mod_entity_hits:
+                dmg = float(evt.get("damage", 1.0))
+                if evt.get("is_hostile", False):
+                    entity_hit_reward += min(dmg * 0.15, 0.6)
+                else:
+                    entity_hit_reward += min(dmg * 0.10, 0.4)
+        rewards["entity_hit"] = entity_hit_reward
+
+        # ── 11d-3. Mob killed reward (mod-only) ────────────────
+        # Larger bonus for actually finishing off a mob.
+        # Hostile kills are worth more (defence/safety).
+        mob_killed_reward = 0.0
+        if use_mod:
+            for evt in mod_mob_kills:
+                if evt.get("is_hostile", False):
+                    mob_killed_reward += 1.0
+                else:
+                    mob_killed_reward += 0.5
+        rewards["mob_killed"] = mob_killed_reward
 
         # ── 11e. Height / cave / fall penalties ─────────────────
         height_penalty = self._compute_height_penalty(_sw, env)
@@ -963,12 +1001,15 @@ class RewardComputer:
                 "item_drop_penalty": 3.0,
                 "damage_taken": 1.5,
                 "hotbar_spam_penalty": 2.0,
+                "inventory_spam_penalty": 2.0,
                 "height_penalty": 2.5,
                 "pitch_penalty": 3.0,
                 "healing": 1.0,
                 "food_reward": 0.8,
                 "xp_reward": 0.1,
                 "home_proximity": 1.5,
+                "entity_hit": 3.0,
+                "mob_killed": 8.0,
                 # Sub-weights (internal multipliers)
                 "mv_forward": 3.0,
                 "mv_backward": 1.0,
@@ -1008,12 +1049,16 @@ class RewardComputer:
             - rewards["item_drop_penalty"] * w.get("item_drop_penalty", 3.0)
             - rewards["damage_taken"] * w.get("damage_taken", 1.5)
             - rewards["hotbar_spam_penalty"] * w.get("hotbar_spam_penalty", 2.0)
+            - rewards["inventory_spam_penalty"] * w.get("inventory_spam_penalty", 2.0)
             - rewards["height_penalty"] * w.get("height_penalty", 2.5)
             - rewards["pitch_penalty"] * w.get("pitch_penalty", 3.0)
             # Sustain
             + rewards["healing"] * w.get("healing", 1.0)
             + rewards["food_reward"] * w.get("food_reward", 0.8)
             + rewards["xp_reward"] * w.get("xp_reward", 0.1)
+            # Combat
+            + rewards["entity_hit"] * w.get("entity_hit", 3.0)
+            + rewards["mob_killed"] * w.get("mob_killed", 8.0)
             # Home proximity (can be positive or negative)
             + rewards["home_proximity"] * w.get("home_proximity", 1.5)
         )

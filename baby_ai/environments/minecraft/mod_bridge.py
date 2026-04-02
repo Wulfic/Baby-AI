@@ -100,6 +100,11 @@ class ModBridge:
         self._pause_ack = threading.Event()
         self._resume_ack = threading.Event()
 
+        # Screen state — updated from player_status events.
+        # True when *any* GUI screen is open (inventory, chest, etc.)
+        self.has_open_screen: bool = False
+        self.open_screen_name: str = ""
+
     # ── Properties ──────────────────────────────────────────────
 
     @property
@@ -298,6 +303,13 @@ class ModBridge:
                             log.debug("Received resume_ack (frozen=%s)",
                                       event.get("frozen"))
                         else:
+                            # Extract screen state from player_status
+                            # before queuing so it's always up-to-date.
+                            if evt_type == "player_status":
+                                self.has_open_screen = event.get(
+                                    "has_open_screen", False)
+                                self.open_screen_name = event.get(
+                                    "open_screen_name", "")
                             self._events.append(event)
                             self._total_events += 1
                             log.info("Mod event: %s %s", evt_type,

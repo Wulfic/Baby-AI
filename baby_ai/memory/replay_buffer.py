@@ -395,9 +395,37 @@ class PrioritizedReplayBuffer:
         self.min_priority = 1e-6
         self.max_priority = 1.0
 
-        # Chunked on-disk storage (replaces per-file storage)
-        storage_dir = REPLAY_DIR / "chunks"
-        self._store = _ChunkStore(storage_dir, capacity)
+        # Chunked on-disk storage — AI transitions
+        ai_dir = REPLAY_DIR / "ai"
+
+        # Backward compat: migrate old replay/chunks/ → replay/ai/
+        old_chunks_dir = REPLAY_DIR / "chunks"
+        if old_chunks_dir.exists() and any(old_chunks_dir.glob("chunk_*.bin")):
+            if not ai_dir.exists() or not any(ai_dir.glob("chunk_*.bin")):
+                log.info(
+                    "Migrating replay/chunks/ → replay/ai/ ..."
+                )
+                ai_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+                for f in old_chunks_dir.glob("chunk_*.bin"):
+                    shutil.move(str(f), str(ai_dir / f.name))
+                log.info("Migration complete.")
+
+        self._store = _ChunkStore(ai_dir, capacity)
+
+        # Separate append-only archive for recorded demos
+        demo_dir = REPLAY_DIR / "demos"
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        self._demo_store = _ChunkStore(demo_dir, capacity)
+        self._demo_write_idx: int = 0  # independent append cursor
+        # Scan existing demo chunks to resume append position
+        for f in demo_dir.glob("chunk_*.bin"):
+            header = self._demo_store._read_header(
+                int(f.stem.split("_")[1])
+            )
+            for _, (_, ln) in enumerate(header):
+                if ln > 0:
+                    self._demo_write_idx += 1
 
         # In-memory metadata index
         self._meta: list[Optional[dict]] = [None] * capacity
@@ -545,6 +573,13 @@ class PrioritizedReplayBuffer:
         # Compress transition
         blob = compress_transition(transition, method=self.compression)
 
+        # Check if this is a demo transition
+        is_demo = False
+        demo_val = transition.get("is_demo")
+        if demo_val is not None:
+            v = demo_val.item() if hasattr(demo_val, "item") else float(demo_val)
+            is_demo = v > 0.5
+
         with self._lock:
             tree_idx = self.tree.add(priority)
             data_idx = tree_idx - self.tree.capacity
@@ -552,12 +587,17 @@ class PrioritizedReplayBuffer:
             # Write blob into chunk file (overwrites old slot)
             self._store.write(data_idx, blob)
 
+            # Archive demo transitions separately (append-only, never pruned)
+            if is_demo:
+                self._demo_store.write(self._demo_write_idx, blob)
+                self._demo_write_idx += 1
+
             self._meta[data_idx] = metadata or {}
             self._episode_ids[data_idx] = self._current_episode_id
             self.max_priority = max(self.max_priority, priority)
             self._step += 1
 
-        # Check disk cap
+        # Check disk cap (only prunes AI store, never demos)
         if self._store.disk_bytes > self.disk_cap_gb * 1e9:
             self._prune_oldest_chunks()
 
@@ -693,7 +733,10 @@ class PrioritizedReplayBuffer:
         return pairs, weights[:batch_size], indices[:batch_size]
 
     def _prune_oldest_chunks(self) -> None:
-        """Remove the oldest chunk files and zero their SumTree priorities."""
+        """Remove the oldest AI chunk files and zero their SumTree priorities.
+
+        Only prunes from the AI store — demo archive is never touched.
+        """
         chunk_files = sorted(
             self._store._dir.glob("chunk_*.bin"),
             key=lambda f: f.stat().st_mtime,
@@ -732,6 +775,8 @@ class PrioritizedReplayBuffer:
             "size": self.size,
             "capacity": self.capacity,
             "disk_mb": self._store.disk_bytes / (1024 ** 2),
+            "demo_disk_mb": self._demo_store.disk_bytes / (1024 ** 2),
+            "demo_count": self._demo_write_idx,
             "disk_cap_gb": self.disk_cap_gb,
             "total_priority": float(self.tree.total),
             "step": self._step,
@@ -773,9 +818,18 @@ class PrioritizedReplayBuffer:
                 continue
         existing_chunks.sort()
 
+        # Also discover demo chunks to inject into the training buffer
+        demo_chunks: list[int] = []
+        for f in self._demo_store._dir.glob("chunk_*.bin"):
+            try:
+                demo_chunks.append(int(f.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+        demo_chunks.sort()
+
         log.info(
-            "rebuild_from_disk: found %d chunk files on disk, scanning...",
-            len(existing_chunks),
+            "rebuild_from_disk: found %d AI + %d demo chunk files, scanning...",
+            len(existing_chunks), len(demo_chunks),
         )
 
         max_data_idx = 0
@@ -810,9 +864,50 @@ class PrioritizedReplayBuffer:
 
                 if chunk_recovered > 0:
                     log.info(
-                        "  chunk_%04d: %d transitions recovered",
+                        "  ai/chunk_%04d: %d transitions recovered",
                         chunk_id, chunk_recovered,
                     )
+
+            # Inject demo archive transitions into the training buffer
+            # with boosted priority so they're sampled more often.
+            demo_priority = max(default_priority * 5.0, self.min_priority) ** self.alpha
+            demo_injected = 0
+            for chunk_id in demo_chunks:
+                header = self._demo_store._read_header(chunk_id)
+                base_idx = chunk_id * CHUNK_SIZE
+                with open(self._demo_store._chunk_path(chunk_id), "rb") as f:
+                    f.seek(self._demo_store._header_size())
+                    blob_region = f.read()
+
+                for slot, (off, ln) in enumerate(header):
+                    if ln == 0:
+                        continue
+                    blob = blob_region[off : off + ln]
+                    # Write into next available slot in the AI store
+                    data_idx = (max_data_idx + demo_injected) % self.capacity
+                    self._store.write(data_idx, blob)
+                    tree_idx = data_idx + self.tree.capacity
+                    self.tree.update(tree_idx, demo_priority)
+                    self.tree.n_entries = min(
+                        self.tree.n_entries + 1, self.capacity,
+                    )
+                    self._meta[data_idx] = {"is_demo": True}
+                    self._episode_ids[data_idx] = data_idx
+                    demo_injected += 1
+
+                if demo_injected > 0:
+                    log.info(
+                        "  demos/chunk_%04d: injected transitions",
+                        chunk_id,
+                    )
+
+            if demo_injected > 0:
+                max_data_idx = max_data_idx + demo_injected
+                recovered += demo_injected
+                log.info(
+                    "Injected %d demo transitions with %.1fx priority boost.",
+                    demo_injected, 5.0,
+                )
 
             # Set data_pointer past the highest recovered index so new
             # add() calls don't overwrite recovered data prematurely.
@@ -837,8 +932,10 @@ class PrioritizedReplayBuffer:
 
         log.info(
             "Rebuilt replay buffer from disk: %d transitions recovered "
-            "(%.1f MB on disk).",
-            recovered, self._store.disk_bytes / (1024 ** 2),
+            "(AI: %.1f MB, demos: %.1f MB on disk).",
+            recovered,
+            self._store.disk_bytes / (1024 ** 2),
+            self._demo_store.disk_bytes / (1024 ** 2),
         )
         return recovered
 

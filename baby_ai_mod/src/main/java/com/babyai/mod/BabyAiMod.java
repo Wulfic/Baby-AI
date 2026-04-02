@@ -5,12 +5,18 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.LightType;
@@ -173,8 +179,46 @@ public class BabyAiMod implements ModInitializer {
             }
         });
 
-        // ── Player death (Fabric API) ────────────────────────
+        // ── Entity attack (Fabric API) ───────────────────────
+        // Fires when the player swings at any entity (mob, animal,
+        // item frame, etc.).  We emit an event so the Python reward
+        // system can incentivise combat and self-defence.
+        AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
+            if (world.isClient() || hand != Hand.MAIN_HAND) {
+                return ActionResult.PASS;
+            }
+            if (!(entity instanceof LivingEntity target)) {
+                return ActionResult.PASS;
+            }
+
+            String entityType = Registries.ENTITY_TYPE.getId(target.getType()).toString();
+            String entityName = target.getName().getString();
+            boolean hostile = target instanceof HostileEntity;
+
+            // Estimate damage from the player's weapon base damage.
+            // We read the health before/after on the next tick for
+            // precise tracking, but here we just use getAttributeValue
+            // for a rough approximation.
+            float dmg = 1.0f;
+            if (player instanceof ServerPlayerEntity serverPlayer) {
+                try {
+                    dmg = (float) serverPlayer.getAttributeValue(
+                        net.minecraft.entity.attribute.EntityAttributes.GENERIC_ATTACK_DAMAGE
+                    );
+                } catch (Exception ignored) {
+                    dmg = 1.0f;
+                }
+            }
+
+            long tick = world.getServer() != null ? world.getServer().getTicks() : 0;
+            EventBridge.INSTANCE.onEntityHit(entityType, entityName, hostile, dmg, tick);
+            LOGGER.debug("[Baby-AI] Entity hit: {} (hostile={}, dmg={:.1f})", entityName, hostile, dmg);
+            return ActionResult.PASS;
+        });
+
+        // ── Player death AND mob killed (Fabric API) ─────────
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
+            // ── Case 1: Player death ──
             if (entity instanceof ServerPlayerEntity player) {
                 // Extract the death message for logging.  The exact
                 // API surface may shift between MC versions — the
@@ -222,6 +266,18 @@ public class BabyAiMod implements ModInitializer {
                         }
                     }
                 });
+            }
+
+            // ── Case 2: Non-player mob killed by the player ──
+            if (!(entity instanceof ServerPlayerEntity)
+                    && damageSource.getAttacker() instanceof ServerPlayerEntity) {
+                String entityType = Registries.ENTITY_TYPE.getId(entity.getType()).toString();
+                String entityName = entity.getName().getString();
+                boolean hostile = entity instanceof HostileEntity;
+                long tick = entity.getServer() != null
+                        ? entity.getServer().getTicks() : 0;
+                EventBridge.INSTANCE.onMobKilled(entityType, entityName, hostile, tick);
+                LOGGER.info("[Baby-AI] Mob killed: {} (hostile={})", entityName, hostile);
             }
         });
 

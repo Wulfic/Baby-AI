@@ -84,6 +84,7 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("damage_taken",       "Damage Taken",       "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
     WeightInfo("hotbar_spam_penalty","Hotbar Spam Penalty","Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("inventory_spam_penalty","Inventory Spam","Penalties",   2.0,   0.0, 10.0,  0.1, is_penalty=True),
 
     WeightInfo("height_penalty",     "Height Penalty",     "Penalties",    2.5,   0.0, 10.0,  0.1, is_penalty=True),
     # Sub-weights: components of the height penalty
@@ -98,7 +99,9 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("food_reward",       "Food Reward",        "Sustain",      0.8,   0.0, 10.0,  0.1),
     WeightInfo("xp_reward",         "XP Reward",          "Sustain",      0.1,   0.0,  5.0,  0.1),
     WeightInfo("home_proximity",    "Home Proximity",     "Sustain",      1.5,  -5.0, 10.0,  0.1),
-]
+    # ── Combat ───────────────────────────────────────────────────
+    WeightInfo("entity_hit",        "Entity Hit",         "Combat",      3.0,   0.0, 20.0,  0.5),
+    WeightInfo("mob_killed",        "Mob Killed",         "Combat",      8.0,   0.0, 30.0,  0.5),]
 
 # Lookup: which keys have children?
 PARENT_KEYS: set[str] = {w.parent for w in REWARD_WEIGHTS if w.parent} - {None}

@@ -95,10 +95,10 @@ class InferenceThread:
         self._mod_bridge = mod_bridge
         self._s2_trigger_count = 0
 
-        # ── ESC-based game pause ──
+        # ── Game pause (mod tick-freeze + input suppression) ──
         self._input_controller = None
-        self._esc_paused = False          # True while pause menu is open
-        self._esc_lock = threading.Lock()  # guard against concurrent toggles
+        self._game_paused = False          # True while game is frozen
+        self._pause_lock = threading.Lock()  # guard against concurrent toggles
 
         # Lazily initialise planner once student model is available
         if self._s2_config.enabled and hasattr(student, 'predictive') and hasattr(student, 'policy'):
@@ -397,8 +397,8 @@ class InferenceThread:
         return cpu_result
 
     def _send_pause(self, paused: bool) -> None:
-        """Toggle the MC pause menu via ESC key press."""
-        self._toggle_esc_pause(paused, reason="system2_planning")
+        """Freeze/resume the game via mod command + input suppression."""
+        self._toggle_game_pause(paused, reason="system2_planning")
 
     # ── System 3: goal planning ──────────────────────────────
 
@@ -550,55 +550,90 @@ class InferenceThread:
             self._trigger_system3(core_state, reason="plan_complete")
 
     def _send_pause_s3(self, paused: bool) -> None:
-        """Toggle the MC pause menu via ESC key press (System 3)."""
-        self._toggle_esc_pause(paused, reason="system3_planning")
+        """Freeze/resume the game via mod command (System 3)."""
+        self._toggle_game_pause(paused, reason="system3_planning")
 
-    def _toggle_esc_pause(self, paused: bool, reason: str = "") -> None:
-        """Press ESC to open/close the Minecraft pause menu.
+    def _toggle_game_pause(self, paused: bool, reason: str = "") -> None:
+        """Freeze/resume the game using the mod's tick-freeze + input suppression.
 
-        Guarded: if already in the requested state, the keypress is
-        skipped so we never double-tap ESC and accidentally toggle
-        back.  A threading lock serialises concurrent callers.
+        Instead of opening the ESC pause menu (which has clickable
+        buttons the AI can accidentally interact with), this:
+
+        1. Suppresses all AI input via ``InputController.paused``
+        2. Closes any open GUI screen (inventory, chest, etc.) with ESC
+        3. Freezes server ticks via the mod's ``setFrozen()`` command
+
+        On resume the order is reversed: unfreeze ticks first, then
+        re-enable AI inputs.
         """
-        with self._esc_lock:
-            if paused == self._esc_paused:
+        with self._pause_lock:
+            if paused == self._game_paused:
                 log.debug(
-                    "_toggle_esc_pause: already %s — skipping (reason=%s)",
+                    "_toggle_game_pause: already %s — skipping (reason=%s)",
                     "paused" if paused else "resumed", reason,
                 )
                 return
 
             ctrl = self._input_controller
-            if ctrl is None:
-                log.warning(
-                    "_toggle_esc_pause: no InputController attached — "
-                    "cannot %s game", "pause" if paused else "resume",
-                )
-                return
 
-            # If pausing, release all held keys first so nothing
-            # gets "stuck" while the pause menu is open.
             if paused:
-                try:
-                    ctrl.release_all()
-                except Exception:
-                    pass
+                # 1. Block all AI inputs immediately
+                if ctrl is not None:
+                    ctrl.paused = True
+                    try:
+                        ctrl.release_all()
+                    except Exception:
+                        pass
 
-            # Tap ESC: down → short hold → up
-            try:
-                ctrl.press_key("ESCAPE", force=True)
-                time.sleep(0.05)  # 50 ms hold — enough for MC to register
-                ctrl.release_key("ESCAPE", force=True)
-            except Exception as exc:
-                log.warning("_toggle_esc_pause: ESC keypress failed: %s", exc)
-                return
+                # 2. If a GUI screen is open, close it with ESC so
+                #    the game returns to normal view before freezing.
+                if (self._mod_bridge is not None
+                        and self._mod_bridge.has_open_screen
+                        and ctrl is not None):
+                    try:
+                        ctrl.press_key("ESCAPE", force=True)
+                        time.sleep(0.05)
+                        ctrl.release_key("ESCAPE", force=True)
+                        time.sleep(0.15)  # let MC process screen close
+                        log.debug(
+                            "_toggle_game_pause: closed open GUI (%s)",
+                            self._mod_bridge.open_screen_name,
+                        )
+                    except Exception as exc:
+                        log.warning("_toggle_game_pause: ESC to close GUI failed: %s", exc)
 
-            self._esc_paused = paused
-            # Give MC a moment to process the menu open/close
-            time.sleep(0.10)
+                # 3. Freeze server ticks via the mod
+                frozen_ok = False
+                if self._mod_bridge is not None:
+                    frozen_ok = self._mod_bridge.send_pause(True, reason=reason)
+                else:
+                    log.warning("_toggle_game_pause: no ModBridge — cannot freeze ticks")
+
+                if not frozen_ok:
+                    # Freeze failed (bridge disconnected / no ack) —
+                    # revert input suppression so the AI isn't stuck.
+                    log.warning(
+                        "_toggle_game_pause: freeze failed — "
+                        "re-enabling inputs (reason=%s)", reason,
+                    )
+                    if ctrl is not None:
+                        ctrl.paused = False
+                    return
+
+            else:
+                # Resume: unfreeze ticks first, then re-enable inputs.
+                # Always re-enable inputs even if the resume command
+                # fails (bridge disconnected after world recreate).
+                if self._mod_bridge is not None:
+                    self._mod_bridge.send_pause(False, reason=reason)
+
+                if ctrl is not None:
+                    ctrl.paused = False
+
+            self._game_paused = paused
             log.info(
-                "Game %s via ESC (reason=%s)",
-                "PAUSED" if paused else "RESUMED", reason,
+                "Game %s via mod freeze (reason=%s)",
+                "FROZEN" if paused else "RESUMED", reason,
             )
 
     def set_mod_bridge(self, mod_bridge) -> None:
@@ -613,13 +648,13 @@ class InferenceThread:
                  self._s2_config.pause_game)
 
     def set_input_controller(self, ctrl) -> None:
-        """Attach the InputController for ESC-based pause.
+        """Attach the InputController for input suppression during pause.
 
         Called from main.py after the env (and its InputController)
         are created.
         """
         self._input_controller = ctrl
-        log.info("InputController attached to InferenceThread for ESC pause")
+        log.info("InputController attached to InferenceThread")
 
     def reset_hidden(self) -> None:
         """Reset the Jamba hidden state (e.g., start of new episode)."""
@@ -633,9 +668,15 @@ class InferenceThread:
         self._s3_step = 0
         if self._goal_monitor is not None:
             self._goal_monitor.reset_full()
-        # If the game is still ESC-paused, resume it before resetting
-        if self._esc_paused:
-            self._toggle_esc_pause(False, reason="episode_reset")
+        # If the game is still frozen, resume it before resetting.
+        # Always force-clear input suppression in case the bridge is
+        # disconnected (e.g. after world recreation).
+        if self._game_paused:
+            self._toggle_game_pause(False, reason="episode_reset")
+        # Belt-and-suspenders: ensure inputs are never stuck off
+        if self._input_controller is not None:
+            self._input_controller.paused = False
+        self._game_paused = False
         log.info("System 3 state reset (episode boundary)")
 
     def swap_model(self, new_state_dict: dict) -> None:

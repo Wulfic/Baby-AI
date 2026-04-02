@@ -56,6 +56,39 @@ public class EventBridge {
     /** Reference to the integrated server — set once the server starts. */
     private final AtomicReference<MinecraftServer> serverRef = new AtomicReference<>(null);
 
+    // ── Client screen state (set by ScreenStateMixin) ──────────
+
+    /**
+     * True while ANY GUI screen is open on the client (inventory,
+     * chest, crafting table, pause menu, death screen, etc.).
+     * Written by the client-side {@code ScreenStateMixin}, read
+     * by the server tick when building {@code player_status}.
+     */
+    private final AtomicBoolean screenOpen = new AtomicBoolean(false);
+    private final AtomicReference<String> openScreenName = new AtomicReference<>("");
+
+    /** Called by {@code ScreenStateMixin} when any screen opens. */
+    public void setScreenOpen(String screenClassName) {
+        screenOpen.set(true);
+        openScreenName.set(screenClassName != null ? screenClassName : "");
+    }
+
+    /** Called by {@code ScreenStateMixin} when the screen closes. */
+    public void setScreenClosed() {
+        screenOpen.set(false);
+        openScreenName.set("");
+    }
+
+    /** Check if any GUI screen is currently open (thread-safe). */
+    public boolean isScreenOpen() {
+        return screenOpen.get();
+    }
+
+    /** Name of the currently open screen class, or empty string. */
+    public String getOpenScreenName() {
+        return openScreenName.get();
+    }
+
     // ── Server reference ───────────────────────────────────────
 
     /**
@@ -190,6 +223,46 @@ public class EventBridge {
         JsonObject j = new JsonObject();
         j.addProperty("event", "player_death");
         j.addProperty("source", source);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Fired when the player hits (attacks) any entity.
+     *
+     * @param entityType Registry ID of the target entity (e.g. "minecraft:zombie").
+     * @param entityName Display name (e.g. "Zombie", "Cow").
+     * @param isHostile  True if the entity is a hostile mob.
+     * @param damage     Approximate damage dealt this swing.
+     * @param tick       Current server tick.
+     */
+    public void onEntityHit(String entityType, String entityName,
+                            boolean isHostile, float damage, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "entity_hit");
+        j.addProperty("entity_type", entityType);
+        j.addProperty("entity_name", entityName);
+        j.addProperty("is_hostile", isHostile);
+        j.addProperty("damage", Math.round(damage * 100.0f) / 100.0f);
+        j.addProperty("tick", tick);
+        broadcast(j);
+    }
+
+    /**
+     * Fired when an entity dies and the player was the attacker.
+     *
+     * @param entityType Registry ID of the killed entity.
+     * @param entityName Display name.
+     * @param isHostile  True if the entity was hostile.
+     * @param tick       Current server tick.
+     */
+    public void onMobKilled(String entityType, String entityName,
+                            boolean isHostile, long tick) {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "mob_killed");
+        j.addProperty("entity_type", entityType);
+        j.addProperty("entity_name", entityName);
+        j.addProperty("is_hostile", isHostile);
         j.addProperty("tick", tick);
         broadcast(j);
     }
@@ -358,6 +431,9 @@ public class EventBridge {
         j.addProperty("velocity_z", Math.round(velZ * 1000.0) / 1000.0);
         // Inventory
         j.addProperty("inventory_used_slots", invUsedSlots);
+        // Client screen state (from ScreenStateMixin)
+        j.addProperty("has_open_screen", screenOpen.get());
+        j.addProperty("open_screen_name", openScreenName.get());
         j.addProperty("tick", tick);
         broadcast(j);
     }

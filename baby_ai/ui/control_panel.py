@@ -328,6 +328,21 @@ class AIControlPanel:
         )
         self.btn_set_home.pack(side=tk.RIGHT, padx=(int(4 * s), 0))
 
+        # ── Hotkey hints strip ─────────────────────────────────
+        hints_bar = tk.Frame(self.root, bg=_BG)
+        hints_bar.pack(fill=tk.X, pady=(0, int(4 * s)))
+        tk.Label(
+            hints_bar,
+            text="Ctrl+P  Pause/Resume  ·  Ctrl+Q  Stop & Save  ·  Ctrl+H  Set Home",
+            font=("Segoe UI", int(8 * s)),
+            bg=_BG, fg=_FG_DIM, anchor="w",
+        ).pack(side=tk.LEFT)
+
+        # ── Keyboard shortcuts ─────────────────────────────────
+        self.root.bind_all("<Control-p>", lambda e: self.toggle_pause())
+        self.root.bind_all("<Control-q>", lambda e: self.trigger_stop())
+        self.root.bind_all("<Control-h>", lambda e: self._on_set_home())
+
         # ── Home Waypoint section ─────────────────────────────
         home_frame = tk.Frame(self.root, bg=_BG_GROUP,
                               padx=int(6 * s), pady=int(4 * s))

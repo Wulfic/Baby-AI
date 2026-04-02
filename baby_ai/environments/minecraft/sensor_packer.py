@@ -116,6 +116,10 @@ class SensorPacker:
 
         self._has_status: bool = False  # True after first player_status event
 
+        # Screen state (from mod)
+        self._has_open_screen: bool = False
+        self._open_screen_name: str = ""
+
     def update(
         self,
         mod_events: List[Dict[str, Any]],
@@ -167,6 +171,8 @@ class SensorPacker:
                 self._velocity_x = ev.get("velocity_x", self._velocity_x)
                 self._velocity_y = ev.get("velocity_y", self._velocity_y)
                 self._velocity_z = ev.get("velocity_z", self._velocity_z)
+                self._has_open_screen = ev.get("has_open_screen", self._has_open_screen)
+                self._open_screen_name = ev.get("open_screen_name", self._open_screen_name)
 
             elif evt == "position_update":
                 self._y = ev.get("y", self._y)
