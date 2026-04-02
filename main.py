@@ -626,6 +626,12 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     )
     control_panel.start()
 
+    # Wire live reward recomposition into the learner so that
+    # weight/toggle changes take effect across ALL replay data
+    # immediately, not just new transitions.
+    orchestrator.learner_thread._reward_weights = reward_weights
+    orchestrator.learner_thread._toggle_state = toggle_state
+
     # Wire home-change notifications so the GUI updates when
     # /sethome is used in-game or set_home() is called.
     def _notify_gui_home_changed() -> None:
@@ -890,6 +896,12 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     "sensor": prev_obs["sensor"].squeeze(0),
                     "action": _action,
                     "reward": torch.tensor(total_r),
+                    # Store RAW per-channel breakdown (pre-toggle) so the
+                    # learner can recompose rewards with live weight/toggle
+                    # changes.  Using rb_raw (not the filtered rb) ensures
+                    # that enabling a previously-disabled channel will
+                    # retroactively include its values from old replay data.
+                    "reward_channels": {**rb_raw, "intrinsic": intrinsic_r},
                     "fused": _cur_fused,
                     "next_fused": _next_fused.detach(),
                     "is_demo": torch.tensor(1.0 if _imitation_active else 0.0),

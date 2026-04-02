@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from baby_ai.config import TrainingConfig, RuntimeConfig, REBELConfig, DEFAULT_CONFIG
+from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
 from baby_ai.learning.rebel import REBELLoss
@@ -133,6 +134,13 @@ class LearnerThread:
         self._step = 0
         self._accum_count = 0
 
+        # Live reward recomposition — when set, sampled transitions are
+        # re-weighted with the current UI weights/toggles so that user
+        # changes take effect immediately instead of after a full buffer
+        # turnover (~14 hours at 500 K capacity / 10 steps per second).
+        self._reward_weights = None   # RewardWeightsState (set by main.py)
+        self._toggle_state = None     # RewardToggleState  (set by main.py)
+
         # Event-driven coordination: the main loop or the distill thread
         # can signal that new data is available or a threshold is crossed,
         # eliminating fixed-interval sleep polling.
@@ -220,6 +228,10 @@ class LearnerThread:
         transitions, weights, indices = self.replay.sample(
             self.config.micro_batch_size, device=self.device
         )
+
+        # Recompose rewards with current UI weights/toggles so that
+        # slider and checkbox changes take effect immediately.
+        self._recompose_rewards(transitions)
 
         # Build batch tensors from transitions
         batch = self._collate_transitions(transitions)
@@ -593,6 +605,53 @@ class LearnerThread:
             [f"{pg['lr']:.2e}" for pg in self.optimizer.param_groups],
         )
 
+    # ── Live reward recomposition ────────────────────────────────────
+
+    def _recompose_rewards(self, transitions: list[dict]) -> None:
+        """Re-weight replay rewards using current UI weights and toggles.
+
+        Each transition that carries a ``reward_channels`` dict (the raw
+        per-channel breakdown saved at collection time) gets its scalar
+        ``reward`` recomputed with the **current** weight multipliers
+        and channel toggles.  Transitions without ``reward_channels``
+        (legacy data) keep their original reward unchanged.
+        """
+        if self._reward_weights is None:
+            return
+
+        w = self._reward_weights.snapshot()
+
+        # Read toggle state once (or default to all-enabled).
+        if self._toggle_state is not None:
+            enabled = self._toggle_state.snapshot()
+        else:
+            enabled = None
+
+        _PENALTY = RewardComposer._PENALTY_CHANNELS
+        _PASSTHROUGH = frozenset({"survival", "extrinsic"})
+
+        for t in transitions:
+            channels = t.get("reward_channels")
+            if channels is None:
+                continue
+
+            total = 0.0
+            for ch, raw_val in channels.items():
+                if ch == "total" or raw_val == 0.0:
+                    continue
+                # Apply toggle (disabled → 0).  Always pass through
+                # survival and extrinsic (matching filter_channels).
+                if enabled is not None and ch not in _PASSTHROUGH:
+                    if not enabled.get(ch, True):
+                        continue
+                weight = w.get(ch, 1.0)
+                if ch in _PENALTY:
+                    total -= weight * raw_val
+                else:
+                    total += weight * raw_val
+
+            t["reward"] = torch.tensor(max(-5.0, min(5.0, total)))
+
     def _collate_transitions(self, transitions: list[dict]) -> dict:
         """Collate a list of transition dicts into batched tensors.
 
@@ -719,6 +778,9 @@ class LearnerThread:
         """
         if len(sequence) < 2:
             return None
+
+        # Recompose rewards with current UI weights/toggles.
+        self._recompose_rewards(sequence)
 
         # Collate the full sequence
         batch = self._collate_transitions(sequence)
