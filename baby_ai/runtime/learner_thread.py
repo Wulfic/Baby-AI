@@ -77,6 +77,7 @@ class LearnerThread:
         self._rebel_loss_fn = REBELLoss(
             beta=rebel_cfg.beta,
             reward_clip=rebel_cfg.reward_clip,
+            entropy_weight=getattr(rebel_cfg, 'entropy_weight', 0.0),
         ).to(device) if rebel_cfg.enabled else None
         self._rebel_value_loss_weight = rebel_cfg.value_loss_weight
 
@@ -92,10 +93,13 @@ class LearnerThread:
             else:
                 policy_params.append(param)
 
-        self.optimizer = torch.optim.Adam([
-            {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr},
-            {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr},
-            {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr},
+        # AdamW: weight decay prevents weight explosion from correlated RL replay
+        # inputs (value heads see near-identical states during on-policy stretches).
+        # Encoders use a lower decay since their features should be stable.
+        self.optimizer = torch.optim.AdamW([
+            {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr, "weight_decay": 1e-4},
+            {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr, "weight_decay": 0.0},
+            {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr, "weight_decay": 0.01},
         ])
 
         # Remember the *configured* base LRs so enable_cosine_schedule()
@@ -136,6 +140,7 @@ class LearnerThread:
                 "params": list(self._fused_proj.parameters()),
                 "lr": self.config.core_lr,
                 "initial_lr": self.config.core_lr,
+                "weight_decay": 0.0,
             })
             self._config_base_lrs.append(self.config.core_lr)
 

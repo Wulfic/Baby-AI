@@ -45,10 +45,11 @@ class REBELLoss(nn.Module):
         reward_clip: Maximum absolute value for the relative reward.
     """
 
-    def __init__(self, beta: float = 0.1, reward_clip: float = 5.0):
+    def __init__(self, beta: float = 0.1, reward_clip: float = 5.0, entropy_weight: float = 0.0):
         super().__init__()
         self.beta = beta
         self.reward_clip = reward_clip
+        self.entropy_weight = entropy_weight
 
     def forward(
         self,
@@ -74,8 +75,8 @@ class REBELLoss(nn.Module):
             Scalar REBEL loss (lower = better policy alignment with rewards).
         """
         # Get policy scores for both actions
-        log_prob_w, _, _ = policy.evaluate(state, action_w)  # (B,)
-        log_prob_l, _, _ = policy.evaluate(state, action_l)  # (B,)
+        log_prob_w, entropy_w, _ = policy.evaluate(state, action_w)  # (B,)
+        log_prob_l, entropy_l, _ = policy.evaluate(state, action_l)  # (B,)
 
         # Relative reward — clipped for gradient stability
         delta_r = torch.clamp(
@@ -92,5 +93,11 @@ class REBELLoss(nn.Module):
         # When delta_r < 0: push score_diff negative (prefer loser — swapped)
         # When delta_r ≈ 0: near-zero gradient (actions equally good)
         loss = -F.logsigmoid(delta_r * score_diff).mean()
+
+        # Entropy bonus: maximise policy entropy to prevent collapse during
+        # long reward deserts (e.g. mining, exploration with no dense reward).
+        if self.entropy_weight > 0.0:
+            mean_entropy = (entropy_w + entropy_l).mean() / 2.0
+            loss = loss - self.entropy_weight * mean_entropy
 
         return loss

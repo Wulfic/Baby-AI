@@ -88,12 +88,12 @@ class System2Config:
 class System3Config:
     """System 3 hierarchical long-horizon planning via latent goals."""
     enabled: bool = True               # enable goal-conditioned hierarchy
-    goal_dim: int = 64                 # latent goal embedding size
+    goal_dim: int = 128                # latent goal embedding size (was 64; richer goal semantics for complex tasks)
     num_goal_candidates: int = 12      # GoalProposer outputs K candidates
     max_subgoals: int = 24             # max subgoal sequence length (~5-15 min plan)
-    planner_layers: int = 2            # SubgoalPlanner transformer layers
-    planner_heads: int = 4             # attention heads
-    proposer_hidden_dim: int = 256     # GoalProposer MLP width
+    planner_layers: int = 4            # SubgoalPlanner transformer layers (was 2; deeper plan sequencing)
+    planner_heads: int = 8             # attention heads (was 4; more parallel planning dimensions)
+    proposer_hidden_dim: int = 512     # GoalProposer MLP width (was 256; wider trunk)
     achieve_threshold: float = 0.85    # cosine sim to mark subgoal done
     patience_steps: int = 5000          # steps per subgoal (~8 min) before stuck → replan
     min_replan_interval: int = 100     # cooldown between replans
@@ -124,13 +124,13 @@ class JambaConfig:
     Interleaves Mamba-2 selective state-space blocks with sparse MoE FFNs
     for O(1) per-step inference with infinite context caching.
     """
-    num_layers: int = 4           # number of stacked Jamba blocks
-    d_state: int = 16             # SSM state dimension (N in Mamba notation)
-    d_conv: int = 4               # causal convolution kernel size
+    num_layers: int = 6           # number of stacked Jamba blocks (was 4; deeper temporal reasoning)
+    d_state: int = 32             # SSM state dimension (was 16; doubled for longer temporal memory)
+    d_conv: int = 8               # causal convolution kernel size (was 4; wider local context window)
     expand: int = 2               # Mamba inner dimension multiplier
     dt_rank: int = 0              # dt projection rank (0 = auto: ceil(dim/16))
     num_experts: int = 4          # total MoE experts per MoE layer
-    top_k_routing: int = 1        # experts activated per token
+    top_k_routing: int = 2        # experts activated per token (was 1; 2 gives richer representations)
     moe_every_n: int = 2          # MoE every N blocks (others use dense FFN)
     ffn_mult: int = 2             # FFN hidden dimension multiplier
     load_balance_weight: float = 0.01  # auxiliary load-balancing loss weight
@@ -153,10 +153,11 @@ class FlowMatchingConfig:
 class REBELConfig:
     """REBEL RL training hyperparameters (Phase D)."""
     enabled: bool = True
-    beta: float = 0.1             # KL regularization weight
+    beta: float = 0.15            # KL regularization weight (was 0.1; more conservative for long-horizon tasks)
     pair_sampling: str = "random" # "same_state" or "random"
     reward_clip: float = 5.0      # clip relative rewards
     value_loss_weight: float = 0.5  # keep training value head for System 2
+    entropy_weight: float = 0.01  # entropy bonus weight — prevents policy collapse during reward deserts
 
 
 @dataclass
@@ -242,8 +243,9 @@ class TeacherConfig:
 
     # Jamba temporal core — scaled up for Teacher
     jamba: JambaConfig = field(default_factory=lambda: JambaConfig(
-        num_layers=4,
-        d_state=16,
+        num_layers=8,       # was 4; deeper temporal reasoning for complex planning chains
+        d_state=32,         # was 16; doubled SSM state for longer temporal memory
+        d_conv=8,           # was 4; wider local context window
         expand=1,           # keep inner dim = hidden_dim to control total param count
         num_experts=8,
         top_k_routing=2,
@@ -314,15 +316,17 @@ class SensorConfig:
 
 @dataclass
 class TrainingConfig:
-    # Learning rates (overridden by GUI slider at runtime)
-    encoder_lr: float = 5e-5
-    core_lr: float = 5e-5
-    policy_lr: float = 5e-5
+    # Learning rates — per-group differentiation (overridden by GUI slider at runtime).
+    # SSM core is most fragile to large updates; encoder features are stable;
+    # policy head changes fastest to adapt to new reward signals.
+    encoder_lr: float = 3e-5   # was 5e-5; slower updates preserve stable visual features
+    core_lr: float = 2e-5      # was 5e-5; slowest — SSM recurrent state is fragile to jumps
+    policy_lr: float = 7e-5    # was 5e-5; fastest — policy must adapt to reward changes quickly
     distill_lr: float = 5e-5
 
     # Batching
     micro_batch_size: int = 16
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4   # was 2; larger effective batch for more stable gradients
 
     # Replay
     replay_capacity: int = 500_000
@@ -346,7 +350,7 @@ class TrainingConfig:
     # Intrinsic reward
     intrinsic_weight_start: float = 0.5
     intrinsic_weight_end: float = 0.05
-    intrinsic_decay_steps: int = 10_000
+    intrinsic_decay_steps: int = 50_000   # was 10_000; Minecraft's vast world needs curiosity longer
 
     # Consolidation (EWC + rehearsal)
     consolidation_every_n_steps: int = 2000
