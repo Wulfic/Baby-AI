@@ -62,6 +62,7 @@ class StudentModel(BabyAgentBase):
             # Optional: slot attention + episodic memory (from config flags)
             use_slot_attention=config.slot_attention.enabled,
             num_vision_slots=config.slot_attention.num_slots,
+            slot_dim=config.slot_attention.slot_dim,
             use_episodic_memory=config.titans_memory.enabled,
             mem_slots=config.titans_memory.mem_slots,
         )

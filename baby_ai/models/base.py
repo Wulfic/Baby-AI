@@ -97,6 +97,7 @@ class BabyAgentBase(nn.Module):
         goal_dim: int = 0,
         use_slot_attention: bool = False,
         num_vision_slots: int = 8,
+        slot_dim: int = 64,
         use_episodic_memory: bool = False,
         mem_slots: int = 64,
     ):
@@ -109,6 +110,7 @@ class BabyAgentBase(nn.Module):
             width_mult=vision_width_mult,
             use_slot_attention=use_slot_attention,
             num_slots=num_vision_slots,
+            slot_dim=slot_dim,
         )
         self.audio_encoder = AudioEncoder(
             n_mels=n_mels,
