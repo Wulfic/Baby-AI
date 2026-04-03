@@ -547,10 +547,14 @@ class DistillationEngine:
         # If all missed, full forward
         if len(miss_positions) == B:
             teacher_out = self._teacher_forward(inputs)
-            # Cache individual samples
+            # Cache individual samples — handle both Tensor and list[Tensor] values
             for i, idx in enumerate(replay_indices):
-                sample_out = {k: v[i] for k, v in teacher_out.items()
-                              if isinstance(v, torch.Tensor) and v.dim() >= 1}
+                sample_out = {}
+                for k, v in teacher_out.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 1:
+                        sample_out[k] = v[i]
+                    elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                        sample_out[k] = [t[i] for t in v]
                 self._label_cache.put(idx, ver, sample_out)
             return teacher_out
 
@@ -564,15 +568,20 @@ class DistillationEngine:
 
         miss_out = self._teacher_forward(miss_inputs)
 
-        # Cache the miss outputs
+        # Cache the miss outputs — handle both Tensor and list[Tensor] (e.g. vq_indices)
         for local_i, global_i in enumerate(miss_positions):
             idx = replay_indices[global_i]
-            sample_out = {k: v[local_i] for k, v in miss_out.items()
-                          if isinstance(v, torch.Tensor) and v.dim() >= 1}
+            sample_out = {}
+            cached_entry = {}
+            for k, v in miss_out.items():
+                if isinstance(v, torch.Tensor) and v.dim() >= 1:
+                    sample_out[k] = v[local_i]
+                    cached_entry[k] = v[local_i].detach().cpu()
+                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    sample_out[k] = [t[local_i] for t in v]
+                    cached_entry[k] = [t[local_i].detach().cpu() for t in v]
             self._label_cache.put(idx, ver, sample_out)
-            cached[global_i] = {k: v[local_i].detach().cpu()
-                                for k, v in miss_out.items()
-                                if isinstance(v, torch.Tensor) and v.dim() >= 1}
+            cached[global_i] = cached_entry
 
         return self._stitch_cached(cached, device)
 
@@ -603,10 +612,18 @@ class DistillationEngine:
         out: dict[str, torch.Tensor] = {}
         for k in keys:
             tensors = [c[k] for c in cached]
-            try:
-                out[k] = torch.stack(tensors).to(device)
-            except RuntimeError:
-                pass  # skip keys with mismatched shapes
+            # list[Tensor] values (e.g. vq_indices per RVQ level) — re-batch per level
+            if isinstance(tensors[0], list):
+                num_levels = len(tensors[0])
+                out[k] = [
+                    torch.stack([t[lvl] for t in tensors]).to(device)
+                    for lvl in range(num_levels)
+                ]
+            else:
+                try:
+                    out[k] = torch.stack(tensors).to(device)
+                except RuntimeError:
+                    pass  # skip keys with mismatched shapes
         return out
 
     @property

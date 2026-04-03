@@ -260,6 +260,14 @@ class BabyAgentBase(nn.Module):
         else:
             self.action_tokenizer = None
 
+        # If slot attention is active, project raw slot vectors into fused_dim
+        # so they can be prepended as extra input tokens for JambaCore.
+        self.use_slot_attention = use_slot_attention
+        if use_slot_attention:
+            self.slot_proj = nn.Linear(slot_dim, fused_dim)
+        else:
+            self.slot_proj = None
+
         # Store dims for external access
         self.fused_dim = fused_dim
         self.hidden_dim = hidden_dim
@@ -273,12 +281,14 @@ class BabyAgentBase(nn.Module):
         code_edge_index: Optional[torch.Tensor] = None,
         code_batch: Optional[torch.Tensor] = None,
         sensor: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Encode raw modalities into a fused embedding.
 
         Returns:
-            (B, fused_dim) fused multimodal embedding.
+            fused: (B, fused_dim) fused multimodal embedding.
+            slots: (B, K, fused_dim) projected slot tokens, or None
+                   if slot attention is disabled.
         """
         embeddings = {}
 
@@ -294,7 +304,14 @@ class BabyAgentBase(nn.Module):
         if sensor is not None:
             embeddings["sensor"] = self.sensor_encoder(sensor)
 
-        return self.fusion(embeddings)
+        fused = self.fusion(embeddings)
+
+        # Expose projected slot tokens for JambaCore sequence input
+        slots = None
+        if self.use_slot_attention and self.vision_encoder._last_slots is not None:
+            slots = self.slot_proj(self.vision_encoder._last_slots)  # (B, K, fused_dim)
+
+        return fused, slots
 
     def forward(
         self,
@@ -322,13 +339,21 @@ class BabyAgentBase(nn.Module):
                              and flow matching policy heads)
             action:          (B, 23) deterministic action vector
         """
-        fused = self.encode(
+        fused, slots = self.encode(
             vision=vision, audio=audio,
             code_x=code_x, code_edge_index=code_edge_index, code_batch=code_batch,
             sensor=sensor,
         )
 
-        core_state, hidden = self.temporal(fused, hidden)
+        # Build temporal input: if slot tokens are available, prepend them
+        # as a sequence so the SSM can attend to per-object structure.
+        # Layout: [slot_1, ..., slot_K, fused] → (B, K+1, fused_dim)
+        if slots is not None:
+            temporal_input = torch.cat([slots, fused.unsqueeze(1)], dim=1)
+            core_out, hidden = self.temporal(temporal_input, hidden)
+            core_state = core_out[:, -1, :]  # take fused-position output
+        else:
+            core_state, hidden = self.temporal(fused, hidden)
 
         # Apply goal conditioning (System 3) — FiLM modulation
         if self.goal_conditioner is not None:
@@ -384,12 +409,18 @@ class BabyAgentBase(nn.Module):
 
         Returns dict with action, log_prob, value, hidden, utterance.
         """
-        fused = self.encode(
+        fused, slots = self.encode(
             vision=vision, audio=audio,
             code_x=code_x, code_edge_index=code_edge_index, code_batch=code_batch,
             sensor=sensor,
         )
-        core_state, hidden = self.temporal(fused, hidden)
+
+        if slots is not None:
+            temporal_input = torch.cat([slots, fused.unsqueeze(1)], dim=1)
+            core_out, hidden = self.temporal(temporal_input, hidden)
+            core_state = core_out[:, -1, :]
+        else:
+            core_state, hidden = self.temporal(fused, hidden)
 
         # Apply goal conditioning (System 3) — FiLM modulation
         if self.goal_conditioner is not None:

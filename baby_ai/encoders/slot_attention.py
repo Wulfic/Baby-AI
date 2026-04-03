@@ -169,11 +169,15 @@ class SlotAttentionVisionHead(nn.Module):
             num_iters=num_iters,
         )
 
-        # Pool K slots → single vector
-        self.pool = nn.Sequential(
+        # Pool K slots → single vector via learned attention query.
+        # A learnable query lets the model weight slots by task relevance
+        # instead of equally averaging (which destroys slot identity).
+        self.pool_proj = nn.Sequential(
             nn.LayerNorm(slot_dim),
             nn.Linear(slot_dim, output_dim),
         )
+        self.pool_query = nn.Parameter(torch.randn(1, 1, output_dim))
+        self.pool_scale = math.sqrt(output_dim)
 
     def forward(
         self,
@@ -192,7 +196,13 @@ class SlotAttentionVisionHead(nn.Module):
         H, W = x.shape[-2:]
         x = x.flatten(2).transpose(1, 2)  # (B, H*W, slot_dim)
 
-        slots = self.slot_attn(x)         # (B, K, slot_dim)
-        embed = self.pool(slots).mean(dim=1)  # (B, output_dim)
+        slots = self.slot_attn(x)                             # (B, K, slot_dim)
+        projected = self.pool_proj(slots)                        # (B, K, output_dim)
+
+        # Attention-weighted pooling: learnable query scores each slot
+        query = self.pool_query.expand(B, -1, -1)               # (B, 1, output_dim)
+        attn = torch.bmm(query, projected.transpose(1, 2))      # (B, 1, K)
+        attn = F.softmax(attn / self.pool_scale, dim=-1)        # (B, 1, K)
+        embed = torch.bmm(attn, projected).squeeze(1)           # (B, output_dim)
 
         return embed, slots

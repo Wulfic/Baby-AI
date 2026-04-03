@@ -343,6 +343,12 @@ class LearnerThread:
             weights_t = weights_t[:actual_B]
             indices = indices[:actual_B]
 
+        # Guard: skip step if collate dropped ALL samples
+        if actual_B == 0:
+            log.warning("Empty batch at step %d after collate; skipping.", self._step)
+            self._step += 1
+            return
+
         # Forward pass with AMP
         # Acquire the teacher lock to prevent the distillation thread
         # from running a concurrent forward on the same SSM
@@ -497,11 +503,12 @@ class LearnerThread:
             if self._distill_engine is not None:
                 self._distill_engine.bump_teacher_version()
 
-        # Update replay priorities
-        new_priorities = [
-            max(loss_dict.get("per_sample_loss", [0.1])[i] if i < len(loss_dict.get("per_sample_loss", [])) else 0.1, 1e-6)
-            for i in range(len(indices))
-        ]
+        # Update replay priorities with per-sample value loss
+        _psl = loss_dict.get("per_sample_loss")
+        if _psl is not None and isinstance(_psl, torch.Tensor) and _psl.numel() >= len(indices):
+            new_priorities = [max(float(_psl[i]), 1e-6) for i in range(len(indices))]
+        else:
+            new_priorities = [0.1] * len(indices)
         self.replay.update_priorities(indices, new_priorities)
 
         # Periodic consolidation -- recompute Fisher Information so the
@@ -618,6 +625,7 @@ class LearnerThread:
         # model output.  This ensures loss.grad_fn is set even when no
         # policy branch fires, so backward() won't crash.
         loss = (value.sum() * 0.0).squeeze()
+        per_sample_value_loss: torch.Tensor | None = None
 
         if "action" in batch and "reward" in batch:
             actions = batch["action"]
@@ -649,6 +657,7 @@ class LearnerThread:
                 v_target = rewards.clamp(-7.0, 7.0)
 
             # Value loss against V-trace targets
+            per_sample_value_loss = F.smooth_l1_loss(v_pred, v_target, reduction='none').detach()
             value_loss = (F.smooth_l1_loss(v_pred, v_target, reduction='none') * weights).mean()
 
             if self._rebel_enabled and self._rebel_loss_fn is not None:
@@ -719,20 +728,35 @@ class LearnerThread:
                 loss = loss + 0.01 * torch.clamp(cot_loss, max=5.0)
 
         # ── Successor features loss ──────────────────────────────────────
+        # NOTE: Successor TD requires (s_t, s_{t+1}) from the same episode.
+        # Random replay batches have no temporal ordering.  We gate on
+        # episode_id and step metadata stored by sample_her(); when those
+        # are absent we skip, since random adjacent indices are meaningless.
         if self._successor_loss_fn is not None:
             shead = getattr(self.teacher, 'successor_head', None)
-            if shead is not None and "action" in batch and "reward" in batch:
+            if shead is not None and "action" in batch:
                 cs = outputs["core_state"]
-                B_sf = cs.size(0)
-                if B_sf >= 2:
-                    sf_out_t = shead(cs[:-1])
-                    sf_out_next = shead(cs[1:].detach())
-                    dones = torch.zeros(B_sf - 1, device=self.device)
-                    sf_loss = self._successor_loss_fn(
-                        sf_out_t["psi"], sf_out_t["phi"],
-                        sf_out_next["psi"], dones,
-                    )
-                    loss = loss + 0.05 * torch.clamp(sf_loss, max=5.0)
+                episode_ids = batch.get("episode_id")
+                steps = batch.get("step")
+                if episode_ids is not None and steps is not None:
+                    # Build valid (t, t+1) pairs within the same episode
+                    ep = episode_ids.long() if isinstance(episode_ids, torch.Tensor) else torch.tensor(episode_ids, device=self.device)
+                    st = steps.long() if isinstance(steps, torch.Tensor) else torch.tensor(steps, device=self.device)
+                    B_sf = cs.size(0)
+                    # Check adjacent items: same episode AND consecutive steps
+                    same_ep = ep[:-1] == ep[1:]
+                    consecutive = st[1:] - st[:-1] == 1
+                    valid = same_ep & consecutive
+                    if valid.any():
+                        idx = valid.nonzero(as_tuple=True)[0]
+                        sf_out_t = shead(cs[idx])
+                        sf_out_next = shead(cs[idx + 1].detach())
+                        dones = torch.zeros(idx.size(0), device=self.device)
+                        sf_loss = self._successor_loss_fn(
+                            sf_out_t["psi"], sf_out_t["phi"],
+                            sf_out_next["psi"], dones,
+                        )
+                        loss = loss + 0.05 * torch.clamp(sf_loss, max=5.0)
 
         # Track task losses for PCGrad (before regularizers are added)
         task_losses: list[torch.Tensor] = []
@@ -750,7 +774,7 @@ class LearnerThread:
         ewc_penalty = torch.clamp(ewc_penalty, max=5.0)
         loss = loss + ewc_penalty
 
-        return {"total": loss, "task_losses": task_losses}
+        return {"total": loss, "task_losses": task_losses, "per_sample_loss": per_sample_value_loss}
 
     @staticmethod
     def _pcgrad_backward(
