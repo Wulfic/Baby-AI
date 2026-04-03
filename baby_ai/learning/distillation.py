@@ -526,6 +526,11 @@ class DistillationEngine:
         if replay_indices is None or B is None:
             return self._teacher_forward(inputs)
 
+        # _collate may have dropped shape-inconsistent samples, making B
+        # smaller than len(replay_indices).  Clip here so cached[i] is always
+        # a valid index and partial-hit logic below stays consistent.
+        replay_indices = replay_indices[:B]
+
         # Check cache for each sample
         cached = [None] * B
         miss_positions: list[int] = []

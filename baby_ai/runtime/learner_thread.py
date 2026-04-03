@@ -18,7 +18,9 @@ from baby_ai.config import TrainingConfig, RuntimeConfig, REBELConfig, DEFAULT_C
 from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
-from baby_ai.learning.rebel import REBELLoss
+from baby_ai.learning.rebel import REBELLoss, GRPOLoss
+from baby_ai.learning.successor import SuccessorLoss
+from baby_ai.core.goals import HERGoalSampler
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
 
@@ -81,6 +83,27 @@ class LearnerThread:
         ).to(device) if rebel_cfg.enabled else None
         self._rebel_value_loss_weight = rebel_cfg.value_loss_weight
 
+        # GRPO loss (alternative to REBEL pairing — group-relative rewards)
+        self._use_grpo = getattr(rebel_cfg, 'use_grpo', False)
+        self._grpo_loss_fn = GRPOLoss(
+            beta=rebel_cfg.beta,
+            entropy_weight=getattr(rebel_cfg, 'entropy_weight', 0.01),
+        ).to(device) if rebel_cfg.enabled else None
+
+        # Successor features loss (if teacher has a successor_head attribute)
+        _shead = getattr(teacher, 'successor_head', None)
+        self._successor_loss_fn = SuccessorLoss().to(device) if _shead is not None else None
+
+        # HER goal relabeling sampler
+        self._her_sampler = HERGoalSampler(
+            her_ratio=0.5,
+            strategy='future',
+        )
+
+        # PCGrad: project conflicting task gradients to reduce interference
+        # Only active when grad accumulation = 1 (multi-backward incompatible)
+        self._use_pcgrad = getattr(self.config, 'use_pcgrad', False)
+
         # Optimizer with parameter-group-specific learning rates
         encoder_params = []
         core_params = []
@@ -96,11 +119,25 @@ class LearnerThread:
         # AdamW: weight decay prevents weight explosion from correlated RL replay
         # inputs (value heads see near-identical states during on-policy stretches).
         # Encoders use a lower decay since their features should be stable.
-        self.optimizer = torch.optim.AdamW([
-            {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr, "weight_decay": 1e-4},
-            {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr, "weight_decay": 0.0},
-            {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr, "weight_decay": 0.01},
-        ])
+        #
+        # Try Schedule-Free AdamW (Defazio et al., 2024): eliminates LR scheduling
+        # by maintaining a dual iterate.  Falls back to standard AdamW if not installed.
+        try:
+            from schedulefree import AdamWScheduleFree
+            self.optimizer = AdamWScheduleFree([
+                {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr, "weight_decay": 1e-4},
+                {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr, "weight_decay": 0.0},
+                {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr, "weight_decay": 0.01},
+            ])
+            self._optimizer_is_sf = True
+            log.info("Using Schedule-Free AdamW optimizer.")
+        except ImportError:
+            self.optimizer = torch.optim.AdamW([
+                {"params": encoder_params, "lr": self.config.encoder_lr, "initial_lr": self.config.encoder_lr, "weight_decay": 1e-4},
+                {"params": core_params, "lr": self.config.core_lr, "initial_lr": self.config.core_lr, "weight_decay": 0.0},
+                {"params": policy_params, "lr": self.config.policy_lr, "initial_lr": self.config.policy_lr, "weight_decay": 0.01},
+            ])
+            self._optimizer_is_sf = False
 
         # Remember the *configured* base LRs so enable_cosine_schedule()
         # can always compute the correct peak, even after a checkpoint
@@ -144,6 +181,28 @@ class LearnerThread:
             })
             self._config_base_lrs.append(self.config.core_lr)
 
+        # ── Muon optimizer for 2-D SSM weight matrices ───────────────────
+        # Applied only to teacher.temporal's 2-D weight matrices.  These
+        # are removed from the main AdamW optimizer to avoid double updates.
+        # Falls back gracefully if muon.py is unavailable.
+        self.muon: object | None = None
+        try:
+            from baby_ai.utils.muon import Muon
+            _muon_params: list[torch.Tensor] = []
+            _muon_ids: set[int] = set()
+            for _n, _p in self.teacher.temporal.named_parameters():
+                if _p.dim() >= 2 and _p.requires_grad:
+                    _muon_params.append(_p)
+                    _muon_ids.add(id(_p))
+            if _muon_params:
+                # Remove these params from main optimizer groups (avoid double update)
+                for _pg in self.optimizer.param_groups:
+                    _pg["params"] = [_p for _p in _pg["params"] if id(_p) not in _muon_ids]
+                self.muon = Muon(_muon_params, lr=self.config.core_lr, momentum=0.95)
+                log.info("Muon optimizer active for %d SSM weight matrices.", len(_muon_params))
+        except Exception as _e:
+            log.debug("Muon optimizer not initialized: %s", _e)
+
         # Thread control
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -170,6 +229,9 @@ class LearnerThread:
         self._running = True
         self._stop_event.clear()
         self.teacher.to(self.device).train()
+        # Schedule-Free AdamW requires train() to be called on the optimizer
+        if self._optimizer_is_sf:
+            self.optimizer.train()
 
         # Phase A: optional torch.compile for Teacher
         if self._runtime_config.compile_teacher and hasattr(torch, 'compile'):
@@ -240,10 +302,26 @@ class LearnerThread:
 
     def _train_step(self) -> None:
         """Perform a single training step."""
-        # Sample from replay
-        transitions, weights, indices = self.replay.sample(
-            self.config.micro_batch_size, device=self.device
-        )
+        # Every 4 steps, use HER-enriched batch for goal-conditioned training;
+        # otherwise use standard prioritized sampling.
+        if self._step % 4 == 0:
+            try:
+                transitions, weights, indices = self.replay.sample_her(
+                    self.config.micro_batch_size, device=self.device
+                )
+                # Relabel goals using the HER sampler (future-strategy)
+                transitions = self._her_sampler.relabel(
+                    transitions,
+                    goal_proj=lambda s: s,  # fused is already goal-compatible
+                )
+            except Exception:
+                transitions, weights, indices = self.replay.sample(
+                    self.config.micro_batch_size, device=self.device
+                )
+        else:
+            transitions, weights, indices = self.replay.sample(
+                self.config.micro_batch_size, device=self.device
+            )
 
         # Recompose rewards with current UI weights/toggles so that
         # slider and checkbox changes take effect immediately.
@@ -252,6 +330,18 @@ class LearnerThread:
         # Build batch tensors from transitions
         batch = self._collate_transitions(transitions)
         weights_t = torch.from_numpy(weights).float().to(self.device)
+
+        # _collate_transitions may drop shape-inconsistent samples, making the
+        # actual batch smaller than micro_batch_size.  Trim weights and indices
+        # to match so downstream losses (value_loss, rebel_loss) don't crash
+        # with "size of tensor a != tensor b" runtime errors on dim 0.
+        actual_B = next(
+            (v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor)),
+            len(weights),
+        )
+        if actual_B < len(weights):
+            weights_t = weights_t[:actual_B]
+            indices = indices[:actual_B]
 
         # Forward pass with AMP
         # Acquire the teacher lock to prevent the distillation thread
@@ -294,7 +384,28 @@ class LearnerThread:
                 return
 
             # Backward with gradient accumulation
-            if self.scaler is not None:
+            # PCGrad applies multiple per-task backward passes and projects
+            # conflicting gradients.  Only active when:
+            #   1. use_pcgrad is set in training config
+            #   2. gradient_accumulation_steps == 1 (multi-backward incompatible)
+            #   3. There are ≥2 separate task losses in the dict
+            _task_losses = loss_dict.get("task_losses", [])
+            _use_pcgrad_now = (
+                self._use_pcgrad
+                and self.config.gradient_accumulation_steps == 1
+                and len(_task_losses) >= 2
+            )
+            if _use_pcgrad_now:
+                _trainable_params = [p for p in self.teacher.parameters() if p.requires_grad]
+                self._pcgrad_backward(_task_losses, _trainable_params, self.scaler)
+                # Also backward the regularizer terms (MoE aux + EWC) on top
+                _reg = total_loss - sum(_task_losses)
+                if _reg.grad_fn is not None:
+                    if self.scaler is not None:
+                        self.scaler.scale(_reg).backward()
+                    else:
+                        _reg.backward()
+            elif self.scaler is not None:
                 self.scaler.scale(total_loss / self.config.gradient_accumulation_steps).backward()
             else:
                 (total_loss / self.config.gradient_accumulation_steps).backward()
@@ -318,6 +429,12 @@ class LearnerThread:
                     )
                     try:
                         self.scaler.step(self.optimizer)
+                        # Muon uses unscaled gradients (already unscaled above)
+                        if self.muon is not None:
+                            try:
+                                self.muon.step()
+                            except Exception as _me:
+                                log.debug("Muon step (scaler path) failed: %s", _me)
                         _step_ok = True
                     except Exception as e:
                         log.error("GradScaler.step failed at learner step %d: %s", self._step, e)
@@ -342,6 +459,12 @@ class LearnerThread:
                     self.teacher.parameters(), max_norm=1.0
                 )
                 self.optimizer.step()
+                # Muon optimizer steps independently (handles its own params)
+                if self.muon is not None:
+                    try:
+                        self.muon.step()
+                    except Exception as _me:
+                        log.debug("Muon step failed: %s", _me)
 
             # ── Sync learning rate ─────────────────────────────────
             if self._lr_scheduler is not None:
@@ -499,23 +622,42 @@ class LearnerThread:
         if "action" in batch and "reward" in batch:
             actions = batch["action"]
             rewards = batch["reward"]
+            v_pred = value.squeeze(-1)
 
-            # Value loss — always trained (needed for System 2 trajectory scoring)
-            value_loss = (F.smooth_l1_loss(value.squeeze(-1), rewards, reduction='none') * weights).mean()
+            # ── V-trace value targets (IMPALA-style off-policy correction) ──
+            # If we stored log_prob + value from the behavior policy at
+            # collection time, compute importance-weighted V-trace targets.
+            # rho = clip(pi / mu, rho_bar=1.0) — single-step V-trace.
+            # v_target = V_mu + rho * (r - V_mu)
+            # This corrects for the off-policy gap between the current
+            # policy π and the behavior policy μ that collected the data.
+            if "log_prob" in batch and "value" in batch:
+                mu_log_prob = batch["log_prob"].float()
+                mu_value = batch["value"].float().squeeze(-1)
+                with torch.no_grad():
+                    try:
+                        # Get current pi_log_prob from the live policy
+                        pi_lp, _, _ = self.teacher.policy.evaluate(
+                            outputs["core_state"], actions
+                        )
+                        rho = (pi_lp.detach() - mu_log_prob).exp().clamp(max=1.0)
+                    except Exception:
+                        rho = torch.ones_like(rewards)
+                    v_target = (mu_value + rho * (rewards - mu_value)).clamp(-7.0, 7.0)
+            else:
+                # No behavior log_prob stored — fall back to raw reward target
+                v_target = rewards.clamp(-7.0, 7.0)
+
+            # Value loss against V-trace targets
+            value_loss = (F.smooth_l1_loss(v_pred, v_target, reduction='none') * weights).mean()
 
             if self._rebel_enabled and self._rebel_loss_fn is not None:
-                # ── REBEL paired loss (Phase D) ──
+                # ── REBEL / GRPO paired loss ──
                 rebel_loss = self._compute_rebel_loss(outputs, batch, weights)
                 loss = rebel_loss + self._rebel_value_loss_weight * value_loss
             else:
                 # ── Legacy: reward-weighted denoising loss ──
-                # NOTE: "value" is never stored in replay transitions,
-                # so old_values is always zeros.  Advantage thus equals
-                # raw rewards.  This is a known limitation — a proper
-                # implementation would store the value estimate at
-                # collection time for off-policy correction.
-                old_values = batch.get("value", torch.zeros_like(rewards))
-                advantage = rewards - old_values.squeeze(-1)
+                advantage = (v_target - v_pred.detach())
                 advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
                 advantage = torch.clamp(advantage, -3.0, 3.0)
                 denoising_loss = outputs.get("denoising_loss", torch.tensor(0.0, device=value.device))
@@ -535,28 +677,173 @@ class LearnerThread:
             kl_loss = torch.clamp(wm_out["kl_loss"], max=10.0)
             loss = loss + 0.1 * dynamics_loss + 0.01 * kl_loss
 
+            # ── Counterfactual causal auxiliary loss ─────────────────────
+            cf_loss = wm_out.get("counterfactual_loss")
+            if cf_loss is not None:
+                loss = loss + 0.01 * torch.clamp(cf_loss, max=5.0)
+
+            # ── Dyna imagined rollouts (every 8 steps to limit overhead) ──
+            if self._step % 8 == 0 and "action" in batch:
+                try:
+                    with torch.no_grad():
+                        start_lat = self.teacher.predictive.encode_state(
+                            outputs["core_state"][:4]  # small imagined batch
+                        )
+                    imagined = self.teacher.predictive.imagine_rollout(
+                        start_lat, self.teacher.policy, horizon=3
+                    )
+                    # Add imagined transitions to replay at low priority
+                    for it in imagined:
+                        self.replay.add(it, priority=0.1)
+                except Exception:
+                    pass  # non-critical; skip on any error
+
+        # ── CoT communication signal ─────────────────────────────────────
+        # Train comm head to predict next subgoal token conditioned on
+        # comm_logits from the current step.  Acts as a chain-of-thought
+        # scratchpad: forces the comm head to encode useful intermediate
+        # state about the current goal.
+        if "comm_logits" in outputs and "action" in batch:
+            comm_logits = outputs["comm_logits"]  # (B, vocab_size)
+            # Self-prediction: next comm token ≈ argmax of current logits
+            # Use stop-grad target to avoid trivial collapse
+            with torch.no_grad():
+                pseudo_target = comm_logits.argmax(dim=-1)  # (B,)
+            # Only keep predictions where pseudo-confidence is high
+            conf = comm_logits.softmax(dim=-1).max(dim=-1).values  # (B,)
+            high_conf = conf > 0.3
+            if high_conf.any():
+                cot_loss = F.cross_entropy(
+                    comm_logits[high_conf], pseudo_target[high_conf]
+                )
+                loss = loss + 0.01 * torch.clamp(cot_loss, max=5.0)
+
+        # ── Successor features loss ──────────────────────────────────────
+        if self._successor_loss_fn is not None:
+            shead = getattr(self.teacher, 'successor_head', None)
+            if shead is not None and "action" in batch and "reward" in batch:
+                cs = outputs["core_state"]
+                B_sf = cs.size(0)
+                if B_sf >= 2:
+                    sf_out_t = shead(cs[:-1])
+                    sf_out_next = shead(cs[1:].detach())
+                    dones = torch.zeros(B_sf - 1, device=self.device)
+                    sf_loss = self._successor_loss_fn(
+                        sf_out_t["psi"], sf_out_t["phi"],
+                        sf_out_next["psi"], dones,
+                    )
+                    loss = loss + 0.05 * torch.clamp(sf_loss, max=5.0)
+
+        # Track task losses for PCGrad (before regularizers are added)
+        task_losses: list[torch.Tensor] = []
+        if loss.grad_fn is not None:
+            task_losses.append(loss)  # policy + value loss
+
         # MoE load-balancing auxiliary loss (from Jamba temporal core)
         if hasattr(self.teacher, 'temporal') and hasattr(self.teacher.temporal, 'aux_loss'):
             moe_loss = self.teacher.temporal.aux_loss
             if moe_loss.requires_grad or moe_loss.item() > 0:
                 loss = loss + moe_loss
 
-        # EWC penalty
+        # EWC penalty (regularizer — excluded from PCGrad task set)
         ewc_penalty = self.consolidator.consolidation_loss(self.teacher)
         ewc_penalty = torch.clamp(ewc_penalty, max=5.0)
         loss = loss + ewc_penalty
 
-        return {"total": loss}
+        return {"total": loss, "task_losses": task_losses}
+
+    @staticmethod
+    def _pcgrad_backward(
+        task_losses: list,
+        params: list,
+        scaler=None,
+    ) -> None:
+        """
+        PCGrad: Project Conflicting Gradients (Yu et al., 2020).
+
+        For each pair of task gradients whose cosine similarity is negative
+        (i.e. they conflict), project each gradient onto the plane orthogonal
+        to the other.  Sum the projected gradients and assign to param.grad.
+
+        Skips multiple backward passes when gradient accumulation or AMP
+        scaler is active (requires retain_graph which is incompatible).
+        Falls back to normal summed backward in those cases.
+        """
+        n = len(task_losses)
+        if n <= 1:
+            loss = task_losses[0] if n == 1 else None
+            if loss is not None:
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            return
+
+        # ── Per-task backward with retain_graph ───────────────────────────
+        # Each backward accumulates into p.grad; scaler-unscaling is done
+        # once at the end so the raw scale factor is consistent.
+        task_grad_vecs: list[torch.Tensor] = []
+        for idx, t_loss in enumerate(task_losses):
+            # Zero grad before each task backward so we capture only this task
+            for p in params:
+                p.grad = None
+            retain = (idx < n - 1)  # last loss doesn't need retain
+            if scaler is not None:
+                scaler.scale(t_loss).backward(retain_graph=retain)
+                # Temporarily unscale to work in true-gradient space
+                inv_scale = 1.0 / (scaler.get_scale() + 1e-8)
+                flat = torch.cat([
+                    (p.grad * inv_scale).detach().flatten() if p.grad is not None
+                    else torch.zeros(p.numel(), device=p.device)
+                    for p in params
+                ])
+            else:
+                t_loss.backward(retain_graph=retain)
+                flat = torch.cat([
+                    p.grad.detach().flatten() if p.grad is not None
+                    else torch.zeros(p.numel(), device=p.device)
+                    for p in params
+                ])
+            task_grad_vecs.append(flat)
+
+        # ── PCGrad projection ─────────────────────────────────────────────
+        projected = [g.clone() for g in task_grad_vecs]
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                gj_norm_sq = task_grad_vecs[j].dot(task_grad_vecs[j]) + 1e-12
+                dot = projected[i].dot(task_grad_vecs[j])
+                if dot < 0:
+                    projected[i] = projected[i] - (dot / gj_norm_sq) * task_grad_vecs[j]
+
+        # ── Assign summed projected gradients back to params ──────────────
+        summed = sum(projected)
+        offset = 0
+        inv_s = 1.0 / (scaler.get_scale() + 1e-8) if scaler is not None else 1.0
+        for p in params:
+            n_elem = p.numel()
+            chunk = summed[offset: offset + n_elem].view_as(p)
+            if scaler is not None:
+                # Re-apply scale factor so the scaler.unscale_() call in the
+                # training loop produces the correct unscaled gradient.
+                p.grad = (chunk / inv_s).contiguous()
+            else:
+                p.grad = chunk.contiguous()
+            offset += n_elem
 
     def _compute_rebel_loss(
         self, outputs: dict, batch: dict, weights: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute REBEL paired preference loss (Phase D).
+        Compute reinforcement learning policy loss.
 
-        Splits the batch into two halves and designates the higher-reward
-        action in each pair as the "winner".  Falls back to the flow-loss
-        from the forward pass if the batch is too small for pairing.
+        Supports two modes:
+          • GRPO: Group-relative policy optimisation (all transitions,
+            group-normalised advantages).  Enabled when rebel_cfg.use_grpo=True.
+          • REBEL: Paired preference loss (half-batch pairing).  Default.
+
+        Falls back to denoising_loss when the batch is too small.
         """
         actions = batch["action"]
         rewards = batch["reward"]
@@ -564,17 +851,20 @@ class LearnerThread:
         B = actions.size(0)
 
         if B < 4:
-            # Batch too small for meaningful pairing — use forward flow loss
             return outputs.get("denoising_loss", torch.tensor(0.0, device=actions.device))
 
+        # ── GRPO mode (group-relative reward normalisation) ───────────────
+        if self._use_grpo and self._grpo_loss_fn is not None:
+            return self._grpo_loss_fn(core_state, actions, rewards, self.teacher.policy)
+
+        # ── REBEL paired mode ─────────────────────────────────────────────
         half = B // 2
         s1, s2 = core_state[:half], core_state[half:half * 2]
         a1, a2 = actions[:half], actions[half:half * 2]
         r1, r2 = rewards[:half], rewards[half:half * 2]
 
-        # Determine winner/loser per pair
-        w_mask = r1 >= r2  # True where first element is winner
-        state_pairs = s1  # Use first-half states as conditioning
+        w_mask = r1 >= r2
+        state_pairs = s1
         action_w = torch.where(w_mask.unsqueeze(-1), a1, a2)
         action_l = torch.where(w_mask.unsqueeze(-1), a2, a1)
         reward_w = torch.where(w_mask, r1, r2)

@@ -158,6 +158,7 @@ class REBELConfig:
     reward_clip: float = 5.0      # clip relative rewards
     value_loss_weight: float = 0.5  # keep training value head for System 2
     entropy_weight: float = 0.01  # entropy bonus weight — prevents policy collapse during reward deserts
+    use_grpo: bool = False        # if True, use GRPO instead of paired REBEL preference loss
 
 
 @dataclass
@@ -171,6 +172,41 @@ class VQConfig:
     action_chunk_size: int = 1      # predict N actions at once (1 = no chunking)
     ema_update: bool = True         # EMA codebook updates (vs gradient)
     ema_decay: float = 0.99         # codebook EMA decay rate
+
+
+@dataclass
+class TitansMemoryConfig:
+    """Titans-style episodic K-V memory configuration."""
+    enabled: bool = False      # off by default (adds ~0.5M params + latency)
+    mem_slots: int = 64        # ring-buffer slots (64 × hidden_dim values in RAM)
+    key_dim_ratio: float = 0.25  # key_dim = hidden_dim * key_dim_ratio
+
+
+@dataclass
+class SlotAttentionConfig:
+    """Slot Attention vision encoder configuration."""
+    enabled: bool = False      # off by default: adds ~1M params, +5ms camera encode
+    num_slots: int = 8         # number of object-centric slots K
+    slot_dim: int = 64         # per-slot dimension
+    num_iters: int = 3         # competitive attention iterations
+
+
+@dataclass
+class SuccessorConfig:
+    """Successor Features configuration."""
+    enabled: bool = False      # off by default: adds ~0.5M params
+    sf_dim: int = 128          # successor feature vector dimension
+    num_tasks: int = 16        # number of pre-defined task weight vectors
+    loss_weight: float = 0.05  # weight of successor TD loss in total loss
+
+
+@dataclass
+class CraftingGraphConfig:
+    """Minecraft crafting graph prior configuration."""
+    enabled: bool = False      # off by default: adds ~0.5M params
+    embed_dim: int = 128       # item embedding dimension (should match goal_dim)
+    hidden_dim: int = 64       # GAT hidden dimension
+    affinity_weight: float = 0.01  # goal-affinity regularisation weight
 
 
 @dataclass
@@ -212,6 +248,18 @@ class StudentConfig:
 
     # VQ-BeT action tokenizer (Phase E)
     vq: VQConfig = field(default_factory=VQConfig)
+
+    # Titans episodic memory
+    titans_memory: TitansMemoryConfig = field(default_factory=TitansMemoryConfig)
+
+    # Slot Attention vision
+    slot_attention: SlotAttentionConfig = field(default_factory=SlotAttentionConfig)
+
+    # Successor Features
+    successor: SuccessorConfig = field(default_factory=SuccessorConfig)
+
+    # Crafting graph prior
+    crafting_graph: CraftingGraphConfig = field(default_factory=CraftingGraphConfig)
 
     # System 2 test-time search
     system2: System2Config = field(default_factory=System2Config)
@@ -267,6 +315,18 @@ class TeacherConfig:
 
     # VQ-BeT action tokenizer (Phase E)
     vq: VQConfig = field(default_factory=VQConfig)
+
+    # Titans episodic memory
+    titans_memory: TitansMemoryConfig = field(default_factory=TitansMemoryConfig)
+
+    # Slot Attention vision
+    slot_attention: SlotAttentionConfig = field(default_factory=SlotAttentionConfig)
+
+    # Successor Features
+    successor: SuccessorConfig = field(default_factory=SuccessorConfig)
+
+    # Crafting graph prior
+    crafting_graph: CraftingGraphConfig = field(default_factory=CraftingGraphConfig)
 
     # System 2 — disabled for Teacher (Teacher trains, doesn't plan)
     system2: System2Config = field(default_factory=lambda: System2Config(enabled=False))

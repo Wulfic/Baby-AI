@@ -39,6 +39,7 @@ from baby_ai.core.communication import CommunicationHead
 from baby_ai.core.predictive import LatentWorldModel
 from baby_ai.core.goals import GoalConditioner
 from baby_ai.core.action_tokenizer import ActionTokenizer
+from baby_ai.models.memory import EpisodicMemory
 from baby_ai.config import JambaConfig, DiffusionPolicyConfig, FlowMatchingConfig, VQConfig
 
 
@@ -94,6 +95,10 @@ class BabyAgentBase(nn.Module):
         vq_config: VQConfig | None = None,
         policy_type: str = "flow_matching",
         goal_dim: int = 0,
+        use_slot_attention: bool = False,
+        num_vision_slots: int = 8,
+        use_episodic_memory: bool = False,
+        mem_slots: int = 64,
     ):
         super().__init__()
 
@@ -102,6 +107,8 @@ class BabyAgentBase(nn.Module):
             in_channels=3,
             embed_dim=vision_embed_dim,
             width_mult=vision_width_mult,
+            use_slot_attention=use_slot_attention,
+            num_slots=num_vision_slots,
         )
         self.audio_encoder = AudioEncoder(
             n_mels=n_mels,
@@ -209,6 +216,17 @@ class BabyAgentBase(nn.Module):
             stochastic_dim=32,
         )
 
+        # --- Episodic K-V memory (Titans-style) ---
+        if use_episodic_memory:
+            self.episodic_memory = EpisodicMemory(
+                mem_slots=mem_slots,
+                key_dim=hidden_dim // 4,
+                value_dim=hidden_dim,
+                input_dim=hidden_dim,
+            )
+        else:
+            self.episodic_memory = None
+
         # --- Goal conditioning (System 3) ---
         self.goal_dim = goal_dim
         if goal_dim > 0:
@@ -314,6 +332,11 @@ class BabyAgentBase(nn.Module):
         if self.goal_conditioner is not None:
             core_state = self.goal_conditioner(core_state, goal)
 
+        # Episodic K-V memory augmentation
+        if self.episodic_memory is not None:
+            core_state = self.episodic_memory.read(core_state)
+            self.episodic_memory.encode_and_write(core_state.detach())
+
         comm_logits = self.communication.get_logits(core_state)
 
         policy_loss, value = self.policy(core_state, actions=actions)
@@ -369,6 +392,11 @@ class BabyAgentBase(nn.Module):
         # Apply goal conditioning (System 3) — FiLM modulation
         if self.goal_conditioner is not None:
             core_state = self.goal_conditioner(core_state, goal)
+
+        # Episodic K-V memory augmentation
+        if self.episodic_memory is not None:
+            core_state = self.episodic_memory.read(core_state)
+            self.episodic_memory.encode_and_write(core_state.detach())
 
         action, log_prob, value = self.policy.act(core_state, deterministic=deterministic)
         utterance = self.communication(core_state)  # autoregressive generation

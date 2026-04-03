@@ -395,20 +395,33 @@ class DiffusionPolicyHead(nn.Module):
         B = state.size(0)
         device = state.device
 
-        # Estimate log_prob: how well the noise net can reconstruct
-        # the action at a medium noise level
-        t_eval = torch.full((B,), self.num_train_steps // 2, device=device)
-        noise = torch.randn_like(action)
-        noisy = self._q_sample(action, t_eval, noise)
-        noise_pred = self.noise_net(noisy, t_eval, state)
-        reconstruction_error = (noise_pred - noise).pow(2).mean(dim=-1)
+        # Option C: DDPM ELBO for a proper variational lower bound on log p(a|s).
+        # L_ELBO(a|s) = -E_t[ w(t) * ||ε_θ(a_t, t, s) - ε||² ]
+        # where w(t) = 1/(2σ_t²) = 1/(2*(1-ᾱ_t)) is the SNR-based importance weight.
+        # Averaging over N_ELBO independent (t, ε) samples gives an unbiased estimator.
+        _N_ELBO = 8  # MC samples: balance quality vs compute (adds ~8× noise net fwds)
+        log_prob = torch.zeros(B, device=device)
+        eps_preds: list[torch.Tensor] = []
 
-        # log_prob proxy: lower error → higher probability, scaled
-        log_prob = -reconstruction_error
+        for _ in range(_N_ELBO):
+            t = torch.randint(0, self.num_train_steps, (B,), device=device)
+            noise = torch.randn_like(action)
+            noisy = self._q_sample(action, t, noise)
+            eps_pred = self.noise_net(noisy, t, state)
+            eps_preds.append(eps_pred.detach())
 
-        # Entropy proxy: average noise prediction variance across timesteps
-        # (higher variance = more uncertain = higher entropy)
-        entropy = torch.ones(B, device=device) * 0.5  # placeholder constant
+            # Per-sample importance-weighted reconstruction quality
+            sigma_sq = (1.0 - self.alpha_bar[t]).clamp(min=1e-5)  # (B,)
+            w_t = 1.0 / (2.0 * sigma_sq)                          # (B,)
+            recon = (eps_pred - noise).pow(2).mean(dim=-1)         # (B,)
+            log_prob = log_prob - w_t * recon
+
+        log_prob = log_prob / _N_ELBO  # average over MC samples
+
+        # Entropy from variance of noise predictions across MC samples.
+        # High epistemic variance → model uncertain → higher entropy.
+        eps_stack = torch.stack(eps_preds, dim=0)              # (N, B, action_dim)
+        entropy = eps_stack.std(dim=0).mean(dim=-1).clamp(min=0.01)  # (B,)
 
         value = self.value_head(state)
         return log_prob, entropy, value
@@ -661,19 +674,33 @@ class FlowMatchingPolicyHead(nn.Module):
         B = state.size(0)
         device = state.device
 
-        # Reconstruct: how well can we predict velocity for this action?
-        t_eval = torch.full((B,), 0.5, device=device)
-        x_0 = torch.randn_like(action)
-        t_expand = t_eval.unsqueeze(-1)
-        x_t = (1 - t_expand) * x_0 + t_expand * action
-        v_target = action - x_0
-        v_pred = self.velocity_net(x_t, t_eval, state)
+        # Option C: Flow-matching ELBO for a proper log_prob estimate.
+        # E_t[-||v_\u03b8(x_t, t, s) - v_target||^2]
+        # where v_target = action - x_0 (straight OT displacement).
+        # Averaging over N_ELBO independent (t, x_0) samples gives an
+        # unbiased estimator of the negative expected flow-matching loss,
+        # which bounds log p(action|state) from below.
+        _N_ELBO = 8  # MC samples
+        log_prob = torch.zeros(B, device=device)
+        v_preds: list[torch.Tensor] = []
 
-        reconstruction_error = (v_pred - v_target).pow(2).mean(dim=-1)
-        log_prob = -reconstruction_error
+        for _ in range(_N_ELBO):
+            t = torch.rand(B, device=device)
+            x_0 = torch.randn_like(action)
+            t_expand = t.unsqueeze(-1)
+            x_t = (1 - t_expand) * x_0 + t_expand * action
+            v_target = action - x_0
+            v_pred = self.velocity_net(x_t, t, state)
+            v_preds.append(v_pred.detach())
 
-        # Entropy proxy: proportional to velocity field divergence
-        entropy = torch.ones(B, device=device) * 0.5
+            recon = (v_pred - v_target).pow(2).mean(dim=-1)  # (B,)
+            log_prob = log_prob - recon
+
+        log_prob = log_prob / _N_ELBO
+
+        # Entropy from variance of velocity predictions across MC samples.
+        v_stack = torch.stack(v_preds, dim=0)                              # (N, B, action_dim)
+        entropy = v_stack.std(dim=0).mean(dim=-1).clamp(min=0.01)          # (B,)
 
         value = self.value_head(state)
         return log_prob, entropy, value

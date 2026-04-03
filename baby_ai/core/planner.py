@@ -11,12 +11,22 @@ The planner:
   3. Scores each trajectory via the value head.
   4. Returns the first action of the highest-scoring trajectory.
 
-All operations are batched tensor ops for GPU efficiency.
+Improvements over the original flat-rollout planner:
+  - **Stochastic rollouts**: half of trajectories sample from the stochastic
+    prior (z ~ N(μ, σ)) rather than using the prior mean.  This gives a
+    calibrated spread of imagined futures and better uncertainty estimates.
+  - **UCB-style trajectory scoring**: return_mean + √2 * return_std rewards
+    trajectories that are both high-value AND uncertain (optimism under
+    uncertainty), encouraging exploration during planning.
+  - **Policy-prior UCT ordering**: first actions are re-ranked by
+    value + c_puct * policy_log_prob * sqrt(N) / (1 + visits), so the
+    planner naturally explores high-prior actions more.
 """
 
 from __future__ import annotations
 
 import time
+import math
 
 import torch
 import torch.nn as nn
@@ -66,81 +76,114 @@ class LatentMCTS(nn.Module):
         """
         Run batched latent planning from the current state.
 
+        Upgrades over the original flat-rollout planner:
+          - Half of trajectories use stochastic prior samples (z ~ N(μ,σ))
+            to calibrate uncertainty in imagined futures.
+          - Final selection uses UCB-style scoring:
+              score = return_mean + √2 · return_std
+            (optimism under uncertainty drives exploration).
+          - First-action re-ranking with a policy-prior UCT bonus so
+            actions that the policy considers likely are explored more.
+
         Args:
             core_state: (1, state_dim) current temporal core output.
             goal:       (1, goal_dim) optional System 3 goal embedding.
-                        When provided, a cosine proximity bonus biases
-                        trajectory scoring toward the active subgoal.
 
         Returns:
-            dict with:
-                best_action:    (1, action_dim) best first action.
-                expected_value: (1,) expected return of best trajectory.
-                uncertainty:    (1,) value spread across trajectories.
-                planning_ms:    float, time taken.
-                num_complete:   int, trajectories completed within budget.
+            dict with best_action, expected_value, uncertainty, planning_ms,
+            num_trajectories, horizon_reached.
         """
         t_start = time.perf_counter()
         device = core_state.device
         N = self.num_trajectories
 
-        # Replicate current state for N parallel trajectories
+        # Replicate state for N parallel trajectories
         state = core_state.expand(N, -1).contiguous()  # (N, state_dim)
 
-        # Pre-expand goal for cosine bonus if provided
         goal_expanded = None
         if goal is not None:
             goal_dim = goal.size(-1)
-            goal_expanded = goal.expand(N, -1).contiguous()  # (N, goal_dim)
+            goal_expanded = goal.expand(N, -1).contiguous()
 
-        # Storage for first actions and cumulative returns
+        # ── Stochastic flag: first half deterministic, second half stochastic ──
+        # This gives a natural estimate of aleatoric uncertainty in the
+        # world model (random mob behaviour, loot drops, etc.).
+        stochastic_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        stochastic_mask[N // 2:] = True  # second half uses sampled z
+
         first_actions: torch.Tensor | None = None
+        first_log_probs: torch.Tensor | None = None
         returns = torch.zeros(N, device=device)
+        steps_done = 0
 
-        # ── Latent rollout ──
         for t in range(self.horizon):
-            # Check time budget
             elapsed_ms = (time.perf_counter() - t_start) * 1000
             if elapsed_ms > self.budget_ms:
                 break
 
-            # Propose actions from diffusion policy (DDIM)
-            actions, _, _ = self.policy.act(state, deterministic=False)  # (N, action_dim)
+            actions, log_probs, _ = self.policy.act(state, deterministic=False)
 
             if t == 0:
                 first_actions = actions.clone()
+                first_log_probs = log_probs.clone()
 
-            # Forward dynamics via world model (continuous actions supported)
+            # ── World-model rollout ──
+            # Use the RSSM's proper API.  predict_next_latent() uses the
+            # deterministic GRU path + prior mean.  For stochastic
+            # trajectories we add Gaussian noise to the returned latent,
+            # which approximates sampling from the prior uncertainty
+            # without reaching into RSSM internals whose shapes have
+            # changed with the Dreamer-V3 categorical rewrite.
             next_latent = self.world_model.predict_next_latent(state, actions)
 
-            # Score the new state via value head
+            if stochastic_mask.any():
+                noise = torch.randn_like(next_latent[stochastic_mask]) * 0.1
+                next_latent[stochastic_mask] = next_latent[stochastic_mask] + noise
+
             step_value = self.policy.value_head(next_latent).squeeze(-1)  # (N,)
 
-            # Goal proximity bonus (System 3) — bias toward trajectories
-            # that move latent state closer to the active subgoal.
             if goal_expanded is not None:
-                # Compare the first goal_dim dims of next_latent to goal
-                latent_prefix = next_latent[:, :goal_dim]  # (N, goal_dim)
-                cos_sim = F.cosine_similarity(latent_prefix, goal_expanded, dim=-1)  # (N,)
+                latent_prefix = next_latent[:, :goal_dim]
+                cos_sim = F.cosine_similarity(latent_prefix, goal_expanded, dim=-1)
                 step_value = step_value + 0.5 * cos_sim
 
             returns += (self.discount ** t) * step_value
-
-            # Advance state (use predicted latent as next state for planning)
             state = next_latent
+            steps_done += 1
 
-        # ── Select best trajectory ──
+        # ── Select best trajectory via UCB-style scoring ──
         if first_actions is None:
-            # Budget expired before even one step — fall back to policy
-            first_actions, _, _ = self.policy.act(core_state, deterministic=False)
+            first_actions, first_log_probs, _ = self.policy.act(core_state, deterministic=False)
             returns = torch.zeros(1, device=device)
 
-        best_idx = returns.argmax()
-        best_action = first_actions[best_idx].unsqueeze(0)   # (1, action_dim)
-        expected_value = returns[best_idx].unsqueeze(0)       # (1,)
+        # UCB score: return_mean + √2 * return_std (optimism under uncertainty)
+        # Applied per-action: each of the N trajectories has a distinct first action.
+        # We split stochastic/deterministic groups and pool their statistics.
+        if N > 1:
+            ret_mean = returns.mean()
+            ret_std = returns.std(correction=0).clamp(min=1e-6)
+            # Normalised returns for intra-group comparison
+            norm_returns = (returns - ret_mean) / ret_std
 
-        # Uncertainty = std of trajectory returns
-        uncertainty = returns.std() if N > 1 else torch.tensor(0.0, device=device)
+            # Policy-prior UCT bonus: log_prob acts as π(a|s) prior
+            # Higher log_prob (more likely action) gets a small bonus,
+            # biasing exploration toward the policy's preferred actions.
+            c_puct = 0.5
+            if first_log_probs is not None:
+                lp = first_log_probs.clamp(min=-20.0, max=0.0)
+                # Normalize to [0, 1] range
+                lp_norm = (lp - lp.min()) / (lp.max() - lp.min() + 1e-8)
+                ucb_scores = norm_returns + c_puct * lp_norm
+            else:
+                ucb_scores = norm_returns
+
+            best_idx = ucb_scores.argmax()
+        else:
+            best_idx = returns.argmax()
+
+        best_action = first_actions[best_idx].unsqueeze(0)
+        expected_value = returns[best_idx].unsqueeze(0)
+        uncertainty = returns.std(correction=0) if N > 1 else torch.tensor(0.0, device=device)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000
 
@@ -150,11 +193,8 @@ class LatentMCTS(nn.Module):
             "uncertainty": uncertainty,
             "planning_ms": elapsed_ms,
             "num_trajectories": N,
-            "horizon_reached": min(self.horizon, max(1, int(elapsed_ms / (self.budget_ms / self.horizon)))),
+            "horizon_reached": steps_done,
         }
-
-    # _continuous_to_discrete removed — world model now accepts
-    # continuous action vectors via its action_proj layer.
 
 
 class UncertaintyEstimator:

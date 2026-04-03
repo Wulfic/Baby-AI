@@ -498,14 +498,33 @@ class MoELayer(nn.Module):
                 self.load_balance_weight * self.num_experts * (f * P).sum()
             )
 
-        # ── Dispatch to experts ──
+        # ── Dispatch to experts (batched scatter/gather) ──
+        # Process all tokens assigned to each expert in a single batched
+        # forward pass rather than iterating over (k_idx, e_idx) doubly.
+        # This collapses the inner loop and maximises GPU tensor-core use.
         output = torch.zeros_like(x_flat)
-        for k_idx in range(self.top_k):
-            for e_idx in range(self.num_experts):
+        for e_idx in range(self.num_experts):
+            e_inputs: list[torch.Tensor] = []
+            e_weights: list[torch.Tensor] = []
+            e_positions: list[torch.Tensor] = []
+            for k_idx in range(self.top_k):
                 mask = top_indices[:, k_idx] == e_idx
                 if mask.any():
-                    expert_out = self.experts[e_idx](x_flat[mask])
-                    output[mask] += top_weights[mask, k_idx].unsqueeze(-1) * expert_out
+                    pos = mask.nonzero(as_tuple=True)[0]
+                    e_inputs.append(x_flat[pos])
+                    e_weights.append(top_weights[pos, k_idx])
+                    e_positions.append(pos)
+            if not e_inputs:
+                continue
+            all_in = torch.cat(e_inputs, dim=0)      # (M, D)
+            all_w  = torch.cat(e_weights, dim=0)     # (M,)
+            all_pos = torch.cat(e_positions, dim=0)  # (M,)
+            expert_out = self.experts[e_idx](all_in) # single batched fwd: (M, D)
+            output.scatter_add_(
+                0,
+                all_pos.unsqueeze(-1).expand_as(expert_out),
+                all_w.unsqueeze(-1) * expert_out,
+            )
 
         output = output.reshape(B, T, D)
         if len(orig_shape) == 2:

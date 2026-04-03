@@ -56,10 +56,14 @@ class GoalProposer(nn.Module):
         goal_dim: int = 64,
         num_candidates: int = 8,
         hidden_dim: int = 256,
+        crafting_graph=None,  # optional CraftingGraph instance
+        crafting_affinity_weight: float = 0.1,
     ):
         super().__init__()
         self.goal_dim = goal_dim
         self.num_candidates = num_candidates
+        self._crafting_graph = crafting_graph
+        self._crafting_affinity_weight = crafting_affinity_weight
 
         # Shared trunk
         self.trunk = nn.Sequential(
@@ -98,6 +102,21 @@ class GoalProposer(nn.Module):
         goals = self.goal_heads(h)                            # (B, K * goal_dim)
         goals = goals.view(-1, self.num_candidates, self.goal_dim)
         scores = self.score_head(h)                           # (B, K)
+
+        # Optional: bias scores toward crafting-graph-reachable goals
+        if self._crafting_graph is not None:
+            try:
+                # goals: (B, K, goal_dim) → flatten to (B*K, goal_dim)
+                flat_goals = goals.detach().view(-1, self.goal_dim)
+                # affinities: (B*K, num_items) → max over items → (B*K)
+                affinities = self._crafting_graph.goal_affinities(flat_goals)  # (B*K, I)
+                craft_score = affinities.max(dim=-1).values.view(
+                    goals.size(0), self.num_candidates
+                )  # (B, K)
+                scores = scores + self._crafting_affinity_weight * craft_score
+            except Exception:
+                pass  # crafting graph optional; skip on any error
+
         return {"goals": goals, "scores": scores}
 
     def project_fused(self, fused: torch.Tensor) -> torch.Tensor:
@@ -377,3 +396,157 @@ class GoalMonitor:
         self._total_steps = 0
         self._last_replan_step = -999
         self._best_similarity = -1.0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# HER Goal Sampler
+# ────────────────────────────────────────────────────────────────────────────
+
+class HERGoalSampler:
+    """
+    Hindsight Experience Replay (HER) goal relabelling.
+
+    For each transition in a replay batch, samples a 'hindsight' goal
+    from a *future* state in the same episode.  This allows the agent
+    to learn even from trajectories that never achieved the intended goal.
+
+    Strategies:
+        'future':   Sample uniformly from states strictly after the current step.
+        'episode':  Sample uniformly from any state in the same episode.
+        'final':    Always use the last state of the episode.
+
+    Args:
+        strategy:   One of 'future', 'episode', 'final'.
+        her_ratio:  Fraction of transitions to relabel with hindsight goals.
+    """
+
+    def __init__(
+        self,
+        strategy: str = "future",
+        her_ratio: float = 0.5,
+    ):
+        assert strategy in ("future", "episode", "final")
+        self.strategy = strategy
+        self.her_ratio = her_ratio
+
+    def relabel(
+        self,
+        batch: list[dict],
+        goal_proj: nn.Module,
+    ) -> list[dict]:
+        """
+        Relabel a fraction of the batch with hindsight goals.
+
+        Args:
+            batch:     List of transition dicts, each must contain:
+                         'episode_id', 'step', 'core_state' (tensor),
+                         optionally 'goal' (tensor).
+            goal_proj: Module projecting core_state → goal_dim.
+                       (e.g. GoalProposer.goal_proj)
+
+        Returns:
+            Augmented batch with relabelled goals and reward=1.0.
+        """
+        import random
+        n = len(batch)
+        n_relabel = int(n * self.her_ratio)
+        indices = random.sample(range(n), min(n_relabel, n))
+
+        # Group by episode_id
+        ep_map: dict[int, list[int]] = {}
+        for i, t in enumerate(batch):
+            eid = t.get("episode_id", 0)
+            ep_map.setdefault(eid, []).append(i)
+
+        augmented = [dict(t) for t in batch]
+
+        for i in indices:
+            t = batch[i]
+            eid = t.get("episode_id", 0)
+            step = t.get("step", 0)
+            ep_indices = ep_map.get(eid, [i])
+
+            if self.strategy == "future":
+                future = [j for j in ep_indices if batch[j].get("step", 0) > step]
+                if not future:
+                    continue
+                j = random.choice(future)
+            elif self.strategy == "episode":
+                j = random.choice(ep_indices)
+            else:  # final
+                j = ep_indices[-1]
+
+            future_state = batch[j]["core_state"]
+            with torch.no_grad():
+                her_goal = goal_proj(future_state)
+            augmented[i] = dict(t)
+            augmented[i]["goal"] = her_goal.detach()
+            augmented[i]["reward"] = 1.0   # relabelled as success
+            augmented[i]["_her"] = True
+
+        return augmented
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CLIP Goal Alignment Head
+# ────────────────────────────────────────────────────────────────────────────
+
+class CLIPGoalHead(nn.Module):
+    """
+    Aligns internal goal embeddings with CLIP text/image space.
+
+    Projecting goal embeddings into CLIP space enables:
+      * Zero-shot goal specification via natural-language ("collect wood").
+      * Richer semantic structure for hindsight target generation.
+      * Eventual integration with CLIP-based reward signals.
+
+    Architecture:
+        goal_embed (goal_dim) -> Linear -> LayerNorm -> Linear -> clip_dim
+        L2 normalised output (unit sphere, matching CLIP convention).
+
+    Args:
+        goal_dim:  Dimension of internal goal embeddings.
+        clip_dim:  Dimension of CLIP embedding space (512 for ViT-B/32).
+    """
+
+    def __init__(self, goal_dim: int = 128, clip_dim: int = 512):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(goal_dim, clip_dim),
+            nn.LayerNorm(clip_dim),
+            nn.GELU(),
+            nn.Linear(clip_dim, clip_dim),
+        )
+
+    def forward(self, goal: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            goal: (..., goal_dim)
+
+        Returns:
+            (..., clip_dim) L2-normalised CLIP-space projection.
+        """
+        return F.normalize(self.proj(goal), dim=-1)
+
+    def alignment_loss(
+        self,
+        goal_embeds: torch.Tensor,
+        clip_targets: torch.Tensor,
+        temperature: float = 0.07,
+    ) -> torch.Tensor:
+        """
+        InfoNCE contrastive loss between projected goals and CLIP targets.
+
+        Args:
+            goal_embeds:  (B, goal_dim) internal goal embeddings.
+            clip_targets: (B, clip_dim) target CLIP embeddings (L2-normed).
+            temperature:  InfoNCE temperature.
+
+        Returns:
+            Scalar contrastive loss.
+        """
+        proj = self.forward(goal_embeds)  # (B, clip_dim)
+        sim = torch.mm(proj, clip_targets.T) / temperature  # (B, B)
+        labels = torch.arange(sim.size(0), device=sim.device)
+        loss = F.cross_entropy(sim, labels)
+        return loss

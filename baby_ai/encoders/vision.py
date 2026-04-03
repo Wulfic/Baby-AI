@@ -3,6 +3,11 @@ Vision encoder — MobileNetV2-style depthwise-separable CNN.
 
 Converts raw image frames (B, C, H, W) → (B, embed_dim) embeddings.
 Designed to be tiny (~1-3M params for student, ~5-10M for teacher).
+
+When ``use_slot_attention=True`` the GAP+Linear head is replaced by a
+SlotAttentionVisionHead that extracts K object-centric slot embeddings
+before pooling.  This improves object binding, which is critical for
+Minecraft's multi-object inventory/scene understanding.
 """
 
 from __future__ import annotations
@@ -10,6 +15,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from baby_ai.encoders.slot_attention import SlotAttentionVisionHead
 
 
 class DepthwiseSeparableConv(nn.Module):
@@ -71,9 +78,12 @@ class VisionEncoder(nn.Module):
     Lightweight MobileNetV2-inspired vision encoder.
 
     Args:
-        in_channels: Input channels (3 for RGB, 1 for grayscale).
-        embed_dim: Output embedding dimension.
-        width_mult: Width multiplier to scale channel counts.
+        in_channels:        Input channels (3 for RGB, 1 for grayscale).
+        embed_dim:          Output embedding dimension.
+        width_mult:         Width multiplier to scale channel counts.
+        use_slot_attention: If True, replace GAP head with SlotAttentionVisionHead.
+        num_slots:          Number of object slots (only used when use_slot_attention=True).
+        slot_dim:           Slot feature dimension (only used when use_slot_attention=True).
     """
 
     def __init__(
@@ -81,8 +91,12 @@ class VisionEncoder(nn.Module):
         in_channels: int = 3,
         embed_dim: int = 128,
         width_mult: float = 0.5,
+        use_slot_attention: bool = False,
+        num_slots: int = 8,
+        slot_dim: int = 64,
     ):
         super().__init__()
+        self.use_slot_attention = use_slot_attention
 
         def _ch(c: int) -> int:
             return max(8, int(c * width_mult))
@@ -114,15 +128,24 @@ class VisionEncoder(nn.Module):
                 in_ch = out_ch
         self.blocks = nn.Sequential(*blocks)
 
-        # Head: global average pool → projection
-        self.head = nn.Sequential(
-            nn.Conv2d(in_ch, _ch(256), 1, bias=False),
-            nn.BatchNorm2d(_ch(256)),
-            nn.ReLU6(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(_ch(256), embed_dim),
-        )
+        # Head: either GAP+linear (default) or Slot Attention
+        if use_slot_attention:
+            self.head = SlotAttentionVisionHead(
+                in_channels=in_ch,
+                num_slots=num_slots,
+                slot_dim=slot_dim,
+                output_dim=embed_dim,
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.Conv2d(in_ch, _ch(256), 1, bias=False),
+                nn.BatchNorm2d(_ch(256)),
+                nn.ReLU6(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(_ch(256), embed_dim),
+            )
+        self._last_slots: torch.Tensor | None = None  # exposed for downstream use
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -134,5 +157,8 @@ class VisionEncoder(nn.Module):
         """
         x = self.stem(x)
         x = self.blocks(x)
-        x = self.head(x)
-        return x
+        if self.use_slot_attention:
+            embed, slots = self.head(x)
+            self._last_slots = slots  # (B, K, slot_dim) — stored for downstream access
+            return embed
+        return self.head(x)

@@ -692,6 +692,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     prev_fused: torch.Tensor | None = None
     prev_action: torch.Tensor | None = None
     prev_obs: dict | None = None
+    prev_log_prob: torch.Tensor | None = None
+    prev_value: torch.Tensor | None = None
     raw_ir: float = 0.0        # raw JEPA curiosity (before normalisation)
     intrinsic_r: float = 0.0   # normalised + clamped curiosity reward
     lp_priority: float = 0.0   # learning progress priority bonus
@@ -938,6 +940,13 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     transition["goal_embedding"] = (
                         _goal_emb.squeeze(0) if _goal_emb.dim() > 1 else _goal_emb
                     )
+                # Store behavior policy log_prob + value for V-trace importance weighting
+                if prev_log_prob is not None:
+                    _lp = prev_log_prob
+                    transition["log_prob"] = _lp.squeeze() if _lp.dim() > 0 else _lp
+                if prev_value is not None:
+                    _val = prev_value
+                    transition["value"] = _val.squeeze() if _val.dim() > 0 else _val
                 priority = abs(intrinsic_r) + lp_priority + 0.01
                 # Human demonstrations are high-value — boost priority
                 if _imitation_active:
@@ -1078,6 +1087,7 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 orchestrator.mark_episode_boundary()
                 obs = env.reset()
                 prev_fused, prev_action, prev_obs = None, None, None
+                prev_log_prob, prev_value = None, None
                 episode_reward = 0.0
                 episode_steps = 0
                 _acc = {k: 0.0 for k in _acc_keys}
@@ -1088,6 +1098,9 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                 orchestrator.save_checkpoint("latest")
 
             prev_fused = fused
+            # ── Record log_prob + value for next transition ─────
+            prev_log_prob = result.get("log_prob")
+            prev_value = result.get("value")
             # ── Record the action for the NEXT transition ───────
             # During imitation mode, use the *player's actual input*
             # instead of the AI's prediction — this is the entire

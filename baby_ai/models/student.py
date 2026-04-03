@@ -59,6 +59,11 @@ class StudentModel(BabyAgentBase):
             policy_type=config.policy_type,
             # System 3 goal conditioning
             goal_dim=config.system3.goal_dim if config.system3.enabled else 0,
+            # Optional: slot attention + episodic memory (from config flags)
+            use_slot_attention=config.slot_attention.enabled,
+            num_vision_slots=config.slot_attention.num_slots,
+            use_episodic_memory=config.titans_memory.enabled,
+            mem_slots=config.titans_memory.mem_slots,
         )
         # Stash REBEL config so the LearnerThread can read it
         self._rebel_config = config.rebel

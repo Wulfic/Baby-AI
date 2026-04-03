@@ -615,6 +615,8 @@ class PrioritizedReplayBuffer:
                 self._store.write(data_idx, blob)
 
             self._meta[data_idx] = metadata or {}
+            # Always record the global step so HER can reconstruct ordering
+            self._meta[data_idx]["step"] = self._step
             self._episode_ids[data_idx] = self._current_episode_id
             self.max_priority = max(self.max_priority, priority)
             self._step += 1
@@ -812,6 +814,35 @@ class PrioritizedReplayBuffer:
             removed += 1
         if removed:
             log.info("Pruned %d chunk files (zeroed SumTree priorities).", removed)
+
+    def sample_her(
+        self,
+        batch_size: int,
+        device: str = "cpu",
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, List[int]]:
+        """
+        Sample a batch and enrich each transition with episode metadata.
+
+        Wraps the standard :meth:`sample` call to inject ``episode_id``
+        and ``step`` fields required by :class:`~baby_ai.core.goals.HERGoalSampler`.
+
+        The data_idx for each sample is used to look up ``_episode_ids``
+        and the step count from ``_meta``.
+
+        Returns:
+            transitions: List of transition dicts with 'episode_id' and 'step'.
+            weights:     Importance-sampling weights.
+            indices:     Tree indices for priority updates.
+        """
+        transitions, weights, indices = self.sample(batch_size, device)
+        with self._lock:
+            for i, tree_idx in enumerate(indices):
+                data_idx = tree_idx - self.tree.capacity
+                if 0 <= data_idx < self.capacity:
+                    transitions[i].setdefault("episode_id", self._episode_ids[data_idx])
+                    meta = self._meta[data_idx] or {}
+                    transitions[i].setdefault("step", meta.get("step", 0))
+        return transitions, weights, indices
 
     def stats(self) -> dict:
         return {

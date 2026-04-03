@@ -258,8 +258,23 @@ class Orchestrator:
         Must be called on every env.reset() so that
         :meth:`PrioritizedReplayBuffer.sample_sequence` respects
         episode boundaries and avoids cross-episode sequences.
+
+        Also resets stateful modules that must be cleared at episode start:
+          - Dreamer-V3 RSSM GRU hidden state (world model)
+          - Episodic K-V memory (Titans-style ring buffer)
         """
         self.replay.mark_episode_boundary()
+
+        # Reset Dreamer-V3 RSSM recurrent state for both models
+        for _model in (self.teacher, self.student):
+            if hasattr(_model, 'predictive') and hasattr(_model.predictive, 'reset_state'):
+                _model.predictive.reset_state()
+
+        # Reset episodic K-V memory (ring buffer write pointer + fill flags)
+        for _model in (self.teacher, self.student):
+            _mem = getattr(_model, 'episodic_memory', None)
+            if _mem is not None:
+                _mem.reset(1)
 
     def save_checkpoint(self, tag: str = "latest") -> Path:
         """Save model weights, optimizer state, and replay metadata."""
