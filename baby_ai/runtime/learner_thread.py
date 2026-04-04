@@ -603,9 +603,10 @@ class LearnerThread:
         """Compute combined training loss."""
         # Teacher forward — pass actions so the policy head can compute
         # its denoising loss (applies to both Diffusion and Flow Matching).
+        _modality_keys = {"vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor"}
         forward_kwargs = {
             k: v for k, v in batch.items()
-            if k in ("vision", "audio", "code_x", "code_edge_index", "code_batch", "sensor")
+            if k in _modality_keys
         }
         if "action" in batch:
             forward_kwargs["actions"] = batch["action"]
@@ -613,6 +614,12 @@ class LearnerThread:
         # Pass goal_embedding from replay for goal-conditioned training
         if "goal_embedding" in batch:
             forward_kwargs["goal"] = batch["goal_embedding"]
+
+        # Guard: at least one modality tensor must be present for encode()
+        if not (forward_kwargs.keys() & _modality_keys):
+            log.warning("Step %d: no modality tensors in batch (keys=%s); skipping.",
+                        self._step, list(batch.keys()))
+            return {"total": torch.tensor(0.0, device=self.device), "task_losses": {}}
 
         outputs = self.teacher(**forward_kwargs)
 
