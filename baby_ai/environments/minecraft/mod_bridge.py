@@ -231,6 +231,26 @@ class ModBridge:
                      "FROZEN" if paused else "RESUMED", reason)
         return acked
 
+    def send_look(self, dyaw: float, dpitch: float) -> bool:
+        """Send a camera rotation command to the mod.
+
+        The mod applies the delta directly on the client player entity,
+        bypassing GLFW raw-input.  This means the OS cursor is never
+        moved and the Minecraft window does not need to be focused.
+
+        Args:
+            dyaw:   Horizontal rotation in degrees (positive = turn right).
+            dpitch: Vertical rotation in degrees (positive = look down).
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        return self.send_command({
+            "command": "look",
+            "dyaw": round(dyaw, 3),
+            "dpitch": round(dpitch, 3),
+        })
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run(self) -> None:

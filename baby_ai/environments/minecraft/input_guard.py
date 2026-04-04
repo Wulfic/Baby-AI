@@ -111,6 +111,10 @@ user32.PostThreadMessageW.restype = wt.BOOL
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wt.DWORD
 
+# GetWindowRect — used to check if cursor is inside the MC window
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetWindowRect.restype = wt.BOOL
+
 # Allowed keys — even when the guard is active, these keys pass through
 # so the user can always escape the AI lock (e.g. Alt+Tab, Ctrl+Alt+Del)
 _ALWAYS_PASS_VKS = {
@@ -259,6 +263,13 @@ class InputGuard:
         """Check if Ctrl is currently held (via GetAsyncKeyState)."""
         return (user32.GetAsyncKeyState(_VK_CONTROL) & 0x8000) != 0
 
+    def _cursor_in_mc_window(self, cx: int, cy: int) -> bool:
+        """Return True if screen-coordinates (cx, cy) fall inside the MC window."""
+        rect = wt.RECT()
+        if not user32.GetWindowRect(self._mc_hwnd, ctypes.byref(rect)):
+            return False
+        return rect.left <= cx < rect.right and rect.top <= cy < rect.bottom
+
     def _keyboard_hook_proc(
         self, nCode: int, wParam: int, lParam: int,
     ) -> int:
@@ -348,16 +359,42 @@ class InputGuard:
         """
         Low-level mouse hook callback.
 
-        Blocks PHYSICAL mouse clicks and scroll so the user can't interfere
-        with the game. Always lets INJECTED (AI) moves/clicks pass through!
-        We also allow physical WM_MOUSEMOVE to pass through so the user doesn't
-        get a frozen OS cursor and can still use Alt-Tab or move their mouse
-        to click the AI Pause button.
+        Blocks PHYSICAL mouse clicks and scroll **only when the cursor
+        is inside the Minecraft window bounds**.  Clicks outside the
+        MC window always pass through so the user can interact with
+        the taskbar, other applications, and the OS freely.
 
-        Ctrl+M toggles mouse blocking — when OFF, all physical mouse events
-        pass through so the user can interact with MC normally.
+        Always lets INJECTED (AI) moves/clicks pass through.
+        Physical WM_MOUSEMOVE always passes through so the user keeps
+        a responsive OS cursor.
+
+        Ctrl+M toggles mouse blocking — when OFF, all physical mouse
+        events pass through so the user can interact with MC normally.
         """
-        if nCode >= 0 and self._should_block():
+        if nCode >= 0:
+            struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+
+            # Check if this input was injected by software (AI PostMessage, etc.)
+            is_injected = (struct.flags & 1) != 0 or (struct.flags & 2) != 0
+            if is_injected:
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Always let mouse movement through (cursor must never freeze)
+            if wParam == 0x0200:  # WM_MOUSEMOVE
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Guard must be active
+            if not self._enabled or self._emergency_off:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Only block clicks that land INSIDE the MC window area.
+            # Clicks on the taskbar, other windows, etc. always pass.
+            if not self._cursor_in_mc_window(struct.pt.x, struct.pt.y):
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
             # If mouse blocking is disabled via Ctrl+M, let everything through
             # but also TRACK button presses for imitation learning.
             if not self._mouse_blocked:
@@ -378,24 +415,7 @@ class InputGuard:
                         self._player_held_buttons.discard("middle")
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-
-            # Check if this input was injected by software (like SetCursorPos or PostMessage AI)
-            is_injected = (struct.flags & 1) != 0 or (struct.flags & 2) != 0
-            if is_injected:
-                self._stats["passed"] += 1
-                return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-            # If physical hardware:
-            # 0x0200 = WM_MOUSEMOVE
-            if wParam == 0x0200:
-                # Let the user physically move their mouse (otherwise cursor is fully frozen system-wide)
-                # Note: this WILL rotate the camera slightly if the user wiggles their mouse while watching,
-                # but it allows them to move their mouse to click the AI UI.
-                self._stats["passed"] += 1
-                return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-            # Block physical clicks and scroll
+            # Block physical clicks and scroll inside the MC window
             self._stats["mouse_blocked"] += 1
             return _BLOCK
 

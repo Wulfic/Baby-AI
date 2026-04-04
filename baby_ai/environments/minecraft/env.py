@@ -44,6 +44,7 @@ from baby_ai.environments.minecraft.action_decoder import (
 from baby_ai.environments.minecraft.capture import ScreenCapture
 from baby_ai.environments.minecraft.input_guard import InputGuard
 from baby_ai.environments.minecraft.input_controller import InputController
+from baby_ai.environments.minecraft.virtual_input import VirtualInputController
 from baby_ai.environments.minecraft.launcher import MinecraftLauncher
 from baby_ai.environments.minecraft.reward_computer import RewardComputer
 from baby_ai.environments.minecraft.screen_analyzer import (
@@ -172,7 +173,19 @@ class MinecraftEnv(GameEnvironment):
         # ── Components ──────────────────────────────────────────
         self._window = WindowManager(hwnd=hwnd, title_search=window_title)
         self._capture = ScreenCapture(self._window, resolution=resolution)
-        self._input = InputController(self._window, mode=input_mode)
+
+        # ── Mod bridge (authoritative game events via TCP) ──────
+        # Created early so VirtualInputController can reference it.
+        self._mod_bridge = ModBridge(port=mod_bridge_port)
+        self._mod_bridge.start()
+
+        # ── Input controller ────────────────────────────────────
+        # "virtual" mode uses the mod bridge for camera look (no
+        # cursor hijack) while keeping PostMessage for keys/buttons.
+        if input_mode == "virtual":
+            self._input = VirtualInputController(self._window, self._mod_bridge)
+        else:
+            self._input = InputController(self._window, mode=input_mode)
 
         # ── Input guard ─────────────────────────────────────────
         # InputGuard intercepts physical keyboard/mouse if MC is focused.
@@ -313,9 +326,7 @@ class MinecraftEnv(GameEnvironment):
         self._steps_in_chunk: int = 0
         self._chunk_is_new: bool = False
 
-        # ── Mod bridge (authoritative game events via TCP) ──────
-        self._mod_bridge = ModBridge(port=mod_bridge_port)
-        self._mod_bridge.start()
+        # ── Mod bridge — already created above (before input controller) ──
 
         # ── Sensor packer (structured game state → tensor) ──────
         self._sensor_packer = SensorPacker()

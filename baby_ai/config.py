@@ -448,7 +448,7 @@ class MinecraftConfig:
     """Settings for the Minecraft game environment."""
     # ── Window / capture ───────────────────────────────────────
     window_title: str = "Minecraft"         # substring matched against window titles
-    input_mode: str = "active"              # "background" (safe, no cursor) or "active" (camera look, moves cursor)
+    input_mode: str = "virtual"             # "virtual" (mod-bridge camera, no cursor hijack), "background" (no camera), or "active" (cursor warp)
     capture_resolution: Tuple[int, int] = (360, 640)  # (H, W) for screen captures
     step_delay_ms: float = 100.0            # minimum ms between consecutive actions
     look_pixels_small: int = 40             # small camera rotation (pixels per step)
@@ -470,7 +470,7 @@ class MinecraftConfig:
     window_height: int = 1080               # Game window height matching standard 1080p maximize
 
     # ── Input guard ────────────────────────────────────────────
-    block_user_input: bool = True           # block user KB/mouse when MC focused
+    block_user_input: bool = True           # block user KB/mouse when MC focused (shortcuts still work)
 
     # ── Mod bridge (Fabric mod TCP event stream) ───────────────
     mod_bridge_port: int = 5556             # TCP port the Baby-AI Bridge mod listens on

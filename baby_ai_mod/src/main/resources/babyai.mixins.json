@@ -5,10 +5,14 @@
   "mixins": [
     "BlockItemMixin",
     "ItemPickupMixin",
-    "CraftingMixin"
+    "CraftingMixin",
+    "SystemDetailsMixin",
+    "WmiQueryMixin"
   ],
   "client": [
     "DeathScreenMixin",
+    "KeyboardInputMixin",
+    "MouseGrabMixin",
     "ScreenStateMixin"
   ],
   "injectors": {

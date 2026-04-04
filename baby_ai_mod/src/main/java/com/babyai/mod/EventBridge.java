@@ -92,6 +92,15 @@ public class EventBridge {
     // ── Server reference ───────────────────────────────────────
 
     /**
+     * True when at least one Python AI client is connected.
+     * Used by mixins to disable cursor grab and keyboard processing
+     * so the user's physical mouse/keyboard are never captured.
+     */
+    public boolean hasClients() {
+        return !clients.isEmpty();
+    }
+
+    /**
      * Store the {@link MinecraftServer} so command handlers can
      * freeze/resume ticks during System 2 planning.
      */
@@ -502,6 +511,10 @@ public class EventBridge {
      * <ul>
      *   <li>{@code {"command":"pause"}}   — freeze game ticks (System 2/3 thinking)</li>
      *   <li>{@code {"command":"resume"}}  — resume game ticks</li>
+     *   <li>{@code {"command":"look", "dyaw":float, "dpitch":float}}
+     *        — rotate the player camera by the given degree deltas
+     *        (executed on the client render thread so the change is
+     *        immediate and bypasses GLFW raw-input)</li>
      * </ul>
      */
     private void handleCommand(JsonObject cmd, PrintWriter clientWriter) {
@@ -552,6 +565,30 @@ public class EventBridge {
                     ack.addProperty("error", "server_not_available");
                     clientWriter.println(ack.toString());
                 }
+            }
+            case "look" -> {
+                // Rotate the player camera by (dyaw, dpitch) degrees.
+                // Executed on the client render thread so the change is
+                // reflected immediately without waiting for a server tick,
+                // and bypasses GLFW raw-input — no cursor warp needed.
+                float dyaw = cmd.has("dyaw") ? cmd.get("dyaw").getAsFloat() : 0f;
+                float dpitch = cmd.has("dpitch") ? cmd.get("dpitch").getAsFloat() : 0f;
+
+                net.minecraft.client.MinecraftClient client = net.minecraft.client.MinecraftClient.getInstance();
+                client.execute(() -> {
+                    if (client.player != null) {
+                        float newYaw = client.player.getYaw() + dyaw;
+                        float newPitch = client.player.getPitch() + dpitch;
+                        // Clamp pitch to Minecraft's limits (-90 up, +90 down)
+                        newPitch = Math.max(-90.0f, Math.min(90.0f, newPitch));
+
+                        client.player.setYaw(newYaw);
+                        client.player.setPitch(newPitch);
+                        // Update head yaw so third-person rendering and
+                        // server-side packets reflect the new orientation.
+                        client.player.headYaw = newYaw;
+                    }
+                });
             }
             default -> LOGGER.warn("[Baby-AI] Unknown command: {}", action);
         }

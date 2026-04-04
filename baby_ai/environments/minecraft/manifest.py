@@ -192,6 +192,10 @@ def build_jvm_args(
     args.append(f"-Xmx{max_memory_mb}M")
     args.append(f"-Xms{min_memory_mb}M")
 
+    # Prevent oshi WMI queries from hanging indefinitely when the
+    # Windows WMI service is unresponsive (common issue).
+    args.append("-Doshi.util.wmi.timeout=5000")
+
     # Parse JVM args from manifest
     raw_jvm = version_data.get("arguments", {}).get("jvm", [])
     substitutions = {
