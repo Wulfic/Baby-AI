@@ -227,6 +227,22 @@ class DistillThread:
             elif isinstance(values[0], (int, float)):
                 batch[key] = torch.tensor(values, dtype=torch.float32, device=self.device)
 
+        # Ensure all tensor keys share the same batch dimension.
+        # Keys built from a subset of transitions (e.g. goal_embedding missing
+        # in some transitions) can end up with a smaller batch size, causing
+        # shape mismatches downstream (e.g. FiLM conditioning).
+        tensor_keys = [k for k, v in batch.items()
+                       if isinstance(v, torch.Tensor) and v.dim() > 0]
+        if tensor_keys:
+            sizes = {k: batch[k].shape[0] for k in tensor_keys}
+            from collections import Counter
+            dominant_size = Counter(sizes.values()).most_common(1)[0][0]
+            for k in list(batch.keys()):
+                if k in sizes and sizes[k] != dominant_size:
+                    log.debug("Dropped key '%s' in collate: batch_size %d != %d",
+                              k, sizes[k], dominant_size)
+                    del batch[k]
+
         return batch
 
     @property
