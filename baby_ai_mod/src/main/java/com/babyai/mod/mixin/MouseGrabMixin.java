@@ -23,21 +23,26 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MouseGrabMixin {
 
     /**
-     * Cancel cursor locking when the AI is connected.
+     * Cancel cursor locking when the AI is connected and NOT in passthrough
+     * mode.  In passthrough mode (record-only / imitation) we allow
+     * lockCursor() through so Minecraft can re-grab the cursor after a GUI
+     * screen (inventory, pause menu) is closed.
      */
     @Inject(method = "lockCursor", at = @At("HEAD"), cancellable = true)
     private void babyai$preventCursorLock(CallbackInfo ci) {
-        if (EventBridge.INSTANCE.hasClients()) {
+        if (EventBridge.INSTANCE.hasClients() && !EventBridge.INSTANCE.isMousePassthrough()) {
             ci.cancel();
         }
     }
 
     /**
      * Block physical mouse movement from rotating the camera.
+     * Skipped when mouse_passthrough is active (record-only / imitation mode)
+     * so the human player retains full camera control.
      */
     @Inject(method = "onCursorPos", at = @At("HEAD"), cancellable = true)
     private void babyai$blockPhysicalMouseMove(long window, double x, double y, CallbackInfo ci) {
-        if (EventBridge.INSTANCE.hasClients()) {
+        if (EventBridge.INSTANCE.hasClients() && !EventBridge.INSTANCE.isMousePassthrough()) {
             ci.cancel();
         }
     }

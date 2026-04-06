@@ -56,6 +56,18 @@ public class EventBridge {
     /** Reference to the integrated server — set once the server starts. */
     private final AtomicReference<MinecraftServer> serverRef = new AtomicReference<>(null);
 
+    /**
+     * When true, physical mouse movement is passed through to Minecraft
+     * even while a client is connected.  Set to true in record-only /
+     * imitation modes so the human player can look around normally.
+     */
+    private final AtomicBoolean mousePassthrough = new AtomicBoolean(false);
+
+    /** True when physical mouse movement should reach Minecraft (e.g. record-only mode). */
+    public boolean isMousePassthrough() {
+        return mousePassthrough.get();
+    }
+
     // ── Client screen state (set by ScreenStateMixin) ──────────
 
     /**
@@ -589,6 +601,11 @@ public class EventBridge {
                         client.player.headYaw = newYaw;
                     }
                 });
+            }
+            case "mouse_passthrough" -> {
+                boolean enabled = cmd.has("enabled") && cmd.get("enabled").getAsBoolean();
+                mousePassthrough.set(enabled);
+                LOGGER.info("[Baby-AI] Mouse passthrough: {}", enabled ? "ON" : "OFF");
             }
             default -> LOGGER.warn("[Baby-AI] Unknown command: {}", action);
         }

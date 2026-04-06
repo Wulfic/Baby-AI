@@ -524,8 +524,13 @@ class RewardComputer:
             horiz_dist = (dx * dx + dz * dz) ** 0.5
             _actual_moved = horiz_dist > 0.1
 
-        if action_id in MOVEMENT_ACTIONS and visual_change > 0.02 and _actual_moved:
-            base_move = visual_change * 0.3
+        if action_id in MOVEMENT_ACTIONS and _actual_moved:
+            # Scale by visual change but use a floor so the reward fires
+            # every step the key is held, not only when the scene happens
+            # to change enough.  Walking into a wall is still unrewarded
+            # because _actual_moved requires >0.1 block position delta.
+            vc_scale = max(visual_change, 0.05)
+            base_move = vc_scale * 0.3
             if action_id in FORWARD_ACTIONS:
                 base_move *= _mv_forward
             elif action_id in BACKWARD_ACTIONS:
@@ -580,9 +585,12 @@ class RewardComputer:
         horiz_dist = (dx * dx + dz * dz) ** 0.5
 
         bonus = 0.0
-        if horiz_dist > 0.1 and visual_change > 0.02:
-            # Treat all imitation movement like forward movement
-            bonus = visual_change * 0.3 * _mv_forward
+        if horiz_dist > 0.1:
+            # Scale by visual change but use a floor so the reward fires
+            # every step the player is actually moving (key held), not only
+            # when the scene changes enough.
+            vc_scale = max(visual_change, 0.05)
+            bonus = vc_scale * 0.3 * _mv_forward
 
         # Camera look component — reward looking around while moving
         if env._player_yaw is not None and env._prev_player_yaw is not None:

@@ -189,7 +189,7 @@ class InferenceThread:
             self._thread.join(timeout=5.0)
         log.info("Inference thread stopped after %d steps.", self._step)
 
-    def submit(self, observation: Dict[str, Any], timeout: float = 5.0) -> Dict[str, Any]:
+    def submit(self, observation: Dict[str, Any], timeout: float = 300.0) -> Dict[str, Any]:
         """
         Submit an observation and wait for the inference result.
 

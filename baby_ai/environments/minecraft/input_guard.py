@@ -115,6 +115,14 @@ kernel32.GetCurrentThreadId.restype = wt.DWORD
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
 user32.GetWindowRect.restype = wt.BOOL
 
+# GetClientRect — returns the client-area size (top-left always 0,0)
+user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetClientRect.restype = wt.BOOL
+
+# ClientToScreen — converts a client-area point to screen coordinates
+user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(wt.POINT)]
+user32.ClientToScreen.restype = wt.BOOL
+
 # Allowed keys — even when the guard is active, these keys pass through
 # so the user can always escape the AI lock (e.g. Alt+Tab, Ctrl+Alt+Del)
 _ALWAYS_PASS_VKS = {
@@ -270,6 +278,28 @@ class InputGuard:
             return False
         return rect.left <= cx < rect.right and rect.top <= cy < rect.bottom
 
+    def _in_client_area(self, cx: int, cy: int) -> bool:
+        """Return True if screen-coordinates (cx, cy) are inside the MC client area.
+
+        The client area is the rendered game viewport, excluding the title bar,
+        window borders, and any non-client decorations.  Clicking outside this
+        region (title bar, resize handles) should always be allowed so the user
+        can move or resize the window regardless of the blocking state.
+        """
+        client_rect = wt.RECT()
+        if not user32.GetClientRect(self._mc_hwnd, ctypes.byref(client_rect)):
+            return True  # conservative: assume client on failure
+
+        # GetClientRect returns coords relative to the client origin (0,0).
+        # Convert the two corners to screen coordinates.
+        tl = wt.POINT(client_rect.left, client_rect.top)
+        if not user32.ClientToScreen(self._mc_hwnd, ctypes.byref(tl)):
+            return True
+        br = wt.POINT(client_rect.right, client_rect.bottom)
+        user32.ClientToScreen(self._mc_hwnd, ctypes.byref(br))
+
+        return tl.x <= cx < br.x and tl.y <= cy < br.y
+
     def _keyboard_hook_proc(
         self, nCode: int, wParam: int, lParam: int,
     ) -> int:
@@ -392,6 +422,13 @@ class InputGuard:
             # Only block clicks that land INSIDE the MC window area.
             # Clicks on the taskbar, other windows, etc. always pass.
             if not self._cursor_in_mc_window(struct.pt.x, struct.pt.y):
+                self._stats["passed"] += 1
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Always let non-client area clicks (title bar, resize borders)
+            # pass through so the user can reposition or resize the window
+            # regardless of the blocking state.
+            if not self._in_client_area(struct.pt.x, struct.pt.y):
                 self._stats["passed"] += 1
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 

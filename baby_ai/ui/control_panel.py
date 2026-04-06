@@ -726,6 +726,16 @@ class AIControlPanel:
             enabled = self._record_only_var.get()
             set_record_only(enabled)
             self._store.set("record_only", enabled)
+            # Immediately sync the input guard so the user's mouse and
+            # keyboard are unblocked the moment record-only activates,
+            # rather than waiting for the next main-loop iteration.
+            if self._input_guard is not None:
+                if enabled:
+                    self._input_guard._kb_blocked = False
+                    self._input_guard._mouse_blocked = False
+                elif not self._input_guard._ai_paused:
+                    self._input_guard._kb_blocked = True
+                    self._input_guard._mouse_blocked = True
 
         rec_cb = tk.Checkbutton(
             imit_frame,

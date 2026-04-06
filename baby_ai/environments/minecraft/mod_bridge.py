@@ -251,6 +251,22 @@ class ModBridge:
             "dpitch": round(dpitch, 3),
         })
 
+    def send_mouse_passthrough(self, enabled: bool) -> bool:
+        """Tell the mod to let physical mouse movement reach Minecraft.
+
+        When *enabled* is True the MouseGrabMixin will stop cancelling
+        ``onCursorPos()``, restoring normal camera movement for the
+        human player.  Called when entering record-only or imitation
+        mode, and reversed when leaving those modes.
+
+        Args:
+            enabled: True = pass physical mouse through, False = block it.
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        return self.send_command({"command": "mouse_passthrough", "enabled": enabled})
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run(self) -> None:

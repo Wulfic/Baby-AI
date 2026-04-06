@@ -765,6 +765,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     env._guard._kb_blocked = False
                     env._guard._mouse_blocked = False
                     env._guard.clear_player_input()
+                if env._mod_bridge is not None:
+                    env._mod_bridge.send_mouse_passthrough(True)
                 env._prev_yaw = None
                 env._prev_pitch = None
                 prev_fused = None          # avoid stale graph refs
@@ -775,6 +777,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     env._guard._kb_blocked = True
                     env._guard._mouse_blocked = True
                     env._guard.clear_player_input()
+                if env._mod_bridge is not None:
+                    env._mod_bridge.send_mouse_passthrough(False)
                 prev_fused = None
                 log.info("Record-Only OFF -- resuming normal operation.")
             _prev_record_only_active = _record_only_active
@@ -843,6 +847,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     env._guard._kb_blocked = False
                     env._guard._mouse_blocked = False
                     env._guard.clear_player_input()
+                if env._mod_bridge is not None:
+                    env._mod_bridge.send_mouse_passthrough(True)
                 # Reset yaw/pitch baseline so first delta is clean
                 env._prev_yaw = None
                 env._prev_pitch = None
@@ -853,6 +859,8 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
                     env._guard._kb_blocked = True
                     env._guard._mouse_blocked = True
                     env._guard.clear_player_input()
+                if env._mod_bridge is not None:
+                    env._mod_bridge.send_mouse_passthrough(False)
                 log.info("Imitation learning OFF — AI inputs resumed, user controls locked.")
             _prev_imitation_active = _imitation_active
 
