@@ -237,7 +237,7 @@ class BlockBreakTracker:
         self._window_size = window_size
         self._break_threshold = break_threshold
         self._prev_center: Optional[np.ndarray] = None
-        self._churn_history: list[float] = []
+        self._churn_history: deque[float] = deque(maxlen=window_size)
 
     def reset(self) -> None:
         """Call on episode reset."""
@@ -275,9 +275,7 @@ class BlockBreakTracker:
             # Decay history when not attacking
             self._churn_history.clear()
 
-        # Keep only the recent window
-        if len(self._churn_history) > self._window_size:
-            self._churn_history = self._churn_history[-self._window_size :]
+        # deque(maxlen=...) handles trimming automatically
 
         if not self._churn_history:
             return 0.0

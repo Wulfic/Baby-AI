@@ -19,6 +19,7 @@ Usage::
 
 from __future__ import annotations
 
+import gc
 import time
 from collections import deque
 from typing import Any, Dict, Optional, Tuple
@@ -417,6 +418,10 @@ class MinecraftEnv(GameEnvironment):
         self._steps_in_chunk = 0
         self._chunk_is_new = False
 
+        # Release frame references so memory can be reclaimed
+        self._last_frame = None
+        self._raw_frame = None
+
         # Drain any stale mod events from the previous episode
         if self._mod_bridge is not None:
             self._mod_bridge.drain_events()
@@ -628,6 +633,11 @@ class MinecraftEnv(GameEnvironment):
 
         self._step_count += 1
         self._prev_action_id = disc_action_id
+
+        # Periodic garbage collection to reclaim numpy/mss transient
+        # allocations that reference-counting alone may miss.
+        if self._step_count % 100 == 0:
+            gc.collect()
 
         return obs, reward, done, info
 

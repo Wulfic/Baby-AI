@@ -11,6 +11,7 @@ within the 100 ms step budget.
 
 from __future__ import annotations
 
+import gc
 from typing import Optional, Tuple
 
 import cv2
@@ -25,11 +26,24 @@ log = get_logger("mc_capture")
 # mss is imported lazily so the module can be loaded even if mss
 # is not installed (e.g. on Linux CI).
 _mss = None
+_mss_grab_count: int = 0
+
+# Recreate the mss instance every N grabs to prevent internal
+# DXGI / GDI handle accumulation on Windows.
+_MSS_RESET_INTERVAL: int = 500
 
 
 def _get_mss():
-    """Lazy-initialise a single mss instance (thread-local)."""
-    global _mss
+    """Lazy-initialise a single mss instance, resetting periodically."""
+    global _mss, _mss_grab_count
+    _mss_grab_count += 1
+    if _mss is not None and _mss_grab_count % _MSS_RESET_INTERVAL == 0:
+        try:
+            _mss.close()
+        except Exception:
+            pass
+        _mss = None
+        gc.collect()
     if _mss is None:
         import mss as _mss_mod
         _mss = _mss_mod.mss()
@@ -88,9 +102,12 @@ class ScreenCapture:
         shot = sct.grab(self._region)
 
         # mss returns BGRA (Blue, Green, Red, Alpha); drop alpha channel.
-        # We keep BGR order here because cv2 (used downstream) expects BGR.
-        # RGB conversion happens only when building the model tensor.
-        frame = np.array(shot, dtype=np.uint8)[..., :3]  # (H, W, 3) BGR
+        # Use ascontiguousarray so the BGR slice is an owning copy and
+        # the full BGRA intermediate (~8 MiB at 1080p) can be freed.
+        frame = np.ascontiguousarray(
+            np.array(shot, dtype=np.uint8)[..., :3]
+        )  # (H, W, 3) BGR
+        del shot
 
         # Resize to model resolution
         frame = cv2.resize(frame, (self._resolution[1], self._resolution[0]))
@@ -158,7 +175,12 @@ class ScreenCapture:
 
         # Native-resolution BGR (no resize) — screen analysers need full
         # pixel detail for hotbar diff and death-screen colour analysis.
-        native_bgr = np.array(shot, dtype=np.uint8)[..., :3]
+        # Use ascontiguousarray so the BGR slice is an owning copy and
+        # the full BGRA intermediate (~8 MiB at 1080p) can be freed.
+        native_bgr = np.ascontiguousarray(
+            np.array(shot, dtype=np.uint8)[..., :3]
+        )
+        del shot
 
         # Downscale to model resolution for the vision encoder
         model_bgr = cv2.resize(
