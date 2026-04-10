@@ -822,6 +822,7 @@ class MinecraftEnv(GameEnvironment):
             log.info("Home location updated: (%.1f, %.1f)",
                      self._home_x, self._home_z)
             self._persist_home()
+            self._sync_home_to_mod()
             if self._on_home_changed:
                 self._on_home_changed()
         else:
@@ -838,6 +839,7 @@ class MinecraftEnv(GameEnvironment):
         self._home_z = z
         log.info("Home location set manually: (%.1f, %.1f, %.1f)", x, y, z)
         self._persist_home()
+        self._sync_home_to_mod()
         if self._on_home_changed:
             self._on_home_changed()
 
@@ -860,6 +862,16 @@ class MinecraftEnv(GameEnvironment):
                 self._home_y = float(sy) if sy is not None else None
                 log.info("Restored persisted home location: (%.1f, %.1f)",
                          self._home_x, self._home_z)
+                self._sync_home_to_mod()
+
+    def _sync_home_to_mod(self) -> None:
+        """Push current home coordinates to the Java mod's HomeManager."""
+        if (self._mod_bridge is not None
+                and self._mod_bridge.connected
+                and self._home_x is not None
+                and self._home_z is not None):
+            y = self._home_y if self._home_y is not None else 64.0
+            self._mod_bridge.set_home(self._home_x, y, self._home_z)
 
     def set_on_home_changed(self, callback: Any) -> None:
         """Register a callback for when home location changes."""

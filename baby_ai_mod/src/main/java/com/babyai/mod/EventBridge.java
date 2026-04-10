@@ -607,6 +607,28 @@ public class EventBridge {
                 mousePassthrough.set(enabled);
                 LOGGER.info("[Baby-AI] Mouse passthrough: {}", enabled ? "ON" : "OFF");
             }
+            case "set_home" -> {
+                // Python is pushing a home coordinate so HomeManager stays in sync
+                // with the Python settings store (set_home GUI button / restored home).
+                double hx = cmd.has("x") ? cmd.get("x").getAsDouble() : 0.0;
+                double hy = cmd.has("y") ? cmd.get("y").getAsDouble() : 64.0;
+                double hz = cmd.has("z") ? cmd.get("z").getAsDouble() : 0.0;
+                MinecraftServer server = serverRef.get();
+                if (server != null) {
+                    server.execute(() -> {
+                        net.minecraft.server.network.ServerPlayerEntity player =
+                            server.getPlayerManager().getPlayerList().stream()
+                                .findFirst().orElse(null);
+                        if (player != null) {
+                            HomeManager.INSTANCE.setHome(player.getUuid(), hx, hy, hz);
+                        } else {
+                            LOGGER.warn("[Baby-AI] set_home: no player found, storing with null UUID");
+                        }
+                    });
+                } else {
+                    LOGGER.warn("[Baby-AI] set_home: serverRef is null");
+                }
+            }
             case "goto_home" -> {
                 // Teleport the player to their saved home waypoint.
                 // Triggered automatically after the AI accumulates >30 s of

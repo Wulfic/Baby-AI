@@ -281,6 +281,19 @@ class ModBridge:
         log.info("Sending goto_home command (idle safeguard)")
         return self.send_command({"command": "goto_home"})
 
+    def set_home(self, x: float, y: float, z: float) -> bool:
+        """Push home coordinates to the Java mod's HomeManager.
+
+        Called whenever the Python-side home is updated (GUI button or
+        restored from settings) so the mod can teleport back without a
+        round-trip to Python.
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        log.info("Syncing home to mod: (%.1f, %.1f, %.1f)", x, y, z)
+        return self.send_command({"command": "set_home", "x": x, "y": y, "z": z})
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run(self) -> None:
