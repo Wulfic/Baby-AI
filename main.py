@@ -643,8 +643,19 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
 
     # Emergency rescue: teleport AI to home via mod bridge.
     def _on_goto_home() -> None:
-        if env._mod_bridge is not None:
-            env._mod_bridge.goto_home()
+        log.info("Go Home button pressed")
+        try:
+            mb = env._mod_bridge
+            if mb is None:
+                log.warning("goto_home: mod_bridge is None")
+                return
+            if not mb.connected:
+                log.warning("goto_home: mod_bridge not connected")
+                return
+            ok = mb.goto_home()
+            log.info("goto_home command sent: %s", ok)
+        except Exception:
+            log.exception("goto_home callback raised an exception")
 
     control_panel = AIControlPanel(
         toggle_state=toggle_state,

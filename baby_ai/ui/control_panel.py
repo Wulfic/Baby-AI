@@ -900,8 +900,16 @@ class AIControlPanel:
 
     def _on_goto_home(self) -> None:
         """Go Home (emergency rescue) button clicked — invoke the callback."""
-        if self.on_goto_home:
-            self.on_goto_home()
+        import traceback
+        print("[GoHome] button clicked, callback =", self.on_goto_home, flush=True)
+        try:
+            if self.on_goto_home:
+                self.on_goto_home()
+            else:
+                print("[GoHome] No callback registered!", flush=True)
+        except Exception as exc:
+            print("[GoHome] Exception in callback:", exc, flush=True)
+            traceback.print_exc()
 
     def _on_apply_home_coords(self) -> None:
         """Apply manually-entered home coordinates from the GUI fields."""
