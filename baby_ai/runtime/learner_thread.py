@@ -208,6 +208,7 @@ class LearnerThread:
         self._running = False
         self._step = 0
         self._accum_count = 0
+        self._consecutive_nan = 0  # steps with NaN loss in a row
 
         # Live reward recomposition — when set, sampled transitions are
         # re-weighted with the current UI weights/toggles so that user
@@ -377,17 +378,43 @@ class LearnerThread:
             # Guard: skip backward when loss is NaN or Inf to prevent
             # poisoning the optimizer state (Adam momentum/variance).
             if torch.isnan(total_loss) or torch.isinf(total_loss):
+                self._consecutive_nan += 1
                 log.warning(
                     "Skipping backward at step %d: loss is %s "
-                    "(batch keys: %s)",
+                    "(batch keys: %s) [consecutive=%d]",
                     self._step,
                     "NaN" if torch.isnan(total_loss) else "Inf",
                     list(batch.keys()),
+                    self._consecutive_nan,
                 )
                 self.optimizer.zero_grad(set_to_none=True)
                 self._accum_count = 0
+                # After 10 consecutive NaN/Inf steps, the optimizer's Adam
+                # momentum terms likely contain NaN propagated from a corrupt
+                # forward pass stored in replay.  Reset state to break the
+                # cascade — weights stay intact but momentum is re-zeroed.
+                if self._consecutive_nan >= 10:
+                    log.warning(
+                        "NaN cascade detected (%d consecutive) — resetting "
+                        "optimizer state to break the loop",
+                        self._consecutive_nan,
+                    )
+                    for pg in self.optimizer.param_groups:
+                        for p in pg["params"]:
+                            state = self.optimizer.state.get(p)
+                            if state:
+                                for k, v in state.items():
+                                    if isinstance(v, torch.Tensor) and (
+                                        torch.isnan(v).any() or torch.isinf(v).any()
+                                    ):
+                                        state[k] = torch.zeros_like(v)
+                    if self.scaler is not None:
+                        self.scaler = torch.amp.GradScaler("cuda")
+                    self._consecutive_nan = 0
                 self._step += 1
                 return
+            else:
+                self._consecutive_nan = 0
 
             # Backward with gradient accumulation
             # PCGrad applies multiple per-task backward passes and projects
@@ -1041,6 +1068,29 @@ class LearnerThread:
         batch = {}
         if not transitions:
             return batch
+
+        # Pre-filter: drop any transition where a tensor key is NaN/Inf.
+        # This prevents replay-buffer contamination from a corrupt inference
+        # forward pass from causing an unrecoverable NaN cascade.
+        _CRITICAL_KEYS = {"fused", "next_fused", "log_prob", "value", "reward"}
+        clean = []
+        for t in transitions:
+            bad = False
+            for k in _CRITICAL_KEYS:
+                v = t.get(k)
+                if isinstance(v, torch.Tensor) and (
+                    torch.isnan(v).any() or torch.isinf(v).any()
+                ):
+                    bad = True
+                    break
+            if not bad:
+                clean.append(t)
+        if len(clean) < len(transitions):
+            log.debug(
+                "_collate_transitions: dropped %d/%d transitions with NaN/Inf tensors",
+                len(transitions) - len(clean), len(transitions),
+            )
+        transitions = clean if clean else transitions
 
         keys = transitions[0].keys()
         for key in keys:

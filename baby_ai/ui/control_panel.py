@@ -155,6 +155,9 @@ class AIControlPanel:
     on_set_home_coords : callable, optional
         Invoked when the user enters manual home coordinates via the
         GUI.  Signature: ``(x: float, y: float, z: float) -> None``.
+    on_goto_home : callable, optional
+        Invoked when the user clicks *Go Home* (emergency teleport).
+        Should call ``mod_bridge.goto_home()`` to teleport the AI.
     input_guard : object, optional
         Reference to the :class:`InputGuard` so the Pause button can
         toggle keyboard/mouse blocking in sync.
@@ -170,6 +173,7 @@ class AIControlPanel:
         reward_weights: Optional[RewardWeightsState] = None,
         on_set_home: Optional[Callable[[], None]] = None,
         on_set_home_coords: Optional[Callable] = None,
+        on_goto_home: Optional[Callable[[], None]] = None,
         input_guard: Optional[object] = None,
         settings_store: Optional[SettingsStore] = None,
     ):
@@ -178,6 +182,7 @@ class AIControlPanel:
         self.on_stop = on_stop
         self.on_set_home = on_set_home
         self.on_set_home_coords = on_set_home_coords
+        self.on_goto_home = on_goto_home
         self._input_guard = input_guard
 
         # Settings persistence
@@ -331,12 +336,22 @@ class AIControlPanel:
         )
         self.btn_set_home.pack(side=tk.RIGHT, padx=(int(4 * s), 0))
 
+        # ── Go Home (emergency rescue) button ──────────────────
+        self.btn_goto_home = tk.Button(
+            top_bar, text="\U0001f6a8  Go Home",
+            command=self._on_goto_home,
+            bg="#e64553", fg="#ffffff", activebackground="#c03a45",
+            font=("Segoe UI", int(9 * s), "bold"),
+            relief="flat", bd=0, padx=int(8 * s), pady=int(4 * s),
+        )
+        self.btn_goto_home.pack(side=tk.RIGHT, padx=(int(4 * s), 0))
+
         # ── Hotkey hints strip ─────────────────────────────────
         hints_bar = tk.Frame(self.root, bg=_BG)
         hints_bar.pack(fill=tk.X, pady=(0, int(4 * s)))
         tk.Label(
             hints_bar,
-            text="Ctrl+P  Pause/Resume  ·  Ctrl+Q  Stop & Save  ·  Ctrl+H  Set Home",
+            text="Ctrl+P  Pause/Resume  ·  Ctrl+Q  Stop & Save  ·  Ctrl+H  Set Home  ·  Ctrl+G  Go Home",
             font=("Segoe UI", int(8 * s)),
             bg=_BG, fg=_FG_DIM, anchor="w",
         ).pack(side=tk.LEFT)
@@ -345,6 +360,7 @@ class AIControlPanel:
         self.root.bind_all("<Control-p>", lambda e: self.toggle_pause())
         self.root.bind_all("<Control-q>", lambda e: self.trigger_stop())
         self.root.bind_all("<Control-h>", lambda e: self._on_set_home())
+        self.root.bind_all("<Control-g>", lambda e: self._on_goto_home())
 
         # ── Home Waypoint section ─────────────────────────────
         home_frame = tk.Frame(self.root, bg=_BG_GROUP,
@@ -881,6 +897,11 @@ class AIControlPanel:
         """Set New Home button clicked — invoke the callback."""
         if self.on_set_home:
             self.on_set_home()
+
+    def _on_goto_home(self) -> None:
+        """Go Home (emergency rescue) button clicked — invoke the callback."""
+        if self.on_goto_home:
+            self.on_goto_home()
 
     def _on_apply_home_coords(self) -> None:
         """Apply manually-entered home coordinates from the GUI fields."""

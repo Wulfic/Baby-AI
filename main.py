@@ -641,12 +641,18 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     def _on_set_home_coords(x: float, y: float, z: float) -> None:
         env.set_home_coords(x, y, z)
 
+    # Emergency rescue: teleport AI to home via mod bridge.
+    def _on_goto_home() -> None:
+        if env._mod_bridge is not None:
+            env._mod_bridge.goto_home()
+
     control_panel = AIControlPanel(
         toggle_state=toggle_state,
         controls_state=controls_state,
         reward_weights=reward_weights,
         on_set_home=_on_set_home,
         on_set_home_coords=_on_set_home_coords,
+        on_goto_home=_on_goto_home,
         input_guard=env._guard,
         settings_store=settings_store,
     )

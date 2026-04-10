@@ -101,10 +101,15 @@ class RewardComputer:
         self._linger_known_chunks: set[tuple[int, int]] = set()
 
         # Idle-safeguard: track how long idle_penalty has been continuously
-        # non-zero. If it exceeds 30 s of wall time, teleport the AI home
+        # non-zero. If it exceeds 15 s of wall time, teleport the AI home
         # so it doesn't train on data while physically stuck.
+        # A grace counter (_non_idle_grace) prevents brief movement bursts
+        # (1-4 steps) from resetting the timer — only 5+ consecutive
+        # non-idle steps count as genuine movement and clear it.
         self._idle_penalty_start: Optional[float] = None
-        self._IDLE_SAFEGUARD_SECS: float = 30.0
+        self._non_idle_grace: int = 0   # consecutive non-idle steps
+        self._IDLE_SAFEGUARD_SECS: float = 15.0
+        self._IDLE_GRACE_STEPS: int = 5   # real movement threshold
 
     def reset(self) -> None:
         """Clear per-episode accumulators."""
@@ -119,6 +124,7 @@ class RewardComputer:
         self.new_chunks_since_linger = 0
         self._linger_known_chunks.clear()
         self._idle_penalty_start = None
+        self._non_idle_grace = 0
 
     # ────────────────────────────────────────────────────────────
     #  Main entry point
@@ -253,24 +259,29 @@ class RewardComputer:
             idle_penalty = self._compute_idle_penalty(action_id, env)
         rewards["idle_penalty"] = idle_penalty
 
-        # ── 7a. Idle safeguard — teleport home after 30 s of continuous penalty ──
+        # ── 7a. Idle safeguard — teleport home after 15 s of continuous penalty ──
         if not observation_only:
             if idle_penalty > 0.0:
+                self._non_idle_grace = 0
                 if self._idle_penalty_start is None:
                     self._idle_penalty_start = time.time()
                 elif (time.time() - self._idle_penalty_start) >= self._IDLE_SAFEGUARD_SECS:
                     mob = getattr(env, "_mod_bridge", None)
                     if mob is not None:
                         log.warning(
-                            "AI stuck for >=30 s (idle penalty active %.1f s) — "
+                            "AI stuck for >=%.0f s (idle penalty active %.1f s) — "
                             "teleporting to home",
+                            self._IDLE_SAFEGUARD_SECS,
                             time.time() - self._idle_penalty_start,
                         )
                         mob.goto_home()
                     # Reset so we don't spam the command every step
                     self._idle_penalty_start = time.time()
             else:
-                self._idle_penalty_start = None
+                self._non_idle_grace += 1
+                if self._non_idle_grace >= self._IDLE_GRACE_STEPS:
+                    # Genuine movement — clear the idle timer
+                    self._idle_penalty_start = None
 
         # ── 7b. Hotbar spam penalty ───────────────────────────
         if observation_only:
