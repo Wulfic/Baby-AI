@@ -100,6 +100,12 @@ class RewardComputer:
         self.new_chunks_since_linger: int = 0
         self._linger_known_chunks: set[tuple[int, int]] = set()
 
+        # Idle-safeguard: track how long idle_penalty has been continuously
+        # non-zero. If it exceeds 30 s of wall time, teleport the AI home
+        # so it doesn't train on data while physically stuck.
+        self._idle_penalty_start: Optional[float] = None
+        self._IDLE_SAFEGUARD_SECS: float = 30.0
+
     def reset(self) -> None:
         """Clear per-episode accumulators."""
         self.frame_history.clear()
@@ -112,6 +118,7 @@ class RewardComputer:
         self.chunk_linger_steps = 0
         self.new_chunks_since_linger = 0
         self._linger_known_chunks.clear()
+        self._idle_penalty_start = None
 
     # ────────────────────────────────────────────────────────────
     #  Main entry point
@@ -245,6 +252,25 @@ class RewardComputer:
         else:
             idle_penalty = self._compute_idle_penalty(action_id, env)
         rewards["idle_penalty"] = idle_penalty
+
+        # ── 7a. Idle safeguard — teleport home after 30 s of continuous penalty ──
+        if not observation_only:
+            if idle_penalty > 0.0:
+                if self._idle_penalty_start is None:
+                    self._idle_penalty_start = time.time()
+                elif (time.time() - self._idle_penalty_start) >= self._IDLE_SAFEGUARD_SECS:
+                    mob = getattr(env, "_mod_bridge", None)
+                    if mob is not None:
+                        log.warning(
+                            "AI stuck for >=30 s (idle penalty active %.1f s) — "
+                            "teleporting to home",
+                            time.time() - self._idle_penalty_start,
+                        )
+                        mob.goto_home()
+                    # Reset so we don't spam the command every step
+                    self._idle_penalty_start = time.time()
+            else:
+                self._idle_penalty_start = None
 
         # ── 7b. Hotbar spam penalty ───────────────────────────
         if observation_only:

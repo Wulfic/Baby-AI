@@ -607,6 +607,43 @@ public class EventBridge {
                 mousePassthrough.set(enabled);
                 LOGGER.info("[Baby-AI] Mouse passthrough: {}", enabled ? "ON" : "OFF");
             }
+            case "goto_home" -> {
+                // Teleport the player to their saved home waypoint.
+                // Triggered automatically after the AI accumulates >30 s of
+                // idle penalties (stuck safeguard — prevents training on bad data).
+                MinecraftServer server = serverRef.get();
+                if (server != null) {
+                    server.execute(() -> {
+                        net.minecraft.server.network.ServerPlayerEntity player =
+                            server.getPlayerManager().getPlayerList().stream()
+                                .findFirst().orElse(null);
+                        if (player == null) {
+                            LOGGER.warn("[Baby-AI] goto_home: no player found");
+                            return;
+                        }
+                        HomeManager.HomePos home =
+                            HomeManager.INSTANCE.getHome(player.getUuid());
+                        if (home == null) {
+                            LOGGER.warn("[Baby-AI] goto_home: no home set for player {}",
+                                        player.getName().getString());
+                            return;
+                        }
+                        net.minecraft.server.world.ServerWorld world =
+                            player.getServerWorld();
+                        player.teleport(
+                            world,
+                            home.x(), home.y(), home.z(),
+                            java.util.Set.of(),
+                            player.getYaw(),
+                            player.getPitch()
+                        );
+                        LOGGER.info("[Baby-AI] Teleported AI to home ({}, {}, {}) after idle safeguard",
+                                    home.x(), home.y(), home.z());
+                    });
+                } else {
+                    LOGGER.warn("[Baby-AI] goto_home: serverRef is null");
+                }
+            }
             default -> LOGGER.warn("[Baby-AI] Unknown command: {}", action);
         }
     }

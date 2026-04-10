@@ -267,6 +267,20 @@ class ModBridge:
         """
         return self.send_command({"command": "mouse_passthrough", "enabled": enabled})
 
+    def goto_home(self) -> bool:
+        """Teleport the AI player to the saved home waypoint.
+
+        Used as a stuck safeguard: after the AI accumulates more than
+        30 consecutive seconds of idle penalties the environment calls
+        this to reset the player's position to a known-good location,
+        preventing the agent from training on bad data while stuck.
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        log.info("Sending goto_home command (idle safeguard)")
+        return self.send_command({"command": "goto_home"})
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run(self) -> None:
