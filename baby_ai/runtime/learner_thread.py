@@ -726,7 +726,8 @@ class LearnerThread:
                 loss = loss + 0.01 * torch.clamp(cf_loss, max=5.0)
 
             # ── Dyna imagined rollouts (every 8 steps to limit overhead) ──
-            if self._step % 8 == 0 and "action" in batch:
+            if (self._step % 8 == 0 and "action" in batch
+                    and getattr(self.config, "save_imagined_rollouts", True)):
                 try:
                     with torch.no_grad():
                         start_lat = self.teacher.predictive.encode_state(

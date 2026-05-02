@@ -421,6 +421,10 @@ class TrainingConfig:
 
     # Checkpointing
     checkpoint_every_n_steps: int = 5000
+    # Dyna / imagined rollouts — when False, skip generating/saving imagined transitions
+    # Set to False by default to avoid saving imagined transitions unless
+    # explicitly enabled in a config file or at runtime.
+    save_imagined_rollouts: bool = False
 
 
 # ---------------------------------------------------------------------------
