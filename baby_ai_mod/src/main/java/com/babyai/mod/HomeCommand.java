@@ -50,13 +50,14 @@ public class HomeCommand {
         }
 
         // Teleport the player to home in their current world.
-        ServerWorld world = player.getServerWorld();
+        ServerWorld world = player.getEntityWorld();
         player.teleport(
             world,
             home.x(), home.y(), home.z(),
             Set.of(),         // no relative flags — absolute coordinates
             player.getYaw(),  // keep current yaw
-            player.getPitch() // keep current pitch
+            player.getPitch(), // keep current pitch
+            true
         );
 
         player.sendMessage(

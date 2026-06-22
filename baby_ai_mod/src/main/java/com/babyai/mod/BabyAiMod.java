@@ -80,7 +80,7 @@ public class BabyAiMod implements ModInitializer {
                     BlockPos eyePos = BlockPos.ofFloored(
                         player.getX(), player.getEyeY(), player.getZ()
                     );
-                    int light = player.getWorld().getLightLevel(LightType.SKY, eyePos);
+                    int light = player.getEntityWorld().getLightLevel(LightType.SKY, eyePos);
                     EventBridge.INSTANCE.onPositionUpdate(
                         player.getX(), player.getY(), player.getZ(),
                         player.getPitch(), player.getYaw(),
@@ -92,7 +92,7 @@ public class BabyAiMod implements ModInitializer {
                     // movement state, world conditions, inventory.
                     Vec3d vel = player.getVelocity();
                     BlockPos feetPos = player.getBlockPos();
-                    RegistryEntry<Biome> biomeEntry = player.getWorld().getBiome(feetPos);
+                    RegistryEntry<Biome> biomeEntry = player.getEntityWorld().getBiome(feetPos);
                     String biomeId = biomeEntry.getKey()
                             .map(k -> k.getValue().toString())
                             .orElse("unknown");
@@ -103,8 +103,9 @@ public class BabyAiMod implements ModInitializer {
 
                     // Count non-empty inventory slots (main 36 slots)
                     int usedSlots = 0;
-                    for (int i = 0; i < player.getInventory().main.size(); i++) {
-                        if (!player.getInventory().main.get(i).isEmpty()) {
+                    var mainStacks = player.getInventory().getMainStacks();
+                    for (int i = 0; i < mainStacks.size(); i++) {
+                        if (!mainStacks.get(i).isEmpty()) {
                             usedSlots++;
                         }
                     }
@@ -118,10 +119,10 @@ public class BabyAiMod implements ModInitializer {
                         player.getAir(), player.getMaxAir(),
                         player.isSprinting(), player.isSwimming(),
                         player.isSneaking(), player.isOnFire(),
-                        player.getWorld().getTime(),
-                        player.getWorld().getTimeOfDay(),
-                        player.getWorld().isRaining(),
-                        player.getWorld().isThundering(),
+                        player.getEntityWorld().getTime(),
+                        player.getEntityWorld().getTimeOfDay(),
+                        player.getEntityWorld().isRaining(),
+                        player.getEntityWorld().isThundering(),
                         biomeId, heldItemId,
                         vel.x, vel.y, vel.z,
                         usedSlots, tick
@@ -203,7 +204,7 @@ public class BabyAiMod implements ModInitializer {
             if (player instanceof ServerPlayerEntity serverPlayer) {
                 try {
                     dmg = (float) serverPlayer.getAttributeValue(
-                        net.minecraft.entity.attribute.EntityAttributes.GENERIC_ATTACK_DAMAGE
+                        net.minecraft.entity.attribute.EntityAttributes.ATTACK_DAMAGE
                     );
                 } catch (Exception ignored) {
                     dmg = 1.0f;
@@ -230,8 +231,8 @@ public class BabyAiMod implements ModInitializer {
                                      .getString();
                 } catch (Exception ignored) { }
 
-                long tick = entity.getServer() != null
-                        ? entity.getServer().getTicks() : 0;
+                long tick = entity.getEntityWorld().getServer() != null
+                        ? entity.getEntityWorld().getServer().getTicks() : 0;
                 EventBridge.INSTANCE.onPlayerDeath(deathMsg, tick);
                 LOGGER.info("[Baby-AI] Player death: {}", deathMsg);
 
@@ -243,9 +244,9 @@ public class BabyAiMod implements ModInitializer {
                 //
                 // If a home waypoint is set, teleport the player
                 // there after respawning instead of the world spawn.
-                player.getServer().execute(() -> {
+                player.getEntityWorld().getServer().execute(() -> {
                     if (player.isDead()) {
-                        ServerPlayerEntity respawned = player.getServer()
+                        ServerPlayerEntity respawned = player.getEntityWorld().getServer()
                               .getPlayerManager()
                               .respawnPlayer(player, false, Entity.RemovalReason.KILLED);
                         LOGGER.info("[Baby-AI] Auto-respawned player");
@@ -255,11 +256,12 @@ public class BabyAiMod implements ModInitializer {
                                 .getHome(respawned.getUuid());
                         if (home != null) {
                             respawned.teleport(
-                                respawned.getServerWorld(),
+                                respawned.getEntityWorld(),
                                 home.x(), home.y(), home.z(),
                                 java.util.Set.of(),
                                 respawned.getYaw(),
-                                respawned.getPitch()
+                                respawned.getPitch(),
+                                true
                             );
                             LOGGER.info("[Baby-AI] Teleported to home after respawn: ({}, {}, {})",
                                         home.x(), home.y(), home.z());
@@ -274,8 +276,8 @@ public class BabyAiMod implements ModInitializer {
                 String entityType = Registries.ENTITY_TYPE.getId(entity.getType()).toString();
                 String entityName = entity.getName().getString();
                 boolean hostile = entity instanceof HostileEntity;
-                long tick = entity.getServer() != null
-                        ? entity.getServer().getTicks() : 0;
+                long tick = entity.getEntityWorld().getServer() != null
+                        ? entity.getEntityWorld().getServer().getTicks() : 0;
                 EventBridge.INSTANCE.onMobKilled(entityType, entityName, hostile, tick);
                 LOGGER.info("[Baby-AI] Mob killed: {} (hostile={})", entityName, hostile);
             }

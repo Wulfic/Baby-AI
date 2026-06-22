@@ -61,8 +61,8 @@ public abstract class ItemPickupMixin {
 
             String itemId = Registries.ITEM
                     .getId(babyai$capturedStack.getItem()).toString();
-            long tick = self.getWorld().getServer() != null
-                    ? self.getWorld().getServer().getTicks() : 0;
+            long tick = self.getEntityWorld().getServer() != null
+                    ? self.getEntityWorld().getServer().getTicks() : 0;
 
             LOGGER.info("[Baby-AI] Item pickup: {} x{}", itemId, pickedCount);
             EventBridge.INSTANCE.onItemPickup(itemId, pickedCount, tick);

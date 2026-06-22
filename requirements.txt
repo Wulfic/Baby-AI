@@ -1,0 +1,15 @@
+# Baby-AI Python dependencies.
+#
+# torch / torchaudio are CUDA builds and must come from PyTorch's own index
+# (see setup.ps1), not plain PyPI. Everything else installs normally:
+#   pip install -r requirements.txt
+
+numpy
+pyyaml
+psutil
+opencv-python
+python-dotenv
+mss
+sounddevice
+librosa
+aiohttp

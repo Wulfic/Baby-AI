@@ -35,13 +35,13 @@ public class CraftingMixin {
             ItemStack stack,
             CallbackInfo ci
     ) {
-        if (player.getWorld() == null || player.getWorld().isClient()) return;
+        if (player.getEntityWorld() == null || player.getEntityWorld().isClient()) return;
         if (stack.isEmpty()) return;
 
         String itemId = Registries.ITEM.getId(stack.getItem()).toString();
         int count = stack.getCount();
-        long tick = player.getServer() != null
-                ? player.getServer().getTicks() : 0;
+        long tick = player.getEntityWorld().getServer() != null
+                ? player.getEntityWorld().getServer().getTicks() : 0;
 
         LOGGER.info("[Baby-AI] Item crafted: {} x{}", itemId, count);
         EventBridge.INSTANCE.onItemCrafted(itemId, count, tick);

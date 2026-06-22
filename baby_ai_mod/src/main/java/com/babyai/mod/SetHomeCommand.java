@@ -53,7 +53,7 @@ public class SetHomeCommand {
         double x = Math.round(player.getX() * 100.0) / 100.0;
         double y = Math.round(player.getY() * 100.0) / 100.0;
         double z = Math.round(player.getZ() * 100.0) / 100.0;
-        long tick = player.getServer() != null ? player.getServer().getTicks() : 0;
+        long tick = player.getEntityWorld().getServer() != null ? player.getEntityWorld().getServer().getTicks() : 0;
 
         // Save in the server-side HomeManager.
         HomeManager.INSTANCE.setHome(player.getUuid(), x, y, z);
@@ -61,12 +61,16 @@ public class SetHomeCommand {
         // Update Minecraft's actual respawn point so the player
         // respawns here natively (like sleeping in a bed).
         BlockPos spawnPos = BlockPos.ofFloored(x, y, z);
+        net.minecraft.world.WorldProperties.SpawnPoint spawnPoint =
+            net.minecraft.world.WorldProperties.SpawnPoint.create(
+                player.getEntityWorld().getRegistryKey(), // current dimension
+                spawnPos,
+                0.0f,   // spawn yaw
+                0.0f    // spawn pitch
+            );
         player.setSpawnPoint(
-            player.getWorld().getRegistryKey(), // current dimension
-            spawnPos,
-            0.0f,   // spawn angle
-            true,    // forced — bypass bed/anchor checks
-            true     // send update to client
+            new ServerPlayerEntity.Respawn(spawnPoint, true), // forced — bypass bed/anchor checks
+            true // send update to client
         );
 
         // Broadcast to Python via the TCP event bridge.

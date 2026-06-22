@@ -651,13 +651,14 @@ public class EventBridge {
                             return;
                         }
                         net.minecraft.server.world.ServerWorld world =
-                            player.getServerWorld();
+                            player.getEntityWorld();
                         player.teleport(
                             world,
                             home.x(), home.y(), home.z(),
                             java.util.Set.of(),
                             player.getYaw(),
-                            player.getPitch()
+                            player.getPitch(),
+                            true
                         );
                         LOGGER.info("[Baby-AI] Teleported AI to home ({}, {}, {}) after idle safeguard",
                                     home.x(), home.y(), home.z());
