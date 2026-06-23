@@ -75,19 +75,23 @@ class VirtualInputController(InputController):
     # ── Camera look (override) ──────────────────────────────────
 
     def mouse_look(self, dx: int, dy: int) -> bool:
-        """Rotate the camera by sending a ``look`` command to the mod.
+        """Rotate the camera, or move the GUI cursor, via the mod bridge.
 
-        The pixel deltas are converted to degrees using the configured
-        pixels-per-degree ratios so the action decoder's output range
-        produces the same visual rotation as active mode.
+        When **no** GUI screen is open the pixel deltas are converted to
+        degrees and sent as a ``look`` command — the mod applies the
+        rotation directly on the player entity (no cursor warp, no focus
+        needed).
 
-        In-game GUI screens (inventory, crafting) still need cursor
-        positioning, which is handled by the parent class's background-
-        mode ``WM_MOUSEMOVE`` PostMessage.  :meth:`mouse_look` is only
-        called for camera rotation; the env distinguishes the two cases
-        via the ``has_open_screen`` flag from the mod bridge.
+        When a GUI screen **is** open (inventory, crafting, chest, …) the
+        same deltas are sent as a ``gui_move`` command instead, so the mod
+        drives ``Screen.mouseMoved`` and the AI's virtual cursor glides
+        over the slots.  This replaces the old ``WM_MOUSEMOVE`` PostMessage
+        path, which GLFW ignored for GUI screens (the cursor never moved).
 
-        Returns True if the command was sent, False otherwise.
+        The env distinguishes the two cases via the ``has_open_screen``
+        flag, which the mod now pushes the instant a screen opens/closes.
+
+        Returns True if a command was sent, False otherwise.
         """
         if not self._window.is_valid:
             return False
@@ -100,11 +104,12 @@ class VirtualInputController(InputController):
             if not _controls_state.is_look_allowed():
                 return False
 
-        # If a GUI screen is open (inventory, chest, etc.), delegate
-        # to the PostMessage-based cursor positioning so the AI can
-        # click on slots/buttons.
+        # If a GUI screen is open, move the in-game cursor over the slots.
+        # The mod also self-guards: a stray ``look`` arriving during the
+        # open/close race is re-interpreted as cursor movement, never
+        # camera rotation, so the camera can't spin behind the inventory.
         if self._bridge.has_open_screen:
-            return super().mouse_look(dx, dy)
+            return self._bridge.send_gui_move(dx, dy)
 
         # Convert pixel deltas → degree deltas
         dyaw = dx / self._px_per_deg_yaw
@@ -118,6 +123,39 @@ class VirtualInputController(InputController):
             "dyaw": round(dyaw, 3),
             "dpitch": round(dpitch, 3),
         })
+
+    # ── Mouse buttons (override for GUI clicks) ─────────────────
+
+    # GLFW button codes used by Screen.mouseClicked / mouseReleased.
+    _GLFW_BUTTON = {"left": 0, "right": 1, "middle": 2}
+
+    def mouse_down(self, button: str = "left", x: int = -1, y: int = -1) -> None:
+        """Press a mouse button — routed to the open GUI screen if any.
+
+        While a screen is open, a normal PostMessage click does nothing
+        (GLFW owns GUI input), so the press is sent to the mod as a
+        ``gui_click`` which calls ``Screen.mouseClicked`` at the virtual
+        cursor — picking up / placing inventory stacks.  Otherwise the
+        parent's PostMessage world-click is used unchanged.
+        """
+        if self._bridge.has_open_screen:
+            if self.paused:
+                return
+            from baby_ai.environments.minecraft.input_controller import _controls_state
+            if _controls_state is not None and not _controls_state.is_button_allowed(button):
+                return
+            self._bridge.send_gui_click(self._GLFW_BUTTON.get(button, 0), down=True)
+            self._held_buttons.add(button)
+            return
+        super().mouse_down(button, x, y)
+
+    def mouse_up(self, button: str = "left", x: int = -1, y: int = -1) -> None:
+        """Release a mouse button — routed to the open GUI screen if any."""
+        if self._bridge.has_open_screen:
+            self._bridge.send_gui_click(self._GLFW_BUTTON.get(button, 0), down=False)
+            self._held_buttons.discard(button)
+            return
+        super().mouse_up(button, x, y)
 
     # ── Properties ──────────────────────────────────────────────
 

@@ -572,7 +572,16 @@ class MinecraftEnv(GameEnvironment):
                     # from getting stuck staring at the sky/feet.
                     # dy < 0 = looking UP (pitch decreasing toward -90)
                     # dy > 0 = looking DOWN (pitch increasing toward +90)
-                    if self._player_pitch is not None:
+                    #
+                    # Skipped while a GUI screen is open: there the look
+                    # delta drives the inventory cursor, not the camera,
+                    # so clamping on player pitch would wrongly freeze
+                    # vertical cursor movement.
+                    screen_open = (
+                        self._mod_bridge is not None
+                        and self._mod_bridge.has_open_screen
+                    )
+                    if self._player_pitch is not None and not screen_open:
                         if dy < 0 and self._player_pitch <= self._PITCH_LIMIT_UP:
                             # Already at/beyond upward limit — block
                             dy = 0

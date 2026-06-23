@@ -251,6 +251,39 @@ class ModBridge:
             "dpitch": round(dpitch, 3),
         })
 
+    def send_gui_move(self, dx: float, dy: float) -> bool:
+        """Move the in-game GUI cursor by (dx, dy) raw window pixels.
+
+        Routed to the mod, which calls ``Screen.mouseMoved`` on the open
+        inventory/crafting screen so the AI can hover over slots.  Has no
+        effect unless a screen is actually open on the client.
+
+        Returns True if the command was sent successfully.
+        """
+        return self.send_command({
+            "command": "gui_move",
+            "dx": round(dx, 1),
+            "dy": round(dy, 1),
+        })
+
+    def send_gui_click(self, button: int, down: bool) -> bool:
+        """Synthesize a GUI mouse-button event at the virtual cursor.
+
+        Drives real slot interactions (pick up / place / swap stacks) via
+        ``Screen.mouseClicked`` / ``mouseReleased`` on the open screen.
+
+        Args:
+            button: GLFW button code — 0=left, 1=right, 2=middle.
+            down:   True for press (mouseClicked), False for release.
+
+        Returns True if the command was sent successfully.
+        """
+        return self.send_command({
+            "command": "gui_click",
+            "button": button,
+            "action": "down" if down else "up",
+        })
+
     def send_mouse_passthrough(self, enabled: bool) -> bool:
         """Tell the mod to let physical mouse movement reach Minecraft.
 
@@ -365,6 +398,19 @@ class ModBridge:
                             self._resume_ack.set()
                             log.debug("Received resume_ack (frozen=%s)",
                                       event.get("frozen"))
+                        elif evt_type == "screen_state":
+                            # Immediate screen open/close notification — lets
+                            # the input controller switch between camera-look
+                            # and GUI-cursor routing without waiting for the
+                            # next player_status tick (~500 ms).  Not queued as
+                            # a game event; it's purely a routing hint.
+                            self.has_open_screen = event.get(
+                                "has_open_screen", False)
+                            self.open_screen_name = event.get(
+                                "open_screen_name", "")
+                            log.debug("Screen state: open=%s name=%s",
+                                      self.has_open_screen,
+                                      self.open_screen_name)
                         else:
                             # Extract screen state from player_status
                             # before queuing so it's always up-to-date.

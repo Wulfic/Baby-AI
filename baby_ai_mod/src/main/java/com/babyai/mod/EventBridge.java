@@ -46,6 +46,15 @@ public class EventBridge {
     public static final EventBridge INSTANCE = new EventBridge();
     public static final int DEFAULT_PORT = 5556;
 
+    /**
+     * Degrees → raw-pixel factor used when a {@code look} command arrives
+     * while a GUI screen is open and must be re-interpreted as cursor
+     * movement.  Matches the {@code pixels_per_deg} ratio the Python
+     * {@code VirtualInputController} uses when converting pixel deltas
+     * to degrees, so the round-trip preserves the intended magnitude.
+     */
+    private static final double GUI_DEG_TO_PX = 8.0;
+
     private static final Logger LOGGER = LoggerFactory.getLogger("baby-ai-bridge");
 
     private ServerSocket serverSocket;
@@ -79,16 +88,35 @@ public class EventBridge {
     private final AtomicBoolean screenOpen = new AtomicBoolean(false);
     private final AtomicReference<String> openScreenName = new AtomicReference<>("");
 
+    /**
+     * Virtual GUI cursor position in raw window-pixel coordinates.
+     *
+     * <p>Driven by the AI's {@code gui_move} (and {@code look}-while-screen-open)
+     * commands so it can hover over inventory slots without GLFW ever moving the
+     * real OS cursor.  Stored in the same units as {@link net.minecraft.client.Mouse#getX()}
+     * so {@code GuiCursorMixin} can report it back to the renderer, making the
+     * carried item stack and slot highlight follow the AI's cursor.
+     *
+     * <p>{@code -1} means "uninitialised" → lazily centred on first use.
+     */
+    private volatile double guiCursorX = -1.0;
+    private volatile double guiCursorY = -1.0;
+
     /** Called by {@code ScreenStateMixin} when any screen opens. */
     public void setScreenOpen(String screenClassName) {
         screenOpen.set(true);
         openScreenName.set(screenClassName != null ? screenClassName : "");
+        broadcastScreenState();
     }
 
     /** Called by {@code ScreenStateMixin} when the screen closes. */
     public void setScreenClosed() {
         screenOpen.set(false);
         openScreenName.set("");
+        // Forget the cursor so the next screen re-centres it.
+        guiCursorX = -1.0;
+        guiCursorY = -1.0;
+        broadcastScreenState();
     }
 
     /** Check if any GUI screen is currently open (thread-safe). */
@@ -99,6 +127,92 @@ public class EventBridge {
     /** Name of the currently open screen class, or empty string. */
     public String getOpenScreenName() {
         return openScreenName.get();
+    }
+
+    /** True once the virtual GUI cursor has a real (centred or moved) position. */
+    public boolean hasGuiCursor() {
+        return guiCursorX >= 0.0 && guiCursorY >= 0.0;
+    }
+
+    /** Virtual GUI cursor X in raw window pixels (read by {@code GuiCursorMixin}). */
+    public double getGuiCursorX() {
+        return guiCursorX;
+    }
+
+    /** Virtual GUI cursor Y in raw window pixels (read by {@code GuiCursorMixin}). */
+    public double getGuiCursorY() {
+        return guiCursorY;
+    }
+
+    /**
+     * Immediately push the current screen-open state to all clients.
+     *
+     * <p>The Python side switches its input routing (camera-look ↔ GUI cursor)
+     * based on this flag.  Pushing it the instant a screen opens/closes — rather
+     * than waiting for the next {@code player_status} tick (~500 ms) — closes the
+     * window where look commands would still rotate the camera behind an open
+     * inventory.
+     */
+    private void broadcastScreenState() {
+        JsonObject j = new JsonObject();
+        j.addProperty("event", "screen_state");
+        j.addProperty("has_open_screen", screenOpen.get());
+        j.addProperty("open_screen_name", openScreenName.get());
+        broadcast(j);
+    }
+
+    // ── Virtual GUI cursor driving (client thread) ─────────────
+
+    /** Lazily centre the virtual cursor in the window on first use. */
+    private void ensureCursorInit(net.minecraft.client.util.Window window) {
+        if (guiCursorX < 0.0 || guiCursorY < 0.0) {
+            guiCursorX = window.getWidth() / 2.0;
+            guiCursorY = window.getHeight() / 2.0;
+        }
+    }
+
+    /**
+     * Move the virtual GUI cursor by (dx, dy) raw pixels and notify the open
+     * screen so slot hover-highlighting updates.  No-op if no screen is open.
+     * Must run on the client (render) thread.
+     */
+    private void moveGuiCursor(net.minecraft.client.MinecraftClient client, double dx, double dy) {
+        net.minecraft.client.gui.screen.Screen screen = client.currentScreen;
+        if (screen == null) return;
+        net.minecraft.client.util.Window window = client.getWindow();
+        ensureCursorInit(window);
+        guiCursorX = Math.max(0.0, Math.min(guiCursorX + dx, window.getWidth() - 1.0));
+        guiCursorY = Math.max(0.0, Math.min(guiCursorY + dy, window.getHeight() - 1.0));
+        double sx = guiCursorX * window.getScaledWidth() / (double) window.getWidth();
+        double sy = guiCursorY * window.getScaledHeight() / (double) window.getHeight();
+        screen.mouseMoved(sx, sy);
+    }
+
+    /**
+     * Synthesize a GUI mouse-button event at the virtual cursor.  This drives
+     * real slot interactions ({@code Screen.mouseClicked} → {@code handleSlotClick}
+     * → {@code interactionManager.clickSlot}), so the AI can pick up, place, and
+     * swap inventory stacks.  {@code button} uses GLFW codes (0=left, 1=right,
+     * 2=middle).  Must run on the client (render) thread.
+     */
+    private void clickGuiCursor(net.minecraft.client.MinecraftClient client, int button, boolean down) {
+        net.minecraft.client.gui.screen.Screen screen = client.currentScreen;
+        if (screen == null) return;
+        net.minecraft.client.util.Window window = client.getWindow();
+        ensureCursorInit(window);
+        double sx = guiCursorX * window.getScaledWidth() / (double) window.getWidth();
+        double sy = guiCursorY * window.getScaledHeight() / (double) window.getHeight();
+        // 1.21.11 bundles (x, y, button) into a Click record.  No modifier
+        // keys, and not a double-click.
+        net.minecraft.client.input.MouseInput buttonInfo =
+            new net.minecraft.client.input.MouseInput(button, 0);
+        net.minecraft.client.gui.Click click =
+            new net.minecraft.client.gui.Click(sx, sy, buttonInfo);
+        if (down) {
+            screen.mouseClicked(click, false);
+        } else {
+            screen.mouseReleased(click);
+        }
     }
 
     // ── Server reference ───────────────────────────────────────
@@ -526,7 +640,14 @@ public class EventBridge {
      *   <li>{@code {"command":"look", "dyaw":float, "dpitch":float}}
      *        — rotate the player camera by the given degree deltas
      *        (executed on the client render thread so the change is
-     *        immediate and bypasses GLFW raw-input)</li>
+     *        immediate and bypasses GLFW raw-input).  If a GUI screen
+     *        is open it is re-interpreted as cursor movement instead.</li>
+     *   <li>{@code {"command":"gui_move", "dx":double, "dy":double}}
+     *        — move the virtual GUI cursor by raw window-pixel deltas so
+     *        the AI can hover over inventory slots</li>
+     *   <li>{@code {"command":"gui_click", "button":int, "action":"down"|"up"}}
+     *        — synthesize a GUI mouse-button event at the virtual cursor
+     *        (button: 0=left, 1=right, 2=middle) to pick up / place stacks</li>
      * </ul>
      */
     private void handleCommand(JsonObject cmd, PrintWriter clientWriter) {
@@ -588,7 +709,14 @@ public class EventBridge {
 
                 net.minecraft.client.MinecraftClient client = net.minecraft.client.MinecraftClient.getInstance();
                 client.execute(() -> {
-                    if (client.player != null) {
+                    if (client.currentScreen != null) {
+                        // A GUI screen is open — NEVER rotate the camera behind
+                        // it.  Re-interpret the degree deltas as virtual cursor
+                        // movement so the AI can traverse inventory slots.  This
+                        // guards the brief window before the screen-open state
+                        // reaches Python (which normally sends gui_move directly).
+                        moveGuiCursor(client, dyaw * GUI_DEG_TO_PX, dpitch * GUI_DEG_TO_PX);
+                    } else if (client.player != null) {
                         float newYaw = client.player.getYaw() + dyaw;
                         float newPitch = client.player.getPitch() + dpitch;
                         // Clamp pitch to Minecraft's limits (-90 up, +90 down)
@@ -601,6 +729,22 @@ public class EventBridge {
                         client.player.headYaw = newYaw;
                     }
                 });
+            }
+            case "gui_move" -> {
+                // Move the virtual GUI cursor over inventory slots.  Sent by the
+                // Python side (in raw window pixels) while a screen is open.
+                double dx = cmd.has("dx") ? cmd.get("dx").getAsDouble() : 0.0;
+                double dy = cmd.has("dy") ? cmd.get("dy").getAsDouble() : 0.0;
+                net.minecraft.client.MinecraftClient client = net.minecraft.client.MinecraftClient.getInstance();
+                client.execute(() -> moveGuiCursor(client, dx, dy));
+            }
+            case "gui_click" -> {
+                // Synthesize a GUI mouse-button event at the virtual cursor so
+                // the AI can pick up / place / swap inventory stacks.
+                int button = cmd.has("button") ? cmd.get("button").getAsInt() : 0;
+                boolean down = !cmd.has("action") || "down".equals(cmd.get("action").getAsString());
+                net.minecraft.client.MinecraftClient client = net.minecraft.client.MinecraftClient.getInstance();
+                client.execute(() -> clickGuiCursor(client, button, down));
             }
             case "mouse_passthrough" -> {
                 boolean enabled = cmd.has("enabled") && cmd.get("enabled").getAsBoolean();

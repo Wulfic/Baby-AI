@@ -2,10 +2,12 @@ package com.babyai.mod.mixin;
 
 import com.babyai.mod.EventBridge;
 import net.minecraft.client.Mouse;
+import net.minecraft.client.MinecraftClient;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Prevents Minecraft from capturing (grabbing) the mouse cursor
@@ -18,6 +20,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * <p>The AI uses PostMessage for clicks and the mod bridge TCP
  * {@code look} command for camera rotation, so neither path goes
  * through GLFW mouse callbacks.
+ *
+ * <p>This mixin also overrides {@link Mouse#getX()} / {@link Mouse#getY()}
+ * to report the AI's <em>virtual</em> GUI cursor while an inventory (or any
+ * other {@code Screen}) is open.  Minecraft computes hover-highlighting and
+ * renders the carried item stack from those getters, so overriding them makes
+ * the on-screen cursor follow the AI's {@code gui_move} commands even though
+ * the real GLFW cursor never moves.
  */
 @Mixin(Mouse.class)
 public abstract class MouseGrabMixin {
@@ -44,6 +53,30 @@ public abstract class MouseGrabMixin {
     private void babyai$blockPhysicalMouseMove(long window, double x, double y, CallbackInfo ci) {
         if (EventBridge.INSTANCE.hasClients() && !EventBridge.INSTANCE.isMousePassthrough()) {
             ci.cancel();
+        }
+    }
+
+    /**
+     * Report the AI's virtual cursor X while a GUI screen is open so the
+     * renderer highlights the hovered slot and draws the carried stack at the
+     * cursor.  Falls through to the real value otherwise.
+     */
+    @Inject(method = "getX", at = @At("HEAD"), cancellable = true)
+    private void babyai$overrideCursorX(CallbackInfoReturnable<Double> cir) {
+        if (EventBridge.INSTANCE.hasClients()
+                && EventBridge.INSTANCE.hasGuiCursor()
+                && MinecraftClient.getInstance().currentScreen != null) {
+            cir.setReturnValue(EventBridge.INSTANCE.getGuiCursorX());
+        }
+    }
+
+    /** Virtual-cursor counterpart of {@link #babyai$overrideCursorX} for Y. */
+    @Inject(method = "getY", at = @At("HEAD"), cancellable = true)
+    private void babyai$overrideCursorY(CallbackInfoReturnable<Double> cir) {
+        if (EventBridge.INSTANCE.hasClients()
+                && EventBridge.INSTANCE.hasGuiCursor()
+                && MinecraftClient.getInstance().currentScreen != null) {
+            cir.setReturnValue(EventBridge.INSTANCE.getGuiCursorY());
         }
     }
 }
