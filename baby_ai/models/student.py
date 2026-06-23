@@ -65,9 +65,14 @@ class StudentModel(BabyAgentBase):
             slot_dim=config.slot_attention.slot_dim,
             use_episodic_memory=config.titans_memory.enabled,
             mem_slots=config.titans_memory.mem_slots,
+            # Grounded successor features (decomposed value head) — shared
+            # with the Teacher so distillation can transfer ψ as well.
+            use_successor=config.successor.enabled,
+            successor_hidden=config.successor.hidden_dim,
         )
-        # Stash REBEL config so the LearnerThread can read it
+        # Stash REBEL + successor config so the LearnerThread can read them
         self._rebel_config = config.rebel
+        self._successor_config = config.successor
 
     @torch.no_grad()
     def inference_step(

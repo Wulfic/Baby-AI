@@ -40,6 +40,8 @@ from baby_ai.core.predictive import LatentWorldModel
 from baby_ai.core.goals import GoalConditioner
 from baby_ai.core.action_tokenizer import ActionTokenizer
 from baby_ai.models.memory import EpisodicMemory
+from baby_ai.learning.channels import NUM_CHANNELS
+from baby_ai.learning.successor import SuccessorHead
 from baby_ai.config import JambaConfig, DiffusionPolicyConfig, FlowMatchingConfig, VQConfig
 
 
@@ -100,6 +102,8 @@ class BabyAgentBase(nn.Module):
         slot_dim: int = 64,
         use_episodic_memory: bool = False,
         mem_slots: int = 64,
+        use_successor: bool = False,
+        successor_hidden: int = 256,
     ):
         super().__init__()
 
@@ -260,6 +264,22 @@ class BabyAgentBase(nn.Module):
         else:
             self.action_tokenizer = None
 
+        # --- Grounded Successor Features head (decomposed value) ---
+        # Predicts ψ(s) ∈ ℝ^C, the expected discounted future per-channel
+        # reward vector.  The scalar value is recovered downstream as
+        # V(s) = ψ(s) · w, where w is the live UI weight vector.  Cumulants
+        # φ are observed (the real reward channels), so this head needs no
+        # learned feature extractor.  See baby_ai.learning.channels.
+        self.use_successor = use_successor
+        if use_successor:
+            self.successor_head = SuccessorHead(
+                state_dim=hidden_dim,
+                num_channels=NUM_CHANNELS,
+                hidden_dim=successor_hidden,
+            )
+        else:
+            self.successor_head = None
+
         # If slot attention is active, project raw slot vectors into fused_dim
         # so they can be prepended as extra input tokens for JambaCore.
         self.use_slot_attention = use_slot_attention
@@ -382,6 +402,12 @@ class BabyAgentBase(nn.Module):
             "action": action,
         }
 
+        # Grounded successor features ψ(s) ∈ ℝ^C — decomposed value.
+        # Scalarised to V(s) = ψ·w by the learner / planner (which hold
+        # the live weight vector); the model stays UI-agnostic.
+        if self.successor_head is not None:
+            result["psi"] = self.successor_head(core_state)
+
         # VQ-BeT tokenization (Phase E)
         if self.action_tokenizer is not None and actions is not None:
             _, vq_indices, vq_loss = self.action_tokenizer.encode(
@@ -434,7 +460,7 @@ class BabyAgentBase(nn.Module):
         action, log_prob, value = self.policy.act(core_state, deterministic=deterministic)
         utterance = self.communication(core_state)  # autoregressive generation
 
-        return {
+        result = {
             "fused": fused,
             "core_state": core_state,
             "hidden": hidden,
@@ -443,3 +469,6 @@ class BabyAgentBase(nn.Module):
             "value": value,
             "utterance": utterance,
         }
+        if self.successor_head is not None:
+            result["psi"] = self.successor_head(core_state)
+        return result

@@ -15,7 +15,6 @@ import torch.nn as nn
 
 from baby_ai.config import TeacherConfig, DEFAULT_CONFIG
 from baby_ai.models.base import BabyAgentBase
-from baby_ai.learning.successor import SuccessorHead
 
 
 class TeacherModel(BabyAgentBase):
@@ -65,18 +64,15 @@ class TeacherModel(BabyAgentBase):
             slot_dim=config.slot_attention.slot_dim,
             use_episodic_memory=config.titans_memory.enabled,
             mem_slots=config.titans_memory.mem_slots,
+            # Grounded successor features (decomposed value head).  The
+            # LearnerThread detects teacher.successor_head and applies the
+            # SF TD loss + ψ·w value scalarisation automatically.
+            use_successor=config.successor.enabled,
+            successor_hidden=config.successor.hidden_dim,
         )
-        # Stash REBEL config so the LearnerThread can read it
+        # Stash REBEL + successor config so the LearnerThread can read them
         self._rebel_config = config.rebel
-
-        # ── Successor features head ───────────────────────────────────────
-        # Enabled via TeacherConfig.successor.enabled.  The LearnerThread
-        # detects this attribute and applies SuccessorLoss automatically.
-        if config.successor.enabled:
-            self.successor_head = SuccessorHead(
-                state_dim=config.hidden_dim,
-                sf_dim=config.successor.sf_dim,
-            )
+        self._successor_config = config.successor
 
     def get_distillation_targets(
         self,

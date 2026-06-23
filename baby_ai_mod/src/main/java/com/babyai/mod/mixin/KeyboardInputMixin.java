@@ -2,6 +2,7 @@ package com.babyai.mod.mixin;
 
 import com.babyai.mod.EventBridge;
 import net.minecraft.client.Keyboard;
+import net.minecraft.client.input.KeyInput;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -44,10 +45,16 @@ public abstract class KeyboardInputMixin {
      * want Minecraft itself to process them and open pause menus or
      * toggle debug screens.
      *
-     * <p>Parameters: onKey(long window, int key, int scancode, int action, int modifiers)
+     * <p>Parameters: onKey(long window, int key, KeyInput keyInput)
+     *
+     * <p>As of Minecraft 1.21.11, the scancode/action/modifiers ints were
+     * bundled into a single {@link KeyInput} record, so the signature is
+     * now {@code onKey(long, int, KeyInput)} instead of {@code onKey(long,
+     * int, int, int, int)}.  This mixin only inspects {@code key}, so the
+     * extra fields are not needed.
      */
     @Inject(method = "onKey", at = @At("HEAD"), cancellable = true)
-    private void babyai$filterKeyEvents(long window, int key, int scancode, int action, int modifiers, CallbackInfo ci) {
+    private void babyai$filterKeyEvents(long window, int key, KeyInput keyInput, CallbackInfo ci) {
         if (!EventBridge.INSTANCE.hasClients()) {
             return;  // No AI connected — let everything through
         }

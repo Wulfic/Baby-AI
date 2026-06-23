@@ -193,11 +193,22 @@ class SlotAttentionConfig:
 
 @dataclass
 class SuccessorConfig:
-    """Successor Features configuration."""
-    enabled: bool = False      # off by default: adds ~0.5M params
-    sf_dim: int = 128          # successor feature vector dimension
-    num_tasks: int = 16        # number of pre-defined task weight vectors
-    loss_weight: float = 0.05  # weight of successor TD loss in total loss
+    """Grounded Successor Features configuration (decomposed value head).
+
+    When enabled, the model gains a ``successor_head`` predicting
+    ψ(s) ∈ ℝ^C — the expected discounted future per-channel reward vector,
+    where C is the number of reward channels
+    (:data:`baby_ai.learning.channels.NUM_CHANNELS`).  The scalar value is
+    recovered as V(s) = ψ(s) · w with w the live UI weight vector, giving
+    zero-shot re-weighting and per-channel value attribution.
+    """
+    enabled: bool = True       # grounded SF decomposed value head
+    hidden_dim: int = 256      # successor head MLP hidden width
+    num_tasks: int = 16        # task weight vectors for the GPI extension
+    loss_weight: float = 0.1   # weight of successor TD loss in total loss
+    value_aux_weight: float = 0.1  # weight aligning policy.value_head → ψ·w
+    sf_dim: int = 128          # deprecated (ψ dim now == NUM_CHANNELS); kept
+                               # so old configs/checkpoints still construct.
 
 
 @dataclass

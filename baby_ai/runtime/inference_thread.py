@@ -22,6 +22,7 @@ import torch
 from baby_ai.core.planner import LatentMCTS, UncertaintyEstimator
 from baby_ai.config import System2Config, System3Config, RuntimeConfig
 from baby_ai.core.goals import GoalProposer, SubgoalPlanner, GoalMonitor
+from baby_ai.learning.channels import weights_to_vector, default_weight_vector
 from baby_ai.utils.logging import get_logger, LatencyTracker
 
 log = get_logger("inference", log_file="inference.log")
@@ -95,6 +96,12 @@ class InferenceThread:
         self._mod_bridge = mod_bridge
         self._s2_trigger_count = 0
 
+        # Live UI weight/toggle state for grounded successor-features value
+        # scalarisation in the planner.  Set by main.py (mirrors the learner);
+        # the planner's weight_fn reads these lazily so it sees live changes.
+        self._reward_weights = None   # RewardWeightsState
+        self._toggle_state = None     # RewardTogglesState
+
         # ── Game pause (mod tick-freeze + input suppression) ──
         self._input_controller = None
         self._game_paused = False          # True while game is frozen
@@ -109,6 +116,8 @@ class InferenceThread:
                 horizon=self._s2_config.planning_horizon,
                 discount=self._s2_config.discount,
                 budget_ms=self._s2_config.planning_budget_ms,
+                successor_head=getattr(student, 'successor_head', None),
+                weight_fn=self._current_w_vec,
             )
 
         # ── System 3: hierarchical goal planning ──
@@ -147,6 +156,23 @@ class InferenceThread:
                 "System 3 initialised: goal_dim=%d, num_candidates=%d, max_subgoals=%d",
                 goal_dim, self._s3_config.num_goal_candidates, self._s3_config.max_subgoals,
             )
+
+    def _current_w_vec(self, device: torch.device | str | None = None) -> torch.Tensor:
+        """Signed scalarisation vector w ∈ ℝ^C from the live UI weights.
+
+        Mirrors ``LearnerThread._current_w_vec`` so the System 2 planner
+        scores imagined states with exactly the value ``ψ·w`` the learner
+        optimises.  Penalty channels are negated and disabled channels
+        zeroed; falls back to the slider defaults before the UI is wired.
+        """
+        if self._reward_weights is not None:
+            weights = self._reward_weights.snapshot()
+            toggles = (
+                self._toggle_state.snapshot()
+                if self._toggle_state is not None else None
+            )
+            return weights_to_vector(weights, toggles, device=device)
+        return default_weight_vector(device=device)
 
     def start(self) -> None:
         """Start the inference thread."""

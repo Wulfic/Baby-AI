@@ -15,11 +15,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from baby_ai.config import TrainingConfig, RuntimeConfig, REBELConfig, DEFAULT_CONFIG
-from baby_ai.learning.rewards import RewardComposer
 from baby_ai.memory.replay_buffer import PrioritizedReplayBuffer
 from baby_ai.learning.intrinsic import JEPACuriosity, LearningProgressEstimator
 from baby_ai.learning.rebel import REBELLoss, GRPOLoss
 from baby_ai.learning.successor import SuccessorLoss
+from baby_ai.learning.channels import (
+    NUM_CHANNELS,
+    REWARD_CHANNELS,
+    CHANNEL_INDEX,
+    channels_to_vector,
+    weights_to_vector,
+    default_weight_vector,
+    scalarize,
+    attribution,
+)
 from baby_ai.core.goals import HERGoalSampler
 from baby_ai.memory.consolidation import Consolidator
 from baby_ai.utils.logging import get_logger
@@ -90,9 +99,16 @@ class LearnerThread:
             entropy_weight=getattr(rebel_cfg, 'entropy_weight', 0.01),
         ).to(device) if rebel_cfg.enabled else None
 
-        # Successor features loss (if teacher has a successor_head attribute)
+        # Grounded successor features (decomposed value head).
+        # Active when the teacher exposes a successor_head module.
         _shead = getattr(teacher, 'successor_head', None)
         self._successor_loss_fn = SuccessorLoss().to(device) if _shead is not None else None
+        _scfg = getattr(teacher, '_successor_config', None)
+        self._sf_loss_weight = getattr(_scfg, 'loss_weight', 0.1) if _scfg else 0.1
+        self._value_aux_weight = getattr(_scfg, 'value_aux_weight', 0.1) if _scfg else 0.1
+        # Index of the death channel — used to mask the SF TD bootstrap at
+        # episode boundaries (done = death fired this step).
+        self._death_ch_idx = CHANNEL_INDEX.get("death_penalty")
 
         # HER goal relabeling sampler
         self._her_sampler = HERGoalSampler(
@@ -324,8 +340,10 @@ class LearnerThread:
                 self.config.micro_batch_size, device=self.device
             )
 
-        # Recompose rewards with current UI weights/toggles so that
-        # slider and checkbox changes take effect immediately.
+        # Attach cumulant vectors φ (for SF) then recompose the scalar
+        # reward φ·w with current UI weights/toggles so that slider and
+        # checkbox changes take effect immediately.
+        self._ensure_reward_vectors(transitions)
         self._recompose_rewards(transitions)
 
         # Build batch tensors from transitions
@@ -655,6 +673,19 @@ class LearnerThread:
         # Soft-clamp value predictions via tanh squashing to [-7, 7].
         value = 7.0 * torch.tanh(value / 7.0)
 
+        # ── Decomposed value via grounded successor features ──────────────
+        # When the model emits ψ(s) ∈ ℝ^C, the *primary* value estimate is
+        # the scalarisation V(s) = ψ·w, where w is the live signed weight
+        # vector.  This makes the value head explicitly per-channel and
+        # zero-shot re-weightable.  The legacy scalar policy.value_head is
+        # kept and softly aligned to ψ·w (value_aux) so downstream consumers
+        # (System 2 planner, V-trace behaviour baseline) keep working.
+        psi = outputs.get("psi")
+        w_vec = self._current_w_vec(device=value.device) if psi is not None else None
+        if psi is not None:
+            v_sf = scalarize(psi, w_vec)               # (B,)
+            v_sf = 7.0 * torch.tanh(v_sf / 7.0)        # match value-head clamp
+
         # Anchor loss to the computation graph via a zero derived from
         # model output.  This ensures loss.grad_fn is set even when no
         # policy branch fires, so backward() won't crash.
@@ -664,7 +695,9 @@ class LearnerThread:
         if "action" in batch and "reward" in batch:
             actions = batch["action"]
             rewards = batch["reward"]
-            v_pred = value.squeeze(-1)
+            # Primary value prediction: ψ·w when available, else the
+            # legacy scalar value head.
+            v_pred = v_sf if psi is not None else value.squeeze(-1)
 
             # ── V-trace value targets (IMPALA-style off-policy correction) ──
             # If we stored log_prob + value from the behavior policy at
@@ -693,6 +726,13 @@ class LearnerThread:
             # Value loss against V-trace targets
             per_sample_value_loss = F.smooth_l1_loss(v_pred, v_target, reduction='none').detach()
             value_loss = (F.smooth_l1_loss(v_pred, v_target, reduction='none') * weights).mean()
+
+            # Keep the legacy scalar value head aligned with ψ·w so the
+            # planner and behaviour-value baseline stay valid during the
+            # transition to the decomposed head.
+            if psi is not None:
+                value_aux = F.smooth_l1_loss(value.squeeze(-1), v_sf.detach())
+                value_loss = value_loss + self._value_aux_weight * value_aux
 
             if self._rebel_enabled and self._rebel_loss_fn is not None:
                 # ── REBEL / GRPO paired loss ──
@@ -762,36 +802,52 @@ class LearnerThread:
                 )
                 loss = loss + 0.01 * torch.clamp(cot_loss, max=5.0)
 
-        # ── Successor features loss ──────────────────────────────────────
-        # NOTE: Successor TD requires (s_t, s_{t+1}) from the same episode.
-        # Random replay batches have no temporal ordering.  We gate on
-        # episode_id and step metadata stored by sample_her(); when those
-        # are absent we skip, since random adjacent indices are meaningless.
-        if self._successor_loss_fn is not None:
-            shead = getattr(self.teacher, 'successor_head', None)
-            if shead is not None and "action" in batch:
-                cs = outputs["core_state"]
-                episode_ids = batch.get("episode_id")
-                steps = batch.get("step")
-                if episode_ids is not None and steps is not None:
-                    # Build valid (t, t+1) pairs within the same episode
-                    ep = episode_ids.long() if isinstance(episode_ids, torch.Tensor) else torch.tensor(episode_ids, device=self.device)
-                    st = steps.long() if isinstance(steps, torch.Tensor) else torch.tensor(steps, device=self.device)
-                    B_sf = cs.size(0)
-                    # Check adjacent items: same episode AND consecutive steps
-                    same_ep = ep[:-1] == ep[1:]
-                    consecutive = st[1:] - st[:-1] == 1
-                    valid = same_ep & consecutive
-                    if valid.any():
-                        idx = valid.nonzero(as_tuple=True)[0]
-                        sf_out_t = shead(cs[idx])
-                        sf_out_next = shead(cs[idx + 1].detach())
-                        dones = torch.zeros(idx.size(0), device=self.device)
-                        sf_loss = self._successor_loss_fn(
-                            sf_out_t["psi"], sf_out_t["phi"],
-                            sf_out_next["psi"], dones,
-                        )
-                        loss = loss + 0.05 * torch.clamp(sf_loss, max=5.0)
+        # ── Grounded successor-features TD loss ──────────────────────────
+        # ψ(s_t) ≈ φ_t + γ·ψ(s_{t+1}), with φ_t the OBSERVED per-channel
+        # reward vector (reward_vector).  TD needs (s_t, s_{t+1}) from the
+        # same episode; random replay batches have no temporal ordering, so
+        # we gate on the episode_id / step metadata attached by sample_her().
+        # (The primary, dense SF signal comes from train_on_sequence, which
+        # always has contiguous transitions.)
+        if (
+            self._successor_loss_fn is not None
+            and psi is not None
+            and "reward_vector" in batch
+        ):
+            episode_ids = batch.get("episode_id")
+            steps = batch.get("step")
+            if episode_ids is not None and steps is not None:
+                ep = episode_ids.long() if isinstance(episode_ids, torch.Tensor) else torch.tensor(episode_ids, device=self.device)
+                st = steps.long() if isinstance(steps, torch.Tensor) else torch.tensor(steps, device=self.device)
+                # Adjacent items that are same-episode AND consecutive steps
+                same_ep = ep[:-1] == ep[1:]
+                consecutive = st[1:] - st[:-1] == 1
+                valid = same_ep & consecutive
+                if valid.any():
+                    idx = valid.nonzero(as_tuple=True)[0]
+                    phi_t = batch["reward_vector"][idx]               # (n, C)
+                    psi_t = psi[idx]                                  # (n, C)
+                    psi_next = psi[idx + 1].detach()                 # (n, C)
+                    dones = self._dones_from_phi(phi_t)
+                    sf_loss = self._successor_loss_fn(psi_t, phi_t, psi_next, dones)
+                    loss = loss + self._sf_loss_weight * torch.clamp(sf_loss, max=5.0)
+
+        # ── Attribution diagnostics (explainability read-out) ────────────
+        # ψ·w decomposed per channel: "what is the agent being rewarded
+        # for".  Logged sparsely; this is the direct answer the decomposed
+        # value head was built to provide.
+        if psi is not None and w_vec is not None and self._step % 100 == 0:
+            with torch.no_grad():
+                attr = attribution(psi, w_vec).mean(dim=0)  # (C,)
+                k = min(6, NUM_CHANNELS)
+                top = torch.topk(attr.abs(), k=k).indices.tolist()
+                readout = ", ".join(
+                    f"{REWARD_CHANNELS[i]}={float(attr[i]):+.3f}" for i in top
+                )
+            log.info(
+                "SF value attribution (top future-reward channels) | V=%.3f | %s",
+                float(attr.sum()), readout,
+            )
 
         # Track task losses for PCGrad (before regularizers are added)
         task_losses: list[torch.Tensor] = []
@@ -1012,51 +1068,73 @@ class LearnerThread:
             [f"{lr:.2e}" for lr in peak_lrs],
         )
 
+    # ── Grounded successor features: vector helpers ──────────────────
+
+    def _current_w_vec(self, device: torch.device | str | None = None) -> torch.Tensor:
+        """Signed scalarisation vector w ∈ ℝ^C from the live UI weights.
+
+        Penalty channels are negated and disabled channels zeroed, so that
+        ``φ · w`` reproduces the scalar reward and ``ψ · w`` the value.
+        Falls back to the slider defaults when no weight state is wired.
+        """
+        if self._reward_weights is not None:
+            weights = self._reward_weights.snapshot()
+            toggles = (
+                self._toggle_state.snapshot()
+                if self._toggle_state is not None else None
+            )
+            return weights_to_vector(weights, toggles, device=device)
+        return default_weight_vector(device=device)
+
+    @staticmethod
+    def _ensure_reward_vectors(transitions: list[dict]) -> None:
+        """Attach a per-transition cumulant vector φ ∈ ℝ^C (CPU tensor).
+
+        Derived once from the stored ``reward_channels`` dict so the SF TD
+        loss and value scalarisation can consume a batched tensor.  Idempotent
+        and independent of the UI weight state.  Legacy transitions without
+        ``reward_channels`` are left untouched (SF skips them).
+        """
+        for t in transitions:
+            if "reward_vector" in t:
+                continue
+            channels = t.get("reward_channels")
+            if channels is not None:
+                t["reward_vector"] = channels_to_vector(channels)
+
+    def _dones_from_phi(self, phi: torch.Tensor) -> torch.Tensor:
+        """Episode-end mask from the cumulant batch (death channel fired).
+
+        Used to stop the SF TD bootstrap across episode boundaries.  Returns
+        a ``(B,)`` float tensor; all-zeros when the death channel is unknown.
+        """
+        if self._death_ch_idx is None:
+            return torch.zeros(phi.size(0), device=phi.device, dtype=phi.dtype)
+        return (phi[:, self._death_ch_idx] > 0).to(phi.dtype)
+
     # ── Live reward recomposition ────────────────────────────────────
 
     def _recompose_rewards(self, transitions: list[dict]) -> None:
         """Re-weight replay rewards using current UI weights and toggles.
 
-        Each transition that carries a ``reward_channels`` dict (the raw
-        per-channel breakdown saved at collection time) gets its scalar
-        ``reward`` recomputed with the **current** weight multipliers
-        and channel toggles.  Transitions without ``reward_channels``
-        (legacy data) keep their original reward unchanged.
+        Recomputes the scalar ``reward`` as ``φ · w`` (clamped to ±5) where
+        φ is the per-transition cumulant vector and w the signed weight
+        vector.  This is exactly the legacy weighted-sum-with-penalty-sign,
+        expressed as a dot product, so slider/toggle changes take effect
+        immediately.  Transitions without channel data keep their original
+        reward.
         """
         if self._reward_weights is None:
             return
 
-        w = self._reward_weights.snapshot()
-
-        # Read toggle state once (or default to all-enabled).
-        if self._toggle_state is not None:
-            enabled = self._toggle_state.snapshot()
-        else:
-            enabled = None
-
-        _PENALTY = RewardComposer._PENALTY_CHANNELS
-        _PASSTHROUGH = frozenset({"survival", "extrinsic"})
+        self._ensure_reward_vectors(transitions)
+        w_vec = self._current_w_vec()  # CPU tensor (pre-collate)
 
         for t in transitions:
-            channels = t.get("reward_channels")
-            if channels is None:
+            rv = t.get("reward_vector")
+            if rv is None:
                 continue
-
-            total = 0.0
-            for ch, raw_val in channels.items():
-                if ch == "total" or raw_val == 0.0:
-                    continue
-                # Apply toggle (disabled → 0).  Always pass through
-                # survival and extrinsic (matching filter_channels).
-                if enabled is not None and ch not in _PASSTHROUGH:
-                    if not enabled.get(ch, True):
-                        continue
-                weight = w.get(ch, 1.0)
-                if ch in _PENALTY:
-                    total -= weight * raw_val
-                else:
-                    total += weight * raw_val
-
+            total = float(torch.dot(rv, w_vec))
             t["reward"] = torch.tensor(max(-5.0, min(5.0, total)))
 
     def _collate_transitions(self, transitions: list[dict]) -> dict:
@@ -1209,7 +1287,9 @@ class LearnerThread:
         if len(sequence) < 2:
             return None
 
-        # Recompose rewards with current UI weights/toggles.
+        # Attach cumulant vectors φ, then recompose scalar rewards with the
+        # current UI weights/toggles.
+        self._ensure_reward_vectors(sequence)
         self._recompose_rewards(sequence)
 
         # Collate the full sequence
@@ -1237,7 +1317,15 @@ class LearnerThread:
             else:
                 outputs = self.teacher(**forward_kwargs)
 
-            values_pred = outputs["value"].squeeze(-1)  # (T,)
+            # Primary value: ψ·w when the successor head is active, else the
+            # legacy scalar head.
+            psi = outputs.get("psi")
+            if psi is not None:
+                w_vec = self._current_w_vec(device=psi.device)
+                values_pred = scalarize(psi, w_vec)            # (T,)
+                values_pred = 7.0 * torch.tanh(values_pred / 7.0)
+            else:
+                values_pred = outputs["value"].squeeze(-1)     # (T,)
 
             # Bootstrap: use the last value prediction as V(s_{T})
             # (terminal bootstrap — we don't have the next observation)
@@ -1253,6 +1341,31 @@ class LearnerThread:
 
             # Value loss with n-step targets
             value_loss = F.smooth_l1_loss(values_pred, nstep_targets.detach())
+
+            # ── Dense grounded SF TD over the contiguous sequence ─────────
+            # Sequence transitions ARE temporally adjacent, so this is the
+            # primary training signal for ψ: ψ(s_t) ≈ φ_t + γ·ψ(s_{t+1}).
+            sf_loss_val = 0.0
+            if (
+                self._successor_loss_fn is not None
+                and psi is not None
+                and "reward_vector" in batch
+                and psi.size(0) >= 2
+            ):
+                phi_seq = batch["reward_vector"]               # (T, C)
+                sf_loss = self._successor_loss_fn(
+                    psi[:-1], phi_seq[:-1], psi[1:].detach(),
+                    self._dones_from_phi(phi_seq[:-1]),
+                )
+                sf_loss = self._sf_loss_weight * torch.clamp(sf_loss, max=5.0)
+                value_loss = value_loss + sf_loss
+                sf_loss_val = float(sf_loss.detach())
+
+            # Keep legacy scalar value head aligned with ψ·w.
+            if psi is not None:
+                value_loss = value_loss + self._value_aux_weight * F.smooth_l1_loss(
+                    outputs["value"].squeeze(-1), values_pred.detach()
+                )
 
             # Policy loss (flow denoising) — unchanged
             denoising_loss = outputs.get(
@@ -1275,7 +1388,7 @@ class LearnerThread:
             else:
                 (loss / self.config.gradient_accumulation_steps).backward()
 
-        return {"total": loss.item(), "value_loss": value_loss.item()}
+        return {"total": loss.item(), "value_loss": value_loss.item(), "sf_loss": sf_loss_val}
 
     @property
     def step_count(self) -> int:

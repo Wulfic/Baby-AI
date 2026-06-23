@@ -675,6 +675,11 @@ def run_minecraft(config: BabyAIConfig, checkpoint_path: str | None = None) -> N
     orchestrator.learner_thread._reward_weights = reward_weights
     orchestrator.learner_thread._toggle_state = toggle_state
 
+    # Same live weights drive the System 2 planner's grounded SF value
+    # (ψ·w), so imagined-trajectory scoring tracks slider/toggle changes.
+    orchestrator.inference_thread._reward_weights = reward_weights
+    orchestrator.inference_thread._toggle_state = toggle_state
+
     # Wire home-change notifications so the GUI updates when
     # /sethome is used in-game or set_home() is called.
     def _notify_gui_home_changed() -> None:

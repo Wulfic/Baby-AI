@@ -8,7 +8,9 @@ simulate futures in its "mind" using the LatentWorldModel.
 The planner:
   1. Proposes N candidate first-actions via the DiffusionPolicy.
   2. Rolls out T latent steps per trajectory using the WorldModel.
-  3. Scores each trajectory via the value head.
+  3. Scores each trajectory via the grounded Successor-Features value
+     ``V(s) = ψ(s) · w`` (live UI weights), falling back to the legacy
+     scalar value head when the successor head is unavailable.
   4. Returns the first action of the highest-scoring trajectory.
 
 Improvements over the original flat-rollout planner:
@@ -27,19 +29,24 @@ from __future__ import annotations
 
 import time
 import math
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from baby_ai.learning.channels import scalarize
 
 
 class LatentMCTS(nn.Module):
     """
     Batched latent-space Monte Carlo Tree Search.
 
-    Uses the LatentWorldModel for forward simulation and the
-    DiffusionPolicyHead's value head for trajectory scoring.
-    All rollouts are executed as a single batched tensor operation.
+    Uses the LatentWorldModel for forward simulation and the grounded
+    Successor-Features value ``ψ(s) · w`` for trajectory scoring (the same
+    decomposed value the learner trains), falling back to the policy's
+    scalar value head when no successor head is wired.  All rollouts are
+    executed as a single batched tensor operation.
 
     Args:
         world_model:      The shared LatentWorldModel.
@@ -48,6 +55,12 @@ class LatentMCTS(nn.Module):
         horizon:          Number of latent steps per trajectory.
         discount:         Discount factor for trajectory returns.
         budget_ms:        Maximum planning time in milliseconds.
+        successor_head:   Optional SuccessorHead mapping a latent → ψ ∈ ℝ^C.
+                          When given (with ``weight_fn``), trajectories are
+                          scored by ``V = ψ · w`` instead of the value head.
+        weight_fn:        Callable returning the live signed weight vector
+                          ``w ∈ ℝ^C`` for a given ``device``.  Called once
+                          per :meth:`plan` so slider changes apply zero-shot.
     """
 
     def __init__(
@@ -58,6 +71,8 @@ class LatentMCTS(nn.Module):
         horizon: int = 5,
         discount: float = 0.99,
         budget_ms: float = 150.0,
+        successor_head: nn.Module | None = None,
+        weight_fn: Callable[..., torch.Tensor] | None = None,
     ):
         super().__init__()
         self.world_model = world_model
@@ -66,6 +81,8 @@ class LatentMCTS(nn.Module):
         self.horizon = horizon
         self.discount = discount
         self.budget_ms = budget_ms
+        self.successor_head = successor_head
+        self.weight_fn = weight_fn
 
     @torch.no_grad()
     def plan(
@@ -96,6 +113,14 @@ class LatentMCTS(nn.Module):
         t_start = time.perf_counter()
         device = core_state.device
         N = self.num_trajectories
+
+        # ── Grounded Successor-Features scalarisation vector w ∈ ℝ^C ──
+        # Fetched fresh each plan() so live UI slider/toggle changes
+        # re-value imagined states zero-shot (only w changes, ψ is reused).
+        # None → fall back to the legacy scalar value head below.
+        w_vec: torch.Tensor | None = None
+        if self.successor_head is not None and self.weight_fn is not None:
+            w_vec = self.weight_fn(device=device)
 
         # Replicate state for N parallel trajectories
         state = core_state.expand(N, -1).contiguous()  # (N, state_dim)
@@ -140,7 +165,16 @@ class LatentMCTS(nn.Module):
                 noise = torch.randn_like(next_latent[stochastic_mask]) * 0.1
                 next_latent[stochastic_mask] = next_latent[stochastic_mask] + noise
 
-            step_value = self.policy.value_head(next_latent).squeeze(-1)  # (N,)
+            # ── Trajectory scoring: grounded SF value ψ·w (preferred) ──
+            # ψ(s) ∈ ℝ^C is the expected discounted future per-channel
+            # reward; V = ψ·w with the live weights.  This is the same
+            # decomposed value the learner optimises, so the planner now
+            # scores futures on exactly the signal it's trained on.
+            if w_vec is not None:
+                psi = self.successor_head(next_latent)        # (N, C)
+                step_value = scalarize(psi, w_vec)            # (N,)
+            else:
+                step_value = self.policy.value_head(next_latent).squeeze(-1)  # (N,)
 
             if goal_expanded is not None:
                 latent_prefix = next_latent[:, :goal_dim]

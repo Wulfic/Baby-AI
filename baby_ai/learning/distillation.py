@@ -467,12 +467,25 @@ class DistillationEngine:
         if "vq_loss" in student_out:
             total = total + 0.05 * student_out["vq_loss"]
 
-        return {
+        # ── Successor-feature distillation ────────────────────────────────
+        # Transfer the Teacher's grounded ψ(s) ∈ ℝ^C (expected discounted
+        # future per-channel reward) into the Student so the Student's
+        # decomposed value head is usable, not just present.  Ramped with
+        # the feature curriculum since ψ is a regression target like fused.
+        psi_loss = None
+        if "psi" in teacher_out and "psi" in student_out:
+            psi_loss = F.mse_loss(student_out["psi"], teacher_out["psi"].detach())
+            total = total + feat_w * psi_loss
+
+        out = {
             "total": total,
             "action_loss": action_loss,
             "comm_kl": comm_kl,
             "feature_loss": feat_loss,
         }
+        if psi_loss is not None:
+            out["psi_loss"] = psi_loss
+        return out
 
     def swap_to_live(self) -> None:
         """
