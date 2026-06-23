@@ -92,6 +92,14 @@ class RewardComputer:
         self.baseline_frame_step: int = 0
         self.hotbar_streak: int = 0
 
+        # Sustained-behaviour streaks (super-linear bonus like building):
+        #   forward_streak — consecutive steps of confirmed forward travel
+        #   mining_streak  — consecutive steps holding attack with visible
+        #                    chip progress on a block
+        self.forward_streak: int = 0
+        self.mining_streak: int = 0
+        self._STREAK_MAX: int = 60
+
         # Chunk-linger tracking: penalise staying in the same
         # area for too long.  ``chunk_linger_steps`` ticks up
         # every step and only resets after 3 *distinct new*
@@ -120,6 +128,8 @@ class RewardComputer:
         self.baseline_frame = None
         self.baseline_frame_step = 0
         self.hotbar_streak = 0
+        self.forward_streak = 0
+        self.mining_streak = 0
         self.chunk_linger_steps = 0
         self.new_chunks_since_linger = 0
         self._linger_known_chunks.clear()
@@ -242,6 +252,20 @@ class RewardComputer:
         chunk_decay = max(0.1, 1.0 - env._steps_in_chunk * 0.02)
         movement_bonus *= chunk_decay
         rewards["movement"] = movement_bonus
+
+        # ── 6c. Sustained-behaviour streaks ─────────────────────
+        # Reward committing to a behaviour rather than jittering:
+        #  • forward_streak rewards continuous confirmed travel.
+        #  • mining_streak rewards holding attack until a block breaks.
+        # Uses the SAME position pair as the movement bonus above
+        # (this step's deltas are applied later in
+        # _process_position_updates).
+        rewards["forward_streak"] = self._compute_forward_streak(
+            action_id, env, observation_only
+        )
+        rewards["mining_streak"] = self._compute_mining_streak(
+            action_id, visual_change, observation_only
+        )
 
         # ── 6b. New chunk exploration bonus ─────────────────────
         # Computed after _process_position_updates (below) so that
@@ -638,6 +662,67 @@ class RewardComputer:
                 bonus += _mv_look
 
         return bonus
+
+    @staticmethod
+    def _actual_moved(env: Any) -> bool:
+        """True when the player's horizontal position changed > 0.1 block."""
+        if (
+            env._player_x is not None
+            and env._prev_player_x is not None
+            and env._player_z is not None
+            and env._prev_player_z is not None
+        ):
+            dx = env._player_x - env._prev_player_x
+            dz = env._player_z - env._prev_player_z
+            return (dx * dx + dz * dz) ** 0.5 > 0.1
+        return False
+
+    def _streak_bonus(self, streak: int) -> float:
+        """Super-linear (sqrt) bonus in [0, 1], 0 until a 3-step commitment."""
+        if streak < 3:
+            return 0.0
+        return min((streak ** 0.5) / (self._STREAK_MAX ** 0.5), 1.0)
+
+    def _compute_forward_streak(
+        self, action_id: int, env: Any, observation_only: bool
+    ) -> float:
+        """Reward sustained forward travel (commit to exploring, don't jitter).
+
+        Counts consecutive steps of *confirmed* forward motion — the agent
+        must both intend to go forward (W, except in imitation where we
+        only have the human's motion) AND actually move (mod-bridge
+        position delta), so walking into a wall earns nothing.
+        """
+        moved = self._actual_moved(env)
+        intends_forward = observation_only or (action_id in FORWARD_ACTIONS)
+        if moved and intends_forward:
+            self.forward_streak = min(self.forward_streak + 1, self._STREAK_MAX)
+        else:
+            self.forward_streak = 0
+        return self._streak_bonus(self.forward_streak)
+
+    def _compute_mining_streak(
+        self, action_id: int, visual_change: float, observation_only: bool
+    ) -> float:
+        """Reward holding the attack button on a block until it breaks.
+
+        Grows only while attacking with visible chip progress
+        (``visual_change`` from the crack overlay), so spamming attack at
+        air earns nothing.  Resets the moment the agent stops attacking,
+        which pushes the policy to *commit* to breaking hard blocks
+        instead of tapping once and wandering off.
+        """
+        if observation_only:
+            self.mining_streak = 0
+            return 0.0
+        is_attack = action_id in ATTACK_ACTIONS
+        if is_attack and visual_change > 0.02:
+            self.mining_streak = min(self.mining_streak + 1, self._STREAK_MAX)
+        elif not is_attack:
+            self.mining_streak = 0
+        # (attacking with no visible change yet — e.g. wind-up — holds the
+        #  current streak without growing it)
+        return self._streak_bonus(self.mining_streak)
 
     def _compute_idle_penalty(self, action_id: int, env: Any) -> float:
         idle_penalty = 0.0
@@ -1084,9 +1169,11 @@ class RewardComputer:
             + rewards["exploration"] * w.get("exploration", 0.8)
             + rewards["movement"] * w.get("movement", 0.3)
             + rewards["new_chunk"] * w.get("new_chunk", 1.0)
+            + rewards.get("forward_streak", 0.0) * w.get("forward_streak", 1.5)
             # Resource gathering
             + rewards["block_break"] * w.get("block_break", 4.0)
             + rewards["item_pickup"] * w.get("item_pickup", 6.0)
+            + rewards.get("mining_streak", 0.0) * w.get("mining_streak", 1.5)
             # Creation
             + rewards["block_place"] * w.get("block_place", 4.0)
             + rewards["crafting"] * w.get("crafting", 25.0)

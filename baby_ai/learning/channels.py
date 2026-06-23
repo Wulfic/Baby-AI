@@ -30,9 +30,40 @@ retraining, and ``ψ(s)[i] · w[i]`` is a direct, readable answer to
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from baby_ai.ui.reward_weights import TOP_LEVEL_WEIGHTS
+
+# ── Reward squashing ──────────────────────────────────────────────────
+# The scalar reward is a weighted sum of raw, *tiered* channel values
+# (block_break carries the item-tier value, crafting the recipe value,
+# etc.).  A hard clamp at ±5 used to saturate: any decent craft or ore
+# break maxed the cap, so the agent could not tell "good" from "great"
+# (diamond and coal both read +5).  A smooth tanh squash keeps the total
+# bounded *while preserving the ordering of large rewards* and gives the
+# value head a smooth gradient near the cap.
+#
+#   reward = REWARD_MAX * tanh(weighted_sum / REWARD_SQUASH_SCALE)
+#
+# SCALE controls how quickly the response saturates.  At SCALE=4 a
+# weighted sum of ~4 maps to ~0.76·MAX, ~8 to ~0.96·MAX, so common steps
+# stay well inside the linear region and only jackpots approach the cap.
+REWARD_MAX: float = 5.0
+REWARD_SQUASH_SCALE: float = 4.0
+
+
+def squash_reward(x):
+    """Bound a raw weighted-sum reward to ``±REWARD_MAX`` via tanh.
+
+    Accepts a Python float or a ``torch.Tensor`` and returns the same
+    type.  Order-preserving and smooth — replaces the old hard clamp so
+    tiered rewards (diamond ≫ dirt) stay distinguishable near the cap.
+    """
+    if isinstance(x, torch.Tensor):
+        return REWARD_MAX * torch.tanh(x / REWARD_SQUASH_SCALE)
+    return REWARD_MAX * math.tanh(x / REWARD_SQUASH_SCALE)
 
 # ── Canonical ordering ────────────────────────────────────────────────
 # Derived from the top-level UI weight sliders (excludes sub-weights like

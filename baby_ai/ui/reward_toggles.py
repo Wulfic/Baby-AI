@@ -40,11 +40,13 @@ CHANNELS: List[ChannelInfo] = [
     ChannelInfo("exploration",        "Exploration",          "Exploration",   True),
     ChannelInfo("action_diversity",   "Action Diversity",     "Exploration",   True),
     ChannelInfo("movement",           "Movement",             "Exploration",   True),
+    ChannelInfo("forward_streak",     "Forward Streak",       "Exploration",   True),
     ChannelInfo("new_chunk",          "New Chunk",            "Exploration",   True),
 
     # ── Interaction ─────────────────────────────────────────────
     ChannelInfo("interaction",        "Interaction",          "Interaction",   False),
     ChannelInfo("block_break",        "Block Break",          "Interaction",   False),
+    ChannelInfo("mining_streak",      "Mining Streak",        "Interaction",   False),
     ChannelInfo("item_pickup",        "Item Pickup",          "Interaction",   False),
     ChannelInfo("item_drop_penalty",  "Item Drop Penalty",    "Interaction",   False, is_penalty=True),
 
@@ -117,9 +119,13 @@ class RewardToggleState:
         self._enabled: Dict[str, bool] = {
             ch.key: ch.default for ch in CHANNELS
         }
-        self._active_preset: str = "phase_1"
-        # Apply phase 1 defaults on construction.
-        self._apply_preset_unlocked("phase_1")
+        # Fresh-bot default: ALL channels on (phase_4).  The phased
+        # curriculum (phase_1 explore-only → phase_4 all) is still
+        # available from the UI, but a brand-new creation-focused agent
+        # should get the full mining/crafting/building/combat signal
+        # immediately so it can make progress instead of only wandering.
+        self._active_preset: str = "phase_4"
+        self._apply_preset_unlocked("phase_4")
 
     # ── Mutators (called from UI thread) ────────────────────────
 

@@ -27,6 +27,7 @@ from baby_ai.learning.channels import (
     weights_to_vector,
     default_weight_vector,
     scalarize,
+    squash_reward,
     attribution,
 )
 from baby_ai.core.goals import HERGoalSampler
@@ -548,6 +549,11 @@ class LearnerThread:
             if self._distill_engine is not None:
                 self._distill_engine.bump_teacher_version()
 
+            # Plasticity maintenance (shrink-and-perturb) — periodically
+            # rejuvenate the policy/value heads to fight the loss of
+            # plasticity that accumulates over very long online streams.
+            self._maybe_plasticity_reset()
+
         # Update replay priorities with per-sample value loss
         _psl = loss_dict.get("per_sample_loss")
         if _psl is not None and isinstance(_psl, torch.Tensor) and _psl.numel() >= len(indices):
@@ -617,15 +623,18 @@ class LearnerThread:
             self._distill_ready_callback()
             self._last_distill_signal_at = self._step
 
-        # ── Interleave n-step sequence training every 4 steps ────
+        # ── Interleave n-step sequence training every 2 steps ────
         # This supplements the single-transition loss with GAE-based
         # multi-step value targets, giving the value head temporal
-        # credit assignment without slowing down normal training.
-        if self._step % 4 == 0 and self.replay.size >= self.config.micro_batch_size:
+        # credit assignment.  Running it more often (every 2 steps) and
+        # over longer windows (seq_len=10) propagates sparse mining/craft
+        # rewards back through more states per unit of collected data —
+        # a sample-efficiency win at no extra GPU cost beyond these steps.
+        if self._step % 2 == 0 and self.replay.size >= self.config.micro_batch_size:
             try:
                 sequences, seq_weights, seq_indices = self.replay.sample_sequence(
                     batch_size=max(self.config.micro_batch_size // 4, 2),
-                    seq_len=8,
+                    seq_len=10,
                     device=self.device,
                 )
                 for seq, w in zip(sequences, seq_weights):
@@ -642,6 +651,47 @@ class LearnerThread:
                 "Step %d | loss=%.4f | replay=%d | priority=%.2f | lr=%s",
                 self._step, total_loss.item(), self.replay.size,
                 self.replay.tree.total, lr_str,
+            )
+
+    def _maybe_plasticity_reset(self) -> None:
+        """Shrink-and-perturb the policy/value heads (Ash & Adams, 2020).
+
+        Deep RL networks lose plasticity over long training — neurons
+        saturate and stop adapting (the "primacy bias" / dormant-neuron
+        problem).  Periodically nudging the head weights toward a fresh
+        initialisation —  ``w ← shrink·w + perturb·noise`` — restores the
+        ability to fit new reward structure without throwing away learned
+        features (the encoder/core are left untouched).
+
+        Controlled by three training-config knobs:
+          * ``plasticity_shrink_every`` — optimizer-step period (0 = off).
+          * ``plasticity_shrink``       — multiplicative shrink (e.g. 0.8).
+          * ``plasticity_perturb``      — noise scale, relative to weight std.
+
+        Off by default: only the heads are affected, but a live agent is
+        playing while we train, so this should be enabled deliberately
+        once the reward signal is verified stable.
+        """
+        every = int(getattr(self.config, "plasticity_shrink_every", 0) or 0)
+        if every <= 0 or self._step == 0 or self._step % every != 0:
+            return
+        shrink = float(getattr(self.config, "plasticity_shrink", 0.8))
+        perturb = float(getattr(self.config, "plasticity_perturb", 0.01))
+        n = 0
+        with torch.no_grad():
+            for attr in ("policy", "successor_head"):
+                mod = getattr(self.teacher, attr, None)
+                if mod is None:
+                    continue
+                for p in mod.parameters():
+                    if p.dim() >= 2 and p.requires_grad:  # weight matrices only
+                        std = p.std()
+                        p.mul_(shrink).add_(torch.randn_like(p) * perturb * std)
+                        n += 1
+        if n:
+            log.info(
+                "Plasticity shrink-and-perturb at step %d: %d weight tensors "
+                "(shrink=%.2f, perturb=%.3f)", self._step, n, shrink, perturb,
             )
 
     def _compute_loss(self, batch: dict, weights: torch.Tensor) -> dict:
@@ -1134,8 +1184,11 @@ class LearnerThread:
             rv = t.get("reward_vector")
             if rv is None:
                 continue
+            # φ·w is the raw weighted sum of tiered channel values; squash
+            # (not hard-clamp) so large tiered rewards stay ordered and the
+            # value head sees a smooth target.  This is THE training reward.
             total = float(torch.dot(rv, w_vec))
-            t["reward"] = torch.tensor(max(-5.0, min(5.0, total)))
+            t["reward"] = torch.tensor(squash_reward(total))
 
     def _collate_transitions(self, transitions: list[dict]) -> dict:
         """Collate a list of transition dicts into batched tensors.

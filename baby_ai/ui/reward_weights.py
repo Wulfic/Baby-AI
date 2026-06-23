@@ -19,6 +19,13 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, List
 
+# Bump whenever the default weight profile below changes in a way that
+# should override a user's persisted weights on next launch.  The control
+# panel compares this against the value stored in baby_ai_settings.json
+# and, on a mismatch, re-applies these defaults once (a "fresh bot"
+# starter profile) instead of loading stale saved weights.
+REWARD_PROFILE_VERSION: int = 2
+
 
 @dataclass(frozen=True)
 class WeightInfo:
@@ -42,10 +49,21 @@ class WeightInfo:
 
 # Ordered list — UI renders in this order.
 # Sub-weights MUST appear immediately after their parent.
+#
+# Default weights are tuned for the tiered + tanh-squash reward signal
+# (see baby_ai/learning/channels.py).  Because the sparse event channels
+# (block_break / item_pickup / block_place / crafting / streaks) now keep
+# their RAW item-tier magnitude instead of being z-scored to ~1, their
+# weights are ~1-3 (not 4-25): a single craft no longer saturates the cap.
+# Relative emphasis is preserved: creation > resources > exploration.
+#
+# IMPORTANT: channel ORDER defines the successor-feature ψ vector
+# (baby_ai/learning/channels.py).  Only ever APPEND new top-level
+# channels at the end — never reorder/remove — or loaded ψ heads shift.
 REWARD_WEIGHTS: List[WeightInfo] = [
     # ── Baseline ────────────────────────────────────────────────
-    WeightInfo("intrinsic",         "Intrinsic (JEPA)",  "Baseline",     0.1,    0.0, 10.0,   0.1),
-    WeightInfo("survival",          "Survival",           "Baseline",     1.0,    0.0,  5.0,   0.1),
+    WeightInfo("intrinsic",         "Intrinsic (JEPA)",  "Baseline",     1.0,    0.0, 10.0,   0.1),
+    WeightInfo("survival",          "Survival",           "Baseline",     0.5,    0.0,  5.0,   0.1),
     WeightInfo("visual_change",     "Visual Change",      "Baseline",     0.1,    0.0,  5.0,   0.1),
 
     # ── Exploration ─────────────────────────────────────────────
@@ -56,9 +74,9 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("int_impact",        "Impact Bonus",       "Exploration",  0.5,    0.0,  3.0,   0.05, parent="interaction"),
     WeightInfo("int_sustained",     "Sustained Mining",   "Exploration",  0.2,    0.0,  2.0,   0.05, parent="interaction"),
 
-    WeightInfo("exploration",       "Exploration",        "Exploration",  0.8,    0.0, 10.0,   0.1),
+    WeightInfo("exploration",       "Exploration",        "Exploration",  1.0,    0.0, 10.0,   0.1),
 
-    WeightInfo("movement",          "Movement",           "Exploration",  0.3,    0.0, 10.0,   0.1),
+    WeightInfo("movement",          "Movement",           "Exploration",  0.5,    0.0, 10.0,   0.1),
     # Sub-weights: internal multipliers within the movement channel
     WeightInfo("mv_forward",        "Forward (W)",        "Exploration",  3.0,    0.0, 10.0,   0.1, parent="movement"),
     WeightInfo("mv_backward",       "Backward (S)",       "Exploration",  1.0,    0.0, 10.0,   0.1, parent="movement"),
@@ -66,42 +84,50 @@ REWARD_WEIGHTS: List[WeightInfo] = [
     WeightInfo("mv_look",           "Camera Look",        "Exploration",  0.02,   0.0,  0.5,   0.01, parent="movement"),
     WeightInfo("mv_jump",           "Jump (Space)",       "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
     WeightInfo("mv_sprint",         "Sprint (Ctrl)",      "Exploration",  1.5,    0.0,  5.0,   0.1, parent="movement"),
-    WeightInfo("new_chunk",          "New Chunk",          "Exploration",  1.0,    0.0, 10.0,   0.1),
+    WeightInfo("new_chunk",          "New Chunk",          "Exploration",  1.5,    0.0, 10.0,   0.1),
     # ── Resource Gathering ──────────────────────────────────────
-    WeightInfo("block_break",       "Block Break",        "Resources",    4.0,    0.0, 30.0,   0.5),
-    WeightInfo("item_pickup",       "Item Pickup",        "Resources",    6.0,    0.0, 30.0,   0.5),
+    WeightInfo("block_break",       "Block Break",        "Resources",    1.5,    0.0, 30.0,   0.5),
+    WeightInfo("item_pickup",       "Item Pickup",        "Resources",    2.0,    0.0, 30.0,   0.5),
 
     # ── Creation ────────────────────────────────────────────────
-    WeightInfo("block_place",       "Block Place",        "Creation",     4.0,    0.0, 30.0,   0.5),
-    WeightInfo("crafting",          "Crafting",           "Creation",    25.0,    0.0, 50.0,   1.0),
-    WeightInfo("building_streak",   "Building Streak",    "Creation",     3.0,    0.0, 20.0,   0.5),
-    WeightInfo("creative_sequence", "Creative Sequence",  "Creation",     6.0,    0.0, 30.0,   0.5),
+    WeightInfo("block_place",       "Block Place",        "Creation",     2.0,    0.0, 30.0,   0.5),
+    WeightInfo("crafting",          "Crafting",           "Creation",     3.0,    0.0, 50.0,   0.5),
+    WeightInfo("building_streak",   "Building Streak",    "Creation",     2.0,    0.0, 20.0,   0.5),
+    WeightInfo("creative_sequence", "Creative Sequence",  "Creation",     3.0,    0.0, 30.0,   0.5),
 
     # ── Penalties ───────────────────────────────────────────────
-    WeightInfo("death_penalty",      "Death Penalty",      "Penalties",    5.0,   0.0, 20.0,  0.5, is_penalty=True),
-    WeightInfo("idle_penalty",       "Idle Penalty",       "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("stagnation_penalty", "Stagnation Penalty", "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("damage_taken",       "Damage Taken",       "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("hotbar_spam_penalty","Hotbar Spam Penalty","Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
-    WeightInfo("inventory_spam_penalty","Inventory Spam","Penalties",   2.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("death_penalty",      "Death Penalty",      "Penalties",    4.0,   0.0, 20.0,  0.5, is_penalty=True),
+    WeightInfo("idle_penalty",       "Idle Penalty",       "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("stagnation_penalty", "Stagnation Penalty", "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("item_drop_penalty",  "Item Drop Penalty",  "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("damage_taken",       "Damage Taken",       "Penalties",    1.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("hotbar_spam_penalty","Hotbar Spam Penalty","Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("inventory_spam_penalty","Inventory Spam","Penalties",   1.5,   0.0, 10.0,  0.1, is_penalty=True),
 
-    WeightInfo("height_penalty",     "Height Penalty",     "Penalties",    2.5,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("height_penalty",     "Height Penalty",     "Penalties",    1.5,   0.0, 10.0,  0.1, is_penalty=True),
     # Sub-weights: components of the height penalty
     WeightInfo("height_underground", "Underground",        "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
     WeightInfo("height_fall",        "Fall Damage",        "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
     WeightInfo("height_darkness",    "Darkness",           "Penalties",    1.0,   0.0,  5.0,  0.1, parent="height_penalty"),
 
-    WeightInfo("pitch_penalty",      "Pitch Penalty",      "Penalties",    3.0,   0.0, 10.0,  0.1, is_penalty=True),
+    WeightInfo("pitch_penalty",      "Pitch Penalty",      "Penalties",    2.0,   0.0, 10.0,  0.1, is_penalty=True),
 
     # ── Survival / Sustain ──────────────────────────────────────
     WeightInfo("healing",           "Healing",            "Sustain",      1.0,   0.0, 10.0,  0.1),
-    WeightInfo("food_reward",       "Food Reward",        "Sustain",      0.8,   0.0, 10.0,  0.1),
-    WeightInfo("xp_reward",         "XP Reward",          "Sustain",      0.1,   0.0,  5.0,  0.1),
-    WeightInfo("home_proximity",    "Home Proximity",     "Sustain",      1.5,  -5.0, 10.0,  0.1),
+    WeightInfo("food_reward",       "Food Reward",        "Sustain",      1.0,   0.0, 10.0,  0.1),
+    WeightInfo("xp_reward",         "XP Reward",          "Sustain",      0.3,   0.0,  5.0,  0.1),
+    WeightInfo("home_proximity",    "Home Proximity",     "Sustain",      1.0,  -5.0, 10.0,  0.1),
     # ── Combat ───────────────────────────────────────────────────
-    WeightInfo("entity_hit",        "Entity Hit",         "Combat",      3.0,   0.0, 20.0,  0.5),
-    WeightInfo("mob_killed",        "Mob Killed",         "Combat",      8.0,   0.0, 30.0,  0.5),]
+    WeightInfo("entity_hit",        "Entity Hit",         "Combat",      1.5,   0.0, 20.0,  0.5),
+    WeightInfo("mob_killed",        "Mob Killed",         "Combat",      3.0,   0.0, 30.0,  0.5),
+
+    # ── Streaks (APPENDED — keep at end to preserve ψ ordering) ──
+    # Reward sustained, committed behaviour: continuous forward travel
+    # (so the agent explores instead of jittering) and holding the attack
+    # button on a block until it breaks (so it commits to mining hard
+    # blocks instead of tapping).  Super-linear in the streak length.
+    WeightInfo("forward_streak",    "Forward Streak",     "Exploration",  1.5,   0.0, 15.0,  0.1),
+    WeightInfo("mining_streak",     "Mining Streak",      "Resources",    1.5,   0.0, 15.0,  0.1),]
 
 # Lookup: which keys have children?
 PARENT_KEYS: set[str] = {w.parent for w in REWARD_WEIGHTS if w.parent} - {None}

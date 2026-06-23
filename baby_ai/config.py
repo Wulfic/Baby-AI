@@ -158,7 +158,9 @@ class REBELConfig:
     reward_clip: float = 5.0      # clip relative rewards
     value_loss_weight: float = 0.5  # keep training value head for System 2
     entropy_weight: float = 0.01  # entropy bonus weight — prevents policy collapse during reward deserts
-    use_grpo: bool = False        # if True, use GRPO instead of paired REBEL preference loss
+    use_grpo: bool = True         # GRPO (group-relative advantages) > REBEL's random half-batch
+                                  # pairing: no state-mismatch noise, full batch participates,
+                                  # robust to reward-scale drift.  See GRPOLoss docstring.
 
 
 @dataclass
@@ -429,6 +431,16 @@ class TrainingConfig:
 
     # Mixed precision
     use_amp: bool = True
+
+    # Plasticity maintenance — shrink-and-perturb (Ash & Adams, 2020) on the
+    # policy/value heads to fight loss-of-plasticity over very long online
+    # runs.  ``plasticity_shrink_every`` is the optimizer-step period
+    # (0 = OFF, the default — enable deliberately, e.g. 25_000, once the
+    # reward signal is verified stable since a live agent is playing while
+    # we train).  At each trigger: w ← shrink·w + perturb·std(w)·noise.
+    plasticity_shrink_every: int = 0
+    plasticity_shrink: float = 0.8
+    plasticity_perturb: float = 0.01
 
     # Checkpointing
     checkpoint_every_n_steps: int = 5000

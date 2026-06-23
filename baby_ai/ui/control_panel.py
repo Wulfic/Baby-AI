@@ -32,7 +32,7 @@ from baby_ai.ui.controls_state import (
     AI_CONTROLS,
     AIControlsState,
 )
-from baby_ai.ui.reward_weights import RewardWeightsState
+from baby_ai.ui.reward_weights import RewardWeightsState, REWARD_PROFILE_VERSION
 from baby_ai.ui.settings_store import SettingsStore
 from baby_ai.ui.theme import (
     get_dpi_scale as _get_dpi_scale,
@@ -53,6 +53,11 @@ from baby_ai.ui.model_tab import (
 
 # ── Thread-safe learning rate holder ─────────────────────────
 _DEFAULT_LR = 5e-5        # medium-low constant LR
+# Fresh-bot starter LR.  The live GUI LR scales every optimizer group by
+# (gui_lr / core_lr), so this ~1.2e-4 yields stable effective rates
+# (encoder ~1.8e-4, core ~1.2e-4, policy ~4.2e-4) — calmer than the old
+# persisted ~3.5e-4 (which scaled policy past 1e-3 and risked divergence).
+_FRESH_BOT_LR = 1.2e-4
 _live_lr: float = _DEFAULT_LR
 _lr_lock = threading.Lock()
 
@@ -1091,10 +1096,35 @@ class AIControlPanel:
             for key, enabled in saved_controls.items():
                 self.controls_state.set_enabled(key, bool(enabled))
 
-        # Reward weights
-        saved_weights = self._store.get("reward_weights")
-        if saved_weights and isinstance(saved_weights, dict):
-            self.reward_weights.set_all(saved_weights)
+        # Reward weights — version-gated migration.
+        # When the code's REWARD_PROFILE_VERSION is newer than what's
+        # saved, apply the retuned starter defaults (weights + a sane LR)
+        # ONCE instead of loading stale saved weights, then stamp the new
+        # version.  After that, the user's manual edits persist normally.
+        saved_meta = self._store.get("meta") or {}
+        try:
+            saved_ver = int(saved_meta.get("reward_profile_version", 0))
+        except (TypeError, ValueError):
+            saved_ver = 0
+
+        if saved_ver < REWARD_PROFILE_VERSION:
+            print(
+                f"[Baby-AI] Reward profile migration {saved_ver} -> "
+                f"{REWARD_PROFILE_VERSION}: applying retuned starter defaults "
+                f"(weights + LR {_FRESH_BOT_LR:.1e}).",
+                flush=True,
+            )
+            self.reward_weights.reset_defaults()
+            set_live_lr(_FRESH_BOT_LR)
+            self._store.set("reward_weights", self.reward_weights.snapshot(),
+                            auto_save=False)
+            self._store.set("learning_rate", _FRESH_BOT_LR, auto_save=False)
+            self._store.set("meta",
+                            {"reward_profile_version": REWARD_PROFILE_VERSION})
+        else:
+            saved_weights = self._store.get("reward_weights")
+            if saved_weights and isinstance(saved_weights, dict):
+                self.reward_weights.set_all(saved_weights)
 
     def _persist_reward_toggles(self) -> None:
         """Save current reward toggle state to disk."""

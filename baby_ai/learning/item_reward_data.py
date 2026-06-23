@@ -1461,10 +1461,14 @@ for _id, _val in [
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  DEFAULT REWARD  — for items not explicitly listed above.
-#  A moderate 0.5 ensures unknown / new items still produce signal.
+#  DEFAULT REWARD  — for items/blocks not explicitly listed above.
+#  Set to the TRIVIAL tier (0.1), NOT a moderate 0.5.  A 0.5 default
+#  made any unlisted block worth MORE than dirt (0.1) or stone (0.2),
+#  so the agent could farm reward by breaking unrecognised decorative
+#  blocks.  0.1 means "unknown ⇒ assume trivial"; anything actually
+#  valuable is in the table above with its real tier.
 # ═══════════════════════════════════════════════════════════════════
-_DEFAULT_REWARD = 0.5
+_DEFAULT_REWARD = 0.1
 
 # Multipliers applied on top of the base item reward depending on
 # the event type.  Crafting something is harder than just picking

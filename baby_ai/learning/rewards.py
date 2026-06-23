@@ -17,6 +17,7 @@ from collections import deque
 import numpy as np
 import torch
 
+from baby_ai.learning.channels import squash_reward
 from baby_ai.utils.logging import RewardMonitor
 
 
@@ -326,6 +327,35 @@ class RewardComposer:
         "height_penalty", "pitch_penalty",
     })
 
+    # ── Tiered (magnitude-meaningful) channels ──────────────────────
+    # These carry a *graded* value straight from the environment: the
+    # item-reward tier table (block_break / item_pickup / block_place /
+    # crafting), the super-linear streak/sequence bonuses, combat, and
+    # sustain signals.  They are applied RAW (never z-scored) so that the
+    # tier structure survives — diamond (3.0) must out-reward dirt (0.1).
+    # Bounding is handled globally by the final tanh squash, not by
+    # flattening each channel to its own running average.
+    _TIERED_CHANNELS: frozenset[str] = frozenset({
+        "block_break", "item_pickup", "block_place", "crafting",
+        "building_streak", "creative_sequence", "new_chunk",
+        "healing", "food_reward", "xp_reward",
+        "entity_hit", "mob_killed", "home_proximity",
+        "forward_streak", "mining_streak",
+    })
+
+    # ── Dense (per-step, near-continuous) channels ──────────────────
+    # These fire on most steps with no inherent unit (frame-diff
+    # magnitude, action-diversity ratio, locomotion confirmation).  They
+    # ARE z-scored so their drifting baselines don't dominate, with the
+    # floor-at-0 rule keeping "below average" neutral rather than punishing.
+    # (The old code z-scored EVERYTHING, which silently zeroed routine
+    # block breaks/pickups after warmup — the root cause of the agent
+    # "getting stuck".  Tiered channels are now exempt.)
+    _DENSE_CHANNELS: frozenset[str] = frozenset({
+        "survival", "visual_change", "action_diversity",
+        "interaction", "exploration", "movement",
+    })
+
     def compose_dynamic(
         self,
         channel_values: dict[str, float],
@@ -370,14 +400,22 @@ class RewardComposer:
             if channel == "total":
                 continue
 
-            # Look up weight — special-case 'intrinsic' to use annealed weight
+            # ── Weight lookup (intrinsic uses the annealed schedule) ──
             if channel == "intrinsic":
                 weight = self.intrinsic_weight * w.get("intrinsic", 1.0)
             else:
                 weight = w.get(channel, 1.0)
 
-            # Normalize (skip for penalty channels — apply raw)
-            if channel in self._RAW_CHANNELS:
+            # ── Per-channel value transform ──────────────────────────
+            # Tiered + raw-penalty + intrinsic channels keep their raw
+            # value (intrinsic is already RMS-normalised upstream); only
+            # dense per-step channels are z-scored.  Unknown channels
+            # fall back to z-scoring to stay bounded.
+            if (
+                channel in self._TIERED_CHANNELS
+                or channel in self._RAW_CHANNELS
+                or channel == "intrinsic"
+            ):
                 normed = raw_value
             else:
                 normed = self._normalize_channel(channel, raw_value)
@@ -391,7 +429,10 @@ class RewardComposer:
             # Monitor
             self._monitor.record(channel, raw_value)
 
-        reward = float(np.clip(reward, -5.0, 5.0))
+        # Bounded squash (matches the learner's training reward) — keeps
+        # the total in ±REWARD_MAX while preserving the ordering of large
+        # tiered rewards instead of saturating a hard clamp.
+        reward = float(squash_reward(reward))
         self._monitor.record("total", reward)
         self._step += 1
         return reward
